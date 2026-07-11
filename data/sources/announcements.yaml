@@ -1,0 +1,15 @@
+sources:
+  - name: nptu-overview
+    adapter: nptu_overview
+    url: https://www.nptu.edu.tw/p/503-1000-1044.php?Lang=zh-tw
+    unit: 國立屏東大學
+    category: 總覽
+    enabled: true
+    crawl_interval_minutes: 60
+  - name: local-fixture
+    adapter: fixture
+    url: data/fixtures/announcements/overview.xml
+    unit: 測試單位
+    category: 測試
+    enabled: false
+    crawl_interval_minutes: 1440

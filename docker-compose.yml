@@ -1,0 +1,43 @@
+services:
+  db:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-nptu_assistant}
+      POSTGRES_USER: ${POSTGRES_USER:-nptu}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-nptu-development-only}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - nptu-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-nptu} -d ${POSTGRES_DB:-nptu_assistant}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  api:
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    env_file:
+      - path: .env.local
+        required: false
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-nptu}:${POSTGRES_PASSWORD:-nptu-development-only}@db:5432/${POSTGRES_DB:-nptu_assistant}
+      CRAWLER_CONFIG_PATH: /app/data/sources/announcements.yaml
+      OFFICIAL_DOCUMENTS_PATH: /app/data/official-documents
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+volumes:
+  nptu-postgres:

@@ -1,0 +1,12 @@
+{
+  "name": "nptu-campus-assistant",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@11.7.0",
+  "scripts": {
+    "build": "corepack pnpm --recursive build",
+    "test": "corepack pnpm --recursive test",
+    "typecheck": "corepack pnpm --recursive typecheck",
+    "contracts": "corepack pnpm --filter @nptu/shared generate"
+  }
+}

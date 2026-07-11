@@ -1,0 +1,32 @@
+# Secrets
+.env
+.env.local
+.env.*.local
+
+# JavaScript
+node_modules/
+.pnpm-store/
+apps/extension/.output/
+apps/extension/.wxt/
+coverage/
+
+# Python
+.venv/
+.bootstrap/
+.tools/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+
+# Runtime data
+*.log
+.DS_Store
+Thumbs.db
+
+# IDE and local tooling
+.idea/
+.vscode/
+.worktrees/

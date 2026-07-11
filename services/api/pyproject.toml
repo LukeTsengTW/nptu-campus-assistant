@@ -1,0 +1,52 @@
+[project]
+name = "nptu-campus-assistant-api"
+version = "0.1.0"
+description = "非官方 NPTU 校務資訊助理 API"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "alembic>=1.16,<2",
+  "beautifulsoup4>=4.13,<5",
+  "fastapi>=0.116,<1",
+  "httpx>=0.28,<1",
+  "openai>=1.93,<3",
+  "pgvector>=0.4,<1",
+  "psycopg[binary]>=3.2,<4",
+  "pydantic-settings>=2.10,<3",
+  "pymupdf>=1.26,<2",
+  "python-json-logger>=3.3,<5",
+  "pyyaml>=6,<7",
+  "sqlalchemy>=2.0,<3",
+  "tiktoken>=0.9,<1",
+  "uvicorn[standard]>=0.35,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "httpx2>=2.5.0",
+  "pytest>=8.4,<10",
+  "pytest-cov>=6,<8",
+  "pytest-httpx>=0.35,<1",
+]
+
+[project.scripts]
+nptu-assistant = "nptu_assistant.cli:main"
+
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nptu_assistant"]
+
+[tool.pytest.ini_options]
+addopts = "-q --strict-markers"
+testpaths = ["tests", "../../tests/integration"]
+
+[tool.coverage.run]
+branch = true
+source = ["nptu_assistant"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true

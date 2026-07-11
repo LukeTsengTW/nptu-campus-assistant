@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_DB: nptu_assistant
+          POSTGRES_USER: nptu
+          POSTGRES_PASSWORD: nptu-ci-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U nptu -d nptu_assistant"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgresql+psycopg://nptu:nptu-ci-only@127.0.0.1:5432/nptu_assistant
+      RUN_POSTGRES_INTEGRATION: "1"
+      LLM_PROVIDER: fake
+      EMBEDDING_PROVIDER: fake
+      ADMIN_API_ENABLED: "true"
+      ADMIN_API_KEY: integration-admin-key
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.7.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: pnpm
+
+      - name: Install dependencies
+        run: |
+          uv sync --project services/api --extra dev --frozen
+          pnpm install --frozen-lockfile
+
+      - name: Migrate and seed twice
+        run: |
+          uv run --project services/api alembic -c alembic.ini upgrade head
+          uv run --project services/api alembic -c alembic.ini upgrade head
+          uv run --project services/api nptu-assistant seed
+          uv run --project services/api nptu-assistant seed
+
+      - name: Backend and PostgreSQL integration tests
+        run: uv run --project services/api pytest
+
+      - name: Verify generated API contracts
+        run: |
+          uv run --project services/api nptu-assistant export-openapi --output packages/shared/openapi.json
+          pnpm --filter @nptu/shared generate
+          git diff --exit-code -- packages/shared/openapi.json packages/shared/src/schema.d.ts
+
+      - name: TypeScript tests and builds
+        run: |
+          pnpm test
+          pnpm build
+
+      - name: Secret-pattern scan
+        shell: bash
+        run: |
+          if git grep -nE 'sk-(proj-)?[A-Za-z0-9_-]{20,}' -- ':!pnpm-lock.yaml'; then
+            echo "Potential OpenAI secret found in tracked files"
+            exit 1
+          fi
