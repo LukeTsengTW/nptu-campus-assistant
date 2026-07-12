@@ -48,6 +48,7 @@ def test_openai_responses_provider_uses_current_structured_output_shape() -> Non
     assert "schema" in output_format
     assert "json_schema" not in output_format
     assert captured["store"] is False
+    assert "不得在 answer" in captured["instructions"]
 
 
 def test_fake_llm_uses_known_source_ids_only() -> None:

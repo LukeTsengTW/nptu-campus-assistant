@@ -88,6 +88,35 @@ def test_chat_rejects_unknown_model_source_ids() -> None:
     assert response.sources == []
 
 
+def test_chat_removes_internal_source_ids_from_user_facing_answer() -> None:
+    source_id = "394a51a1-c0fc-4b96-a81f-f2acd9bd46e4"
+    evidence = Evidence(
+        id=source_id,
+        kind=AnswerType.ANNOUNCEMENT,
+        title="115學年度申請公告",
+        url="https://www.nptu.edu.tw/announcement",
+        unit="教務處",
+        published_at=date(2026, 7, 10),
+        content="申請公告內容",
+        score=0.8,
+    )
+    service = ChatService(
+        StubRetriever([evidence]),
+        StubLlm(
+            GeneratedAnswer(
+                answer=f"115學年度申請公告 [{source_id}]",
+                used_source_ids=[source_id],
+            )
+        ),
+    )
+
+    response = service.answer("最近有哪些公告？")
+
+    assert source_id not in response.answer
+    assert response.answer == "115學年度申請公告"
+    assert response.sources[0].title == "115學年度申請公告"
+
+
 def test_chat_preserves_conflict_warning_from_grounded_answer() -> None:
     evidence = Evidence(
         id="announcement-1",

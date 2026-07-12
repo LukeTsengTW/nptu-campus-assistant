@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Protocol
 
 from nptu_assistant.api.schemas import (
@@ -13,6 +14,9 @@ from nptu_assistant.rag.routing import QuestionRoute, route_question
 
 
 INSUFFICIENT_ANSWER = "目前收錄的官方資料不足以確認。"
+_INTERNAL_SOURCE_ID = re.compile(
+    r"[\[（(]?\s*\b[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}\b\s*[\]）)]?"
+)
 
 
 class Retriever(Protocol):
@@ -41,6 +45,12 @@ def insufficient_response() -> ChatResponse:
     )
 
 
+def sanitize_user_facing_text(text: str) -> str:
+    cleaned = _INTERNAL_SOURCE_ID.sub("", text)
+    cleaned = re.sub(r"[ \t]+([，。；：、])", r"\1", cleaned)
+    return "\n".join(line.rstrip() for line in cleaned.splitlines()).strip()
+
+
 class ChatService:
     def __init__(self, retriever: Retriever, llm: LlmProvider) -> None:
         self._retriever = retriever
@@ -56,9 +66,12 @@ class ChatService:
         used = [by_id[source_id] for source_id in generated.used_source_ids if source_id in by_id]
         if not used:
             return insufficient_response()
+        answer = sanitize_user_facing_text(generated.answer)
+        if not answer:
+            return insufficient_response()
         answer_type = used[0].kind
         return ChatResponse(
-            answer=generated.answer,
+            answer=answer,
             answer_type=answer_type,
             confidence=confidence_for_score(used[0].score),
             sources=[
@@ -70,5 +83,7 @@ class ChatService:
                 )
                 for item in used
             ],
-            warning=generated.warning,
+            warning=(sanitize_user_facing_text(generated.warning) or None)
+            if generated.warning
+            else None,
         )
