@@ -33,6 +33,8 @@ def normalize_announcement_keyword(question: str) -> str:
     keyword = question.strip()
     for term in _GENERIC_ANNOUNCEMENT_TERMS:
         keyword = keyword.replace(term, "")
+    keyword = re.sub(r"前\s*[0-9一二三四五六七八九十]+\s*[個則筆篇項]?", "", keyword)
+    keyword = re.sub(r"[0-9一二三四五六七八九十]+\s*[個則筆篇項]", "", keyword)
     return re.sub(r"\s+", " ", keyword).strip()
 
 

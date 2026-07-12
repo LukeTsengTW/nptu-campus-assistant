@@ -35,6 +35,9 @@ def test_route_question_detects_announcement_intent() -> None:
 def test_latest_announcement_queries_use_recency_fallback() -> None:
     assert normalize_announcement_keyword("幫我查最新公告") == ""
     assert normalize_announcement_keyword("最近有哪些公告？") == ""
+    assert normalize_announcement_keyword("列出前五個最新公告") == ""
+    assert normalize_announcement_keyword("列出前5個最新公告") == ""
+    assert normalize_announcement_keyword("列出五則最新公告") == ""
     assert normalize_announcement_keyword("公告") == ""
     assert normalize_announcement_keyword("獎學金公告") == "獎學金"
 
