@@ -13,6 +13,33 @@ from nptu_assistant.rag.models import Evidence
 from nptu_assistant.rag.routing import QuestionRoute
 
 
+_GENERIC_ANNOUNCEMENT_TERMS = (
+    "幫我",
+    "查",
+    "找",
+    "列出",
+    "顯示",
+    "最新",
+    "最近",
+    "有哪些",
+    "公告如下",
+    "公告",
+    "？",
+    "?",
+)
+
+
+def normalize_announcement_keyword(question: str) -> str:
+    keyword = question.strip()
+    for term in _GENERIC_ANNOUNCEMENT_TERMS:
+        keyword = keyword.replace(term, "")
+    return re.sub(r"\s+", " ", keyword).strip()
+
+
+def is_fixture_source(source_name: str) -> bool:
+    return "fixture" in source_name.lower()
+
+
 class SqlRetriever:
     def __init__(
         self,
@@ -88,15 +115,18 @@ class SqlRetriever:
         return sorted(evidence, key=lambda item: item.score, reverse=True)[:6]
 
     def _search_announcements(self, question: str) -> list[Evidence]:
-        keyword = re.sub(r"(最新|最近|近期|公告|有哪些|請問|？|\?|，|。)", "", question).strip()
+        keyword = normalize_announcement_keyword(question)
         score_expression = func.greatest(
             func.similarity(Announcement.title, keyword),
             func.similarity(Announcement.body, keyword),
         ).label("score")
+        public_sources = Source.name.not_like("%fixture%")
         with self._factory() as session:
             if keyword:
                 rows = session.execute(
                     select(Announcement, score_expression)
+                    .join(Source, Source.id == Announcement.source_id)
+                    .where(public_sources)
                     .order_by(desc("score"), Announcement.published_at.desc())
                     .limit(20)
                 ).all()
@@ -104,7 +134,11 @@ class SqlRetriever:
                 rows = [
                     (item, 0.65)
                     for item in session.scalars(
-                        select(Announcement).order_by(Announcement.published_at.desc()).limit(20)
+                        select(Announcement)
+                        .join(Source, Source.id == Announcement.source_id)
+                        .where(public_sources)
+                        .order_by(Announcement.published_at.desc(), Announcement.last_crawled_at.desc())
+                        .limit(20)
                     ).all()
                 ]
         return [

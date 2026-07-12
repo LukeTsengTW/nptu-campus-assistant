@@ -5,6 +5,7 @@ from datetime import date
 from nptu_assistant.api.schemas import AnswerType, Confidence
 from nptu_assistant.providers.fake import FakeLlmProvider
 from nptu_assistant.rag.models import Evidence, GeneratedAnswer
+from nptu_assistant.rag.retrieval import is_fixture_source, normalize_announcement_keyword
 from nptu_assistant.rag.routing import QuestionRoute, route_question
 from nptu_assistant.rag.service import ChatService, confidence_for_score
 
@@ -29,6 +30,19 @@ class StubLlm:
 def test_route_question_detects_announcement_intent() -> None:
     assert route_question("最近有哪些報名公告？") is QuestionRoute.ANNOUNCEMENT
     assert route_question("學分抵免辦法是什麼？") is QuestionRoute.DOCUMENT
+
+
+def test_latest_announcement_queries_use_recency_fallback() -> None:
+    assert normalize_announcement_keyword("幫我查最新公告") == ""
+    assert normalize_announcement_keyword("最近有哪些公告？") == ""
+    assert normalize_announcement_keyword("公告") == ""
+    assert normalize_announcement_keyword("獎學金公告") == "獎學金"
+
+
+def test_fixture_sources_are_not_public_announcement_evidence() -> None:
+    assert is_fixture_source("local-fixture")
+    assert is_fixture_source("integration-fixture-abc")
+    assert not is_fixture_source("nptu-overview")
 
 
 def test_confidence_thresholds() -> None:

@@ -6,6 +6,7 @@ type ErrorEnvelope = { error?: { message?: unknown } };
 
 const ANSWER_TYPES = new Set(["official_document", "announcement", "insufficient_information"]);
 const CONFIDENCE_LEVELS = new Set(["high", "medium", "low"]);
+const NETWORK_ERROR_MESSAGE = "無法連線到後端服務，請確認本機 API 已啟動。";
 
 
 function isOfficialNptuUrl(value: unknown): value is string {
@@ -76,6 +77,9 @@ export class ApiClient {
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") {
         throw new Error("查詢逾時，請稍後再試。");
+      }
+      if (error instanceof TypeError && error.message === "Failed to fetch") {
+        throw new Error(NETWORK_ERROR_MESSAGE);
       }
       if (error instanceof Error) throw error;
       throw new Error("無法連線到後端服務。");

@@ -38,6 +38,14 @@ describe("ApiClient", () => {
     );
   });
 
+  it("將瀏覽器 fetch 連線失敗轉成可操作的繁體中文錯誤", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError("Failed to fetch")));
+
+    await expect(new ApiClient("http://127.0.0.1:8000").chat("測試")).rejects.toThrow(
+      "無法連線到後端服務，請確認本機 API 已啟動。",
+    );
+  });
+
   it("rejects an invalid answer type and unsafe source URL", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
       ok: true,
