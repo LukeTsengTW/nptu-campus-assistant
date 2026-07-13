@@ -86,26 +86,29 @@ class KeywordAnnouncementSearchService:
     def normalize(self, text: str) -> str:
         return self._resolver.normalize(text)
 
+    def _load_form(self) -> SearchForm:
+        self._http.get(self._config.session_url)
+        bootstrap_content = self._http.submit_form(
+            self._config.bootstrap_method,
+            self._config.bootstrap_url,
+            {},
+        )
+        bootstrap = self._adapter.parse_bootstrap_form(
+            bootstrap_content,
+            self._config.bootstrap_url,
+        )
+        return SearchForm(
+            bootstrap.method,
+            self._config.url,
+            bootstrap.hidden_fields,
+            tuple(self._config.search_types),
+        )
+
     def ingest(self, query: str) -> KeywordIngestionResult:
         expansion = self._resolver.expand(query)
         summary = CrawlSummary()
         try:
-            self._http.get(self._config.session_url)
-            bootstrap_content = self._http.submit_form(
-                self._config.bootstrap_method,
-                self._config.bootstrap_url,
-                {},
-            )
-            bootstrap = self._adapter.parse_bootstrap_form(
-                bootstrap_content,
-                self._config.bootstrap_url,
-            )
-            form: SearchForm | None = SearchForm(
-                bootstrap.method,
-                self._config.url,
-                bootstrap.hidden_fields,
-                tuple(self._config.search_types),
-            )
+            form: SearchForm | None = self._load_form()
         except Exception as exc:
             summary.failed = 1
             summary.errors.append(f"官方搜尋表單無法載入：{type(exc).__name__}")
@@ -119,24 +122,29 @@ class KeywordAnnouncementSearchService:
         successful_searches = 0
         for search_term in expansion.search_terms:
             for search_type in self._config.search_types:
-                if form is None:
+                last_error: Exception | None = None
+                for _attempt in range(2):
+                    try:
+                        if form is None:
+                            form = self._load_form()
+                        if search_type not in form.search_types:
+                            raise ValueError(f"官網搜尋表單缺少分類：{search_type}")
+                        fields = dict(form.hidden_fields)
+                        fields.update({"SchKey": search_term, "SchType": search_type})
+                        content = self._http.submit_form(form.method, form.action_url, fields)
+                        parsed_results = self._adapter.parse_results(content, form.action_url)
+                        next_form = self._adapter.parse_form(content, self._config.url)
+                        results.extend(parsed_results)
+                        form = next_form
+                        successful_searches += 1
+                        break
+                    except Exception as exc:
+                        last_error = exc
+                        form = None
+                else:
                     summary.failed += 1
-                    summary.errors.append("官網搜尋表單無法繼續使用")
-                    continue
-                if search_type not in form.search_types:
-                    summary.failed += 1
-                    summary.errors.append(f"官網搜尋表單缺少分類：{search_type}")
-                    continue
-                fields = dict(form.hidden_fields)
-                fields.update({"SchKey": search_term, "SchType": search_type})
-                try:
-                    content = self._http.submit_form(form.method, form.action_url, fields)
-                    results.extend(self._adapter.parse_results(content, form.action_url))
-                    form = self._adapter.parse_form(content, self._config.url)
-                    successful_searches += 1
-                except Exception as exc:
-                    summary.failed += 1
-                    summary.errors.append(f"{search_type} 搜尋失敗：{type(exc).__name__}")
+                    error_name = type(last_error).__name__ if last_error else "RuntimeError"
+                    summary.errors.append(f"{search_type} 搜尋失敗：{error_name}")
 
         unique_results: dict[str, AnnouncementSearchResult] = {}
         for result in results:
