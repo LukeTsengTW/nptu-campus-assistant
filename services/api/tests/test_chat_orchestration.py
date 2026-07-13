@@ -52,7 +52,9 @@ class StubRetriever:
         unit: str | None,
         date_from: date | None,
         date_to: date | None,
+        canonical_urls: tuple[str, ...] | None = None,
     ) -> list[Evidence]:
+        del canonical_urls
         self.calls.append(("search_announcements", (query, limit, sort, unit, date_from, date_to)))
         return list(self.by_tool.get("search_announcements", []))  # type: ignore[arg-type]
 

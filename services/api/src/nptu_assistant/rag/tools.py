@@ -122,6 +122,7 @@ class StructuredRetriever(Protocol):
         unit: str | None,
         date_from: date | None,
         date_to: date | None,
+        canonical_urls: tuple[str, ...] | None = None,
     ) -> list[Evidence]: ...
 
     def search_documents(self, *, query: str, limit: int) -> list[Evidence]: ...
@@ -193,6 +194,7 @@ class ToolExecutor:
         parsed: SearchAnnouncementsArguments,
     ) -> tuple[list[Evidence], str | None]:
         arguments = parsed.model_dump()
+        arguments["canonical_urls"] = None
         warning: str | None = None
         if parsed.query and self._keyword_ingestor is not None:
             try:
@@ -201,6 +203,7 @@ class ToolExecutor:
                     arguments["unit"] = self._keyword_ingestor.normalize(parsed.unit)
                 ingestion = self._keyword_ingestor.ingest(parsed.query)
                 arguments["query"] = ingestion.retrieval_query
+                arguments["canonical_urls"] = ingestion.canonical_urls
                 warning = ingestion.warning
             except Exception:
                 warning = FULL_SEARCH_FAILURE_WARNING
