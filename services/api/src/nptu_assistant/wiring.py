@@ -6,6 +6,10 @@ from nptu_assistant.api.errors import AppError
 from nptu_assistant.api.services import AnnouncementService, HealthService
 from nptu_assistant.core.settings import Settings, WORKSPACE_ROOT, resolve_workspace_path
 from nptu_assistant.crawlers.http import CrawlHttpClient
+from nptu_assistant.crawlers.refresh import (
+    AnnouncementRefreshCoordinator,
+    AnnouncementRefreshScheduler,
+)
 from nptu_assistant.crawlers.service import CrawlerService
 from nptu_assistant.db.repositories import SqlAnnouncementRepository, SqlDocumentRepository
 from nptu_assistant.db.session import create_session_factory
@@ -63,6 +67,18 @@ def build_services(settings: Settings) -> dict[str, object]:
         settings.crawler_user_agent,
         interval_seconds=settings.crawler_request_interval_seconds,
     )
+    crawler_service = CrawlerService(
+        resolve_workspace_path(settings.crawler_config_path),
+        announcement_repository,
+        http_client,
+        workspace_root=WORKSPACE_ROOT,
+    )
+    announcement_refresher = AnnouncementRefreshCoordinator(
+        resolve_workspace_path(settings.crawler_config_path),
+        crawler_service,
+        announcement_repository,
+    )
+    refresh_scheduler = AnnouncementRefreshScheduler(announcement_refresher)
     return {
         "health_service": HealthService(factory, settings),
         "chat_service": (
@@ -70,6 +86,7 @@ def build_services(settings: Settings) -> dict[str, object]:
                 SqlRetriever(factory, embedding),
                 llm,
                 SqlConversationStore(factory),
+                announcement_refresher,
             )
             if llm
             else None
@@ -80,11 +97,7 @@ def build_services(settings: Settings) -> dict[str, object]:
             document_repository,
             embedding,
         ),
-        "crawler_service": CrawlerService(
-            resolve_workspace_path(settings.crawler_config_path),
-            announcement_repository,
-            http_client,
-            workspace_root=WORKSPACE_ROOT,
-        ),
+        "crawler_service": crawler_service,
+        "refresh_scheduler": refresh_scheduler,
         "session_factory": factory,
     }

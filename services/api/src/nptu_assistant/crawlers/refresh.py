@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -12,6 +14,7 @@ from nptu_assistant.crawlers.config import CrawlerSourceConfig, load_source_conf
 
 
 REFRESH_FAILURE_WARNING = "最新公告更新失敗，以下內容來自資料庫最後成功收錄的資料。"
+logger = logging.getLogger(__name__)
 
 
 class CrawlRunner(Protocol):
@@ -21,6 +24,11 @@ class CrawlRunner(Protocol):
 
 class FreshnessRepository(Protocol):
     def latest_crawled_at(self, source_name: str) -> datetime | None:
+        raise NotImplementedError
+
+
+class DueSourceRefresher(Protocol):
+    def refresh_due_sources(self) -> list[RefreshResult]:
         raise NotImplementedError
 
 
@@ -100,3 +108,32 @@ class AnnouncementRefreshCoordinator:
         return checked_at - max(timestamps) >= timedelta(
             minutes=config.crawl_interval_minutes
         )
+
+
+class AnnouncementRefreshScheduler:
+    def __init__(
+        self,
+        coordinator: DueSourceRefresher,
+        *,
+        check_interval_seconds: float = 60.0,
+    ) -> None:
+        self._coordinator = coordinator
+        self._check_interval_seconds = check_interval_seconds
+        self._stop = asyncio.Event()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    async def run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                await asyncio.to_thread(self._coordinator.refresh_due_sources)
+            except Exception:
+                logger.exception("announcement_refresh_scheduler_failed")
+            try:
+                await asyncio.wait_for(
+                    self._stop.wait(),
+                    timeout=self._check_interval_seconds,
+                )
+            except TimeoutError:
+                continue

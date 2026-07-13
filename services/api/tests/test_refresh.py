@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from nptu_assistant.api.schemas import CrawlSummary
-from nptu_assistant.crawlers.refresh import AnnouncementRefreshCoordinator
+from nptu_assistant.crawlers.refresh import (
+    AnnouncementRefreshCoordinator,
+    AnnouncementRefreshScheduler,
+    RefreshResult,
+)
 
 
 NOW = datetime(2026, 7, 13, 12, 0, tzinfo=timezone.utc)
@@ -42,6 +47,15 @@ class BlockingCrawler(RecordingCrawler):
         self.started.set()
         assert self.release.wait(timeout=1)
         return self.summary
+
+
+class RecordingCoordinator:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def refresh_due_sources(self) -> list[RefreshResult]:
+        self.calls += 1
+        return []
 
 
 def write_config(path: Path) -> None:
@@ -129,3 +143,24 @@ def test_parallel_refreshes_only_crawl_once(tmp_path: Path) -> None:
         assert second.result(timeout=1).attempted is False
 
     assert crawler.calls == [["nptu-overview"]]
+
+
+def test_scheduler_checks_immediately_and_stops_cleanly() -> None:
+    async def exercise() -> None:
+        coordinator = RecordingCoordinator()
+        scheduler = AnnouncementRefreshScheduler(
+            coordinator,
+            check_interval_seconds=0.01,
+        )
+        task = asyncio.create_task(scheduler.run())
+        deadline = asyncio.get_running_loop().time() + 1
+        while coordinator.calls < 2:
+            if asyncio.get_running_loop().time() >= deadline:
+                raise AssertionError("scheduler 未在期限內執行第二次檢查")
+            await asyncio.sleep(0.005)
+        scheduler.stop()
+        await asyncio.wait_for(task, timeout=1)
+
+        assert coordinator.calls >= 2
+
+    asyncio.run(exercise())
