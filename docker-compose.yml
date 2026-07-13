@@ -1,6 +1,7 @@
 services:
   db:
     image: pgvector/pgvector:pg17
+    restart: unless-stopped
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-nptu_assistant}
       POSTGRES_USER: ${POSTGRES_USER:-nptu}
@@ -19,6 +20,7 @@ services:
     build:
       context: .
       dockerfile: services/api/Dockerfile
+    restart: unless-stopped
     env_file:
       - path: .env.local
         required: false
