@@ -1,0 +1,193 @@
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass
+from datetime import date
+from typing import Protocol
+
+from nptu_assistant.api.schemas import CrawlSummary
+from nptu_assistant.crawlers.adapters.nptu_search import (
+    AnnouncementSearchResult,
+    NptuAssociationSearchAdapter,
+    SearchForm,
+)
+from nptu_assistant.crawlers.config import KeywordSearchConfig
+from nptu_assistant.crawlers.models import AnnouncementCandidate
+
+
+PARTIAL_SEARCH_FAILURE_WARNING = "部分官網公告搜尋失敗，以下結果可能不完整。"
+FULL_SEARCH_FAILURE_WARNING = "本次官網公告搜尋失敗，以下內容來自資料庫最後成功收錄的資料。"
+
+
+@dataclass(frozen=True, slots=True)
+class KeywordExpansion:
+    search_terms: tuple[str, ...]
+    retrieval_query: str
+
+
+@dataclass(frozen=True, slots=True)
+class KeywordIngestionResult:
+    retrieval_query: str
+    summary: CrawlSummary
+    warning: str | None = None
+
+
+class KeywordAliasResolver:
+    def __init__(self, aliases: Mapping[str, str]) -> None:
+        self._aliases = dict(aliases)
+
+    def normalize(self, text: str) -> str:
+        normalized = text.strip()
+        for alias in sorted(self._aliases, key=len, reverse=True):
+            normalized = normalized.replace(alias, self._aliases[alias])
+        return normalized
+
+    def expand(self, query: str) -> KeywordExpansion:
+        query = query.strip()
+        if not query:
+            raise ValueError("公告搜尋關鍵字不得為空")
+        normalized = self.normalize(query)
+        terms = tuple(dict.fromkeys((query, normalized)))
+        return KeywordExpansion(terms, normalized)
+
+
+class AnnouncementRepository(Protocol):
+    def upsert(
+        self,
+        candidate: AnnouncementCandidate,
+        *,
+        source_name: str,
+        source_url: str,
+        interval_minutes: int,
+    ) -> str: ...
+
+
+class SearchHttpClient(Protocol):
+    def get(self, url: str) -> str: ...
+
+    def submit_form(self, method: str, url: str, fields: Mapping[str, str]) -> str: ...
+
+
+class KeywordAnnouncementSearchService:
+    def __init__(
+        self,
+        config: KeywordSearchConfig,
+        repository: AnnouncementRepository,
+        http_client: SearchHttpClient,
+        adapter: NptuAssociationSearchAdapter | None = None,
+    ) -> None:
+        self._config = config
+        self._repository = repository
+        self._http = http_client
+        self._adapter = adapter or NptuAssociationSearchAdapter()
+        self._resolver = KeywordAliasResolver(config.aliases)
+
+    def normalize(self, text: str) -> str:
+        return self._resolver.normalize(text)
+
+    def ingest(self, query: str) -> KeywordIngestionResult:
+        expansion = self._resolver.expand(query)
+        summary = CrawlSummary()
+        try:
+            self._http.get(self._config.session_url)
+            bootstrap_content = self._http.submit_form(
+                self._config.bootstrap_method,
+                self._config.bootstrap_url,
+                {},
+            )
+            bootstrap = self._adapter.parse_bootstrap_form(
+                bootstrap_content,
+                self._config.bootstrap_url,
+            )
+            form: SearchForm | None = SearchForm(
+                bootstrap.method,
+                self._config.url,
+                bootstrap.hidden_fields,
+                tuple(self._config.search_types),
+            )
+        except Exception as exc:
+            summary.failed = 1
+            summary.errors.append(f"官方搜尋表單無法載入：{type(exc).__name__}")
+            return KeywordIngestionResult(
+                expansion.retrieval_query,
+                summary,
+                FULL_SEARCH_FAILURE_WARNING,
+            )
+
+        results: list[AnnouncementSearchResult] = []
+        successful_searches = 0
+        for search_term in expansion.search_terms:
+            for search_type in self._config.search_types:
+                if form is None:
+                    summary.failed += 1
+                    summary.errors.append("官網搜尋表單無法繼續使用")
+                    continue
+                if search_type not in form.search_types:
+                    summary.failed += 1
+                    summary.errors.append(f"官網搜尋表單缺少分類：{search_type}")
+                    continue
+                fields = dict(form.hidden_fields)
+                fields.update({"SchKey": search_term, "SchType": search_type})
+                try:
+                    content = self._http.submit_form(form.method, form.action_url, fields)
+                    results.extend(self._adapter.parse_results(content, form.action_url))
+                    form = self._adapter.parse_form(content, self._config.url)
+                    successful_searches += 1
+                except Exception as exc:
+                    summary.failed += 1
+                    summary.errors.append(f"{search_type} 搜尋失敗：{type(exc).__name__}")
+
+        unique_results: dict[str, AnnouncementSearchResult] = {}
+        for result in results:
+            unique_results.setdefault(result.canonical_url, result)
+        ordered = sorted(
+            unique_results.values(),
+            key=lambda item: (item.published_at is not None, item.published_at or date.min),
+            reverse=True,
+        )[: self._config.max_items]
+
+        for result in ordered:
+            if result.published_at is None:
+                summary.failed += 1
+                summary.errors.append(f"公告缺少發布日期：{result.title}")
+                continue
+            warning: str | None = None
+            body = result.body
+            try:
+                body = self._adapter.parse_detail(self._http.get(result.canonical_url))
+            except Exception:
+                warning = "公告詳情暫時無法取得，已保留搜尋結果摘要。"
+            candidate = AnnouncementCandidate(
+                title=result.title,
+                canonical_url=result.canonical_url,
+                unit=result.unit or self._config.unit,
+                category=result.category or self._config.category,
+                published_at=result.published_at,
+                deadline_at=None,
+                body=body,
+                warning=warning,
+            )
+            try:
+                outcome = self._repository.upsert(
+                    candidate,
+                    source_name=self._config.name,
+                    source_url=self._config.url,
+                    interval_minutes=self._config.crawl_interval_minutes,
+                )
+                if outcome == "created":
+                    summary.created += 1
+                elif outcome == "updated":
+                    summary.updated += 1
+                else:
+                    summary.unchanged += 1
+            except Exception as exc:
+                summary.failed += 1
+                summary.errors.append(f"公告收錄失敗：{type(exc).__name__}")
+
+        if successful_searches == 0:
+            warning = FULL_SEARCH_FAILURE_WARNING
+        elif summary.failed:
+            warning = PARTIAL_SEARCH_FAILURE_WARNING
+        else:
+            warning = None
+        return KeywordIngestionResult(expansion.retrieval_query, summary, warning)

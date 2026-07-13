@@ -86,6 +86,12 @@ def test_wiring_shares_one_openai_client_between_text_and_embeddings(monkeypatch
     assert len(clients) == 1
     assert chat_service._llm._client is clients[0]
     assert chat_service._tool_executor._retriever._embedding_provider._client is clients[0]
+    keyword_ingestor = chat_service._tool_executor._keyword_ingestor
+    crawler_service = services["crawler_service"]
+    assert keyword_ingestor is not None
+    assert keyword_ingestor._http is crawler_service._http
+    assert keyword_ingestor._repository is crawler_service._repository
+    assert keyword_ingestor.normalize("電科系") == "電腦科學與人工智慧學系"
 
 
 class MemoryDocumentRepository:

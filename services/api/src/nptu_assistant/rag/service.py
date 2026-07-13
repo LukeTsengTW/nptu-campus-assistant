@@ -20,6 +20,7 @@ from nptu_assistant.rag.models import (
 from nptu_assistant.rag.prompts import SYSTEM_INSTRUCTIONS
 from nptu_assistant.rag.tools import (
     AnnouncementRefresher,
+    KeywordAnnouncementIngestor,
     StructuredRetriever,
     ToolExecutor,
     tool_definitions,
@@ -84,10 +85,15 @@ class ChatService:
         llm: LlmProvider,
         conversation_store: ConversationStore,
         announcement_refresher: AnnouncementRefresher | None = None,
+        keyword_announcement_ingestor: KeywordAnnouncementIngestor | None = None,
     ) -> None:
         self._llm = llm
         self._conversation_store = conversation_store
-        self._tool_executor = ToolExecutor(retriever, announcement_refresher)
+        self._tool_executor = ToolExecutor(
+            retriever,
+            announcement_refresher,
+            keyword_announcement_ingestor,
+        )
 
     def delete_conversation(self, conversation_id: str) -> bool:
         return self._conversation_store.delete(conversation_id)

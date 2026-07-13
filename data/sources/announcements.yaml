@@ -1,3 +1,18 @@
+keyword_search:
+  name: nptu-association-search
+  session_url: https://www.nptu.edu.tw/app/index.php?Plugin=asso
+  bootstrap_url: https://www.nptu.edu.tw/app/index.php?Action=mobileloadmod&Type=mobilesch&Nbr=0
+  bootstrap_method: post
+  url: https://www.nptu.edu.tw/app/index.php?Plugin=asso&Action=assosearch
+  search_types:
+    - part
+    - com
+  max_items: 20
+  unit: 國立屏東大學
+  category: 關鍵字搜尋
+  aliases:
+    電科系: 電腦科學與人工智慧學系
+
 sources:
   - name: nptu-overview
     adapter: nptu_overview
