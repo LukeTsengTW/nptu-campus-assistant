@@ -107,6 +107,11 @@ def test_newest_keyword_search_is_limited_to_current_canonical_urls() -> None:
     assert urls[0] in statement
     assert urls[1] in statement
     assert "ORDER BY announcements.published_at DESC" in statement
+    assert "CASE announcements.canonical_url" in statement
+    assert "announcements.last_crawled_at DESC" not in statement
+    assert "LIMIT" not in statement
+    assert "announcements.unit ILIKE" not in statement
+    assert "sources.name NOT ILIKE" not in statement
 
 
 def test_successful_empty_keyword_scope_returns_no_announcements() -> None:

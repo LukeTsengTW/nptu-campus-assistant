@@ -10,6 +10,7 @@ from nptu_assistant.api.schemas import (
     Confidence,
     SourceReference,
 )
+from nptu_assistant.crawlers.resolution import UnitSourceResolver
 from nptu_assistant.rag.models import (
     ConversationContext,
     Evidence,
@@ -86,6 +87,7 @@ class ChatService:
         conversation_store: ConversationStore,
         announcement_refresher: AnnouncementRefresher | None = None,
         keyword_announcement_ingestor: KeywordAnnouncementIngestor | None = None,
+        unit_source_resolver: UnitSourceResolver | None = None,
     ) -> None:
         self._llm = llm
         self._conversation_store = conversation_store
@@ -93,6 +95,7 @@ class ChatService:
             retriever,
             announcement_refresher,
             keyword_announcement_ingestor,
+            unit_source_resolver,
         )
 
     def delete_conversation(self, conversation_id: str) -> bool:

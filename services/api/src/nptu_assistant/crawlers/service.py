@@ -1,25 +1,35 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol
 
 from nptu_assistant.api.schemas import CrawlSummary
-from nptu_assistant.crawlers.adapters.fixture import FixtureAdapter
-from nptu_assistant.crawlers.adapters.nptu import NptuOverviewAdapter
+from nptu_assistant.crawlers.adapters.factory import build_adapter
 from nptu_assistant.crawlers.config import CrawlerSourceConfig, load_source_configs
 from nptu_assistant.crawlers.http import CrawlHttpClient
 from nptu_assistant.crawlers.models import AnnouncementCandidate
 
 
 class AnnouncementRepository(Protocol):
-    def upsert(
+    def commit_source_refresh(
         self,
-        candidate: AnnouncementCandidate,
+        candidates: list[AnnouncementCandidate],
         *,
         source_name: str,
         source_url: str,
+        source_unit: str,
         interval_minutes: int,
-    ) -> str: ...
+        crawled_at: datetime,
+    ) -> list[str]: ...
+
+
+@dataclass(frozen=True, slots=True)
+class CrawlRunResult:
+    summary: CrawlSummary
+    canonical_urls: dict[str, tuple[str, ...]]
+    persisted_source_snapshots: frozenset[str] = frozenset()
 
 
 class CrawlerService:
@@ -37,7 +47,12 @@ class CrawlerService:
         self._workspace_root = workspace_root
 
     def run(self, source_names: list[str] | None = None) -> CrawlSummary:
+        return self.run_with_urls(source_names).summary
+
+    def run_with_urls(self, source_names: list[str] | None = None) -> CrawlRunResult:
         summary = CrawlSummary()
+        canonical_urls: dict[str, tuple[str, ...]] = {}
+        persisted_source_snapshots: set[str] = set()
         reset_robots = getattr(self._http, "reset_robots", None)
         if callable(reset_robots):
             reset_robots()
@@ -48,7 +63,7 @@ class CrawlerService:
         if unknown:
             summary.failed += len(unknown)
             summary.errors.extend(f"未知 crawler source：{name}" for name in sorted(unknown))
-            return summary
+            return CrawlRunResult(summary, canonical_urls)
         selected = [
             config
             for config in configs
@@ -56,42 +71,78 @@ class CrawlerService:
         ]
         for config in selected:
             try:
-                self._crawl_source(config, summary)
+                canonical_urls[config.name] = self._crawl_source(config, summary)
+                persisted_source_snapshots.add(config.name)
             except Exception as exc:
                 summary.failed += 1
                 summary.errors.append(f"{config.name}: {type(exc).__name__}: {exc}")
-        return summary
+        return CrawlRunResult(
+            summary,
+            canonical_urls,
+            frozenset(persisted_source_snapshots),
+        )
 
-    def _crawl_source(self, config: CrawlerSourceConfig, summary: CrawlSummary) -> None:
-        adapter = FixtureAdapter() if config.adapter == "fixture" else NptuOverviewAdapter()
+    def _crawl_source(
+        self,
+        config: CrawlerSourceConfig,
+        summary: CrawlSummary,
+    ) -> tuple[str, ...]:
+        adapter = build_adapter(config)
         if config.adapter == "fixture":
             fixture_path = self._workspace_root / config.url
             listing = fixture_path.read_text(encoding="utf-8")
-        elif config.adapter == "nptu_overview":
-            listing = self._http.get(config.url)
+        elif config.adapter == "nptu_html_list":
+            listing = self._http.get(config.url, allowed_hosts=config.allowed_hosts)
         else:
-            raise ValueError(f"未支援的 adapter：{config.adapter}")
+            listing = self._http.get(config.url)
+        resolved_candidates: list[AnnouncementCandidate] = []
         for candidate in adapter.parse_listing(listing)[: config.max_items]:
             resolved = candidate
-            if config.adapter == "fixture":
+            if config.adapter == "fixture" and self._detail_enabled(config):
                 detail_path = (self._workspace_root / config.url).with_name("detail.html")
                 if detail_path.exists():
                     resolved = self._with_body(candidate, adapter.parse_detail(detail_path.read_text(encoding="utf-8")))
-            else:
+            elif self._detail_enabled(config):
                 try:
-                    detail = self._http.get(candidate.canonical_url)
+                    detail = (
+                        self._http.get(
+                            candidate.canonical_url,
+                            allowed_hosts=config.allowed_hosts,
+                        )
+                        if config.adapter == "nptu_html_list"
+                        else self._http.get(candidate.canonical_url)
+                    )
                     resolved = self._with_body(candidate, adapter.parse_detail(detail))
                 except Exception:
-                    resolved = self._with_warning(candidate, "detail 頁面暫時無法取得，使用 feed 內容")
-            result = self._repository.upsert(
-                resolved,
-                source_name=config.name,
-                source_url=(
-                    resolved.canonical_url if config.adapter == "fixture" else config.url
-                ),
-                interval_minutes=config.crawl_interval_minutes,
-            )
+                    resolved = self._with_warning(candidate, "公告詳情暫時無法取得，使用列表內容")
+            resolved_candidates.append(resolved)
+
+        source_url = (
+            resolved_candidates[0].canonical_url
+            if config.adapter == "fixture" and resolved_candidates
+            else config.url
+        )
+        results = self._repository.commit_source_refresh(
+            resolved_candidates,
+            source_name=config.name,
+            source_url=source_url,
+            source_unit=config.unit,
+            interval_minutes=config.crawl_interval_minutes,
+            crawled_at=datetime.now(timezone.utc),
+        )
+        if len(results) != len(resolved_candidates):
+            raise RuntimeError("announcement repository 回傳的批次結果數量不一致")
+        canonical_urls: list[str] = []
+        for resolved, result in zip(resolved_candidates, results, strict=True):
             setattr(summary, result, getattr(summary, result) + 1)
+            canonical_urls.append(resolved.canonical_url)
+        return tuple(dict.fromkeys(canonical_urls))
+
+    @staticmethod
+    def _detail_enabled(config: CrawlerSourceConfig) -> bool:
+        if config.detail is not None:
+            return config.detail.enabled
+        return config.adapter in {"fixture", "nptu_overview"}
 
     @staticmethod
     def _with_body(candidate: AnnouncementCandidate, body: str) -> AnnouncementCandidate:

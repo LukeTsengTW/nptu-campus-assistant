@@ -48,3 +48,13 @@ uv run pytest tests/test_live_keyword_search.py -q
 ```
 
 此測試會請求 NPTU 官網，驗證 session、搜尋表單與結果 DOM；不寫入資料庫。未設定 `RUN_LIVE_KEYWORD_SEARCH=1` 時顯示 skipped。
+
+啟用資訊學院單位公告來源 live smoke test：
+
+```powershell
+$env:RUN_LIVE_UNIT_ANNOUNCEMENT_SOURCE="1"
+cd services/api
+uv run pytest tests/test_live_unit_announcement_source.py -q
+```
+
+此測試只讀取 `data/sources/announcements.yaml`、檢查 robots、下載資訊學院列表並驗證目前 selectors 與 canonical URL host；不建立 repository，也不寫入資料庫。未設定環境變數時明確顯示 skipped，CI 不依賴外部網站可用性。

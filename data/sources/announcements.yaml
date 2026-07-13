@@ -85,6 +85,30 @@ sources:
     enabled: true
     crawl_interval_minutes: 60
     max_items: 20
+    allowed_hosts:
+      - nptu.edu.tw
+    detail:
+      enabled: true
+  - name: information-college-html
+    adapter: nptu_html_list
+    url: https://ccs.nptu.edu.tw/p/403-1025-1019-1.php?Lang=zh-tw
+    unit: 資訊學院
+    aliases:
+      - 資訊學院
+    category: 學術單位公告
+    enabled: true
+    crawl_interval_minutes: 60
+    max_items: 20
+    allowed_hosts:
+      - ccs.nptu.edu.tw
+    selectors:
+      listing: section.mb
+      item: .row.listBS
+      date: i.mdate
+      title_link: .mtitle > a[href]
+      link_attribute: href
+    detail:
+      enabled: false
   - name: local-fixture
     adapter: fixture
     url: data/fixtures/announcements/overview.xml
@@ -92,3 +116,5 @@ sources:
     category: 測試
     enabled: false
     crawl_interval_minutes: 1440
+    detail:
+      enabled: true

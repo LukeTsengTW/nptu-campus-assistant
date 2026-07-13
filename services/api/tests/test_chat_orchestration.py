@@ -3,12 +3,16 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from datetime import date
+from pathlib import Path
 
 import pytest
 
 from nptu_assistant.api.errors import AppError
 from nptu_assistant.api.schemas import AnswerType
 from nptu_assistant.crawlers.refresh import RefreshResult
+from nptu_assistant.crawlers.config import load_keyword_search_config, load_source_configs
+from nptu_assistant.crawlers.resolution import UnitSourceResolver
+from nptu_assistant.providers.fake import FakeLlmProvider
 from nptu_assistant.rag.models import (
     ConversationContext,
     Evidence,
@@ -19,6 +23,10 @@ from nptu_assistant.rag.models import (
 )
 from nptu_assistant.rag.service import ChatService, INSUFFICIENT_ANSWER
 from nptu_assistant.rag.tools import AnnouncementSort, ToolExecutor
+
+
+WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
+CONFIG_PATH = WORKSPACE_ROOT / "data/sources/announcements.yaml"
 
 
 def evidence(
@@ -54,8 +62,12 @@ class StubRetriever:
         date_to: date | None,
         canonical_urls: tuple[str, ...] | None = None,
     ) -> list[Evidence]:
-        del canonical_urls
-        self.calls.append(("search_announcements", (query, limit, sort, unit, date_from, date_to)))
+        self.calls.append(
+            (
+                "search_announcements",
+                (query, limit, sort, unit, date_from, date_to, canonical_urls),
+            )
+        )
         return list(self.by_tool.get("search_announcements", []))  # type: ignore[arg-type]
 
     def search_documents(self, *, query: str, limit: int) -> list[Evidence]:
@@ -104,8 +116,15 @@ class StubConversationStore:
 
 
 class RecordingRefresher:
-    def __init__(self, warning: str | None = None) -> None:
+    def __init__(
+        self,
+        warning: str | None = None,
+        canonical_urls: tuple[str, ...] | None = (
+            "https://ccs.nptu.edu.tw/p/406-1025-197412,r1019.php?Lang=zh-tw",
+        ),
+    ) -> None:
         self.warning = warning
+        self.canonical_urls = canonical_urls
         self.calls: list[str] = []
 
     def ensure_fresh(self, source_name: str) -> RefreshResult:
@@ -115,7 +134,15 @@ class RecordingRefresher:
             attempted=True,
             succeeded=self.warning is None,
             warning=self.warning,
+            canonical_urls=self.canonical_urls,
         )
+
+
+def project_unit_resolver() -> UnitSourceResolver:
+    return UnitSourceResolver(
+        load_source_configs(CONFIG_PATH),
+        load_keyword_search_config(CONFIG_PATH).aliases,
+    )
 
 
 def function_turn(call_id: str, name: str, arguments: dict[str, object]) -> ModelTurn:
@@ -410,3 +437,89 @@ def test_no_result_tool_cannot_create_grounded_sources() -> None:
 
     assert response.answer == "查不到符合條件的資料。"
     assert response.sources == []
+
+
+def test_fake_chat_routes_information_college_to_one_source_and_keeps_all_urls() -> None:
+    items = [
+        replace(
+            evidence(f"information-{index}"),
+            title=f"資訊學院公告{index}",
+            url=f"https://ccs.nptu.edu.tw/a/{index}",
+            unit="資訊學院",
+            published_at=date(2026, 7, 14 - index),
+        )
+        for index in range(1, 6)
+    ]
+    retriever = StubRetriever({"search_announcements": items})
+    refresher = RecordingRefresher(
+        canonical_urls=tuple(item.url for item in items),
+    )
+
+    response = ChatService(
+        retriever,
+        FakeLlmProvider(),
+        StubConversationStore(),
+        announcement_refresher=refresher,
+        unit_source_resolver=project_unit_resolver(),
+    ).answer("幫我查資訊學院的最新公告")
+
+    assert refresher.calls == ["information-college-html"]
+    assert [call[0] for call in retriever.calls] == ["search_announcements"]
+    assert retriever.calls[0][1][-1] == tuple(item.url for item in items)
+    assert len(response.sources) == 5
+    assert all(item.url in response.answer for item in items)
+    assert [source.url for source in response.sources] == [item.url for item in items]
+
+
+@pytest.mark.parametrize(
+    ("question", "message"),
+    [
+        ("火星學院最新公告", "無法辨識"),
+        ("資訊學院研發處最新公告", "可能對應多個單位"),
+        ("研發處最新公告", "尚未設定"),
+    ],
+)
+def test_fake_chat_unit_errors_do_not_refresh_or_query(
+    question: str,
+    message: str,
+) -> None:
+    retriever = StubRetriever({})
+    refresher = RecordingRefresher()
+
+    response = ChatService(
+        retriever,
+        FakeLlmProvider(),
+        StubConversationStore(),
+        announcement_refresher=refresher,
+        unit_source_resolver=project_unit_resolver(),
+    ).answer(question)
+
+    assert message in response.answer
+    assert response.sources == []
+    assert retriever.calls == []
+    assert refresher.calls == []
+
+
+def test_unit_refresh_failure_uses_only_cached_source_snapshot_and_keeps_warning() -> None:
+    cached = replace(
+        evidence("information-cached"),
+        title="資訊學院上次成功公告",
+        url="https://ccs.nptu.edu.tw/cached/1",
+        unit="資訊學院",
+    )
+    warning = "最新公告更新失敗，以下內容來自資料庫最後成功收錄的資料。"
+    retriever = StubRetriever({"search_announcements": [cached]})
+    refresher = RecordingRefresher(warning, (cached.url,))
+
+    response = ChatService(
+        retriever,
+        FakeLlmProvider(),
+        StubConversationStore(),
+        announcement_refresher=refresher,
+        unit_source_resolver=project_unit_resolver(),
+    ).answer("資訊學院最新公告")
+
+    assert refresher.calls == ["information-college-html"]
+    assert retriever.calls[0][1][-1] == (cached.url,)
+    assert response.sources[0].url == cached.url
+    assert response.warning == warning

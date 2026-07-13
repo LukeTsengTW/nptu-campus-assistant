@@ -128,6 +128,27 @@ class MemoryAnnouncementRepository:
         self.urls.add(candidate.canonical_url)
         return "created"
 
+    def commit_source_refresh(
+        self,
+        candidates: list[AnnouncementCandidate],
+        *,
+        source_name: str,
+        source_url: str,
+        source_unit: str,
+        interval_minutes: int,
+        crawled_at: object,
+    ) -> list[str]:
+        del source_unit, crawled_at
+        return [
+            self.upsert(
+                candidate,
+                source_name=source_name,
+                source_url=source_url,
+                interval_minutes=interval_minutes,
+            )
+            for candidate in candidates
+        ]
+
 
 class UnusedHttpClient:
     def get(self, url: str) -> str:
@@ -214,6 +235,37 @@ def test_fixture_crawler_creates_then_reports_unchanged(tmp_path: Path) -> None:
     assert repository.source_urls[0].startswith("https://")
 
 
+def test_empty_fixture_listing_is_a_successful_empty_source_scope(tmp_path: Path) -> None:
+    fixture_dir = tmp_path / "data/fixtures/announcements"
+    fixture_dir.mkdir(parents=True)
+    fixture_dir.joinpath("overview.xml").write_text(
+        "<?xml version='1.0'?><rss><channel></channel></rss>",
+        encoding="utf-8",
+    )
+    config = tmp_path / "sources.yaml"
+    config.write_text(
+        """sources:
+  - name: empty-fixture
+    adapter: fixture
+    url: data/fixtures/announcements/overview.xml
+    unit: 測試單位
+    enabled: false
+""",
+        encoding="utf-8",
+    )
+    service = CrawlerService(
+        config,
+        MemoryAnnouncementRepository(),
+        UnusedHttpClient(),
+        workspace_root=tmp_path,
+    )
+
+    result = service.run_with_urls(["empty-fixture"])
+
+    assert result.summary.failed == 0
+    assert result.canonical_urls == {"empty-fixture": ()}
+
+
 def test_http_client_checks_robots_and_retries_twice() -> None:
     attempts = {"listing": 0}
 
@@ -236,6 +288,19 @@ def test_http_client_checks_robots_and_retries_twice() -> None:
         client.close()
 
     assert attempts["listing"] == 3
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"interval_seconds": -1},
+        {"max_response_bytes": 0},
+        {"max_redirects": -1},
+    ],
+)
+def test_http_client_rejects_invalid_resource_limits(kwargs: dict[str, int]) -> None:
+    with pytest.raises(ValueError):
+        CrawlHttpClient("NPTU-Test/1.0", **kwargs)
 
 
 def test_http_client_rechecks_robots_after_reset() -> None:
@@ -264,7 +329,10 @@ def test_http_client_rechecks_robots_after_reset() -> None:
 
 
 def test_http_client_rejects_redirect_outside_nptu_allowlist() -> None:
+    requested_hosts: list[str] = []
+
     def handler(request: httpx.Request) -> httpx.Response:
+        requested_hosts.append(str(request.url.host))
         if request.url.path == "/robots.txt":
             return httpx.Response(200, text="User-agent: *\nAllow: /", request=request)
         if request.url.host == "www.nptu.edu.tw":
@@ -279,6 +347,125 @@ def test_http_client_rejects_redirect_outside_nptu_allowlist() -> None:
     )
     try:
         with pytest.raises(ValueError, match="allowlist"):
+            client.get("https://www.nptu.edu.tw/list")
+    finally:
+        client.close()
+
+    assert "example.com" not in requested_hosts
+
+
+def test_http_client_rejects_redirect_outside_source_host_before_request() -> None:
+    requested_hosts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_hosts.append(str(request.url.host))
+        if request.url.path == "/robots.txt":
+            return httpx.Response(200, text="User-agent: *\nAllow: /", request=request)
+        return httpx.Response(
+            302,
+            headers={"Location": "https://www.nptu.edu.tw/content"},
+            request=request,
+        )
+
+    client = CrawlHttpClient(
+        "NPTU-Test/1.0",
+        interval_seconds=0,
+        sleep=lambda _: None,
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        with pytest.raises(ValueError, match="allowlist"):
+            client.get(
+                "https://ccs.nptu.edu.tw/list",
+                allowed_hosts=["ccs.nptu.edu.tw"],
+            )
+    finally:
+        client.close()
+
+    assert "www.nptu.edu.tw" not in requested_hosts
+
+
+def test_http_client_allows_validated_redirect_and_checks_target_robots() -> None:
+    robots_hosts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/robots.txt":
+            robots_hosts.append(str(request.url.host))
+            return httpx.Response(200, text="User-agent: *\nAllow: /", request=request)
+        if request.url.host == "ccs.nptu.edu.tw":
+            return httpx.Response(
+                302,
+                headers={"Location": "https://news.ccs.nptu.edu.tw/content"},
+                request=request,
+            )
+        return httpx.Response(200, text="redirected", request=request)
+
+    client = CrawlHttpClient(
+        "NPTU-Test/1.0",
+        interval_seconds=0,
+        sleep=lambda _: None,
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        assert client.get(
+            "https://ccs.nptu.edu.tw/list",
+            allowed_hosts=["ccs.nptu.edu.tw"],
+        ) == "redirected"
+    finally:
+        client.close()
+
+    assert robots_hosts == ["ccs.nptu.edu.tw", "news.ccs.nptu.edu.tw"]
+
+
+def test_http_client_get_form_redirect_uses_location_query_without_reapplying_fields() -> None:
+    requested_queries: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/robots.txt":
+            return httpx.Response(200, text="User-agent: *\nAllow: /", request=request)
+        requested_queries.append(str(request.url.query))
+        if request.url.path == "/search":
+            return httpx.Response(
+                302,
+                headers={"Location": "/results?token=abc"},
+                request=request,
+            )
+        return httpx.Response(200, text="redirected", request=request)
+
+    client = CrawlHttpClient(
+        "NPTU-Test/1.0",
+        interval_seconds=0,
+        sleep=lambda _: None,
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        result = client.submit_form(
+            "get",
+            "https://www.nptu.edu.tw/search",
+            {"SchKey": "test"},
+        )
+    finally:
+        client.close()
+
+    assert result == "redirected"
+    assert requested_queries == ["b'SchKey=test'", "b'token=abc'"]
+
+
+def test_http_client_rejects_oversized_response() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/robots.txt":
+            return httpx.Response(200, text="User-agent: *\nAllow: /", request=request)
+        return httpx.Response(200, content=b"12345", request=request)
+
+    client = CrawlHttpClient(
+        "NPTU-Test/1.0",
+        interval_seconds=0,
+        max_response_bytes=4,
+        sleep=lambda _: None,
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        with pytest.raises(ValueError, match="大小上限"):
             client.get("https://www.nptu.edu.tw/list")
     finally:
         client.close()

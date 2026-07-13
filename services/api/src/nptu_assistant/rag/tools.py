@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from enum import StrEnum
 from typing import Protocol
@@ -9,6 +9,7 @@ from typing import Protocol
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from nptu_assistant.crawlers.refresh import REFRESH_FAILURE_WARNING, RefreshResult
+from nptu_assistant.crawlers.resolution import UnitResolutionStatus, UnitSourceResolver
 from nptu_assistant.crawlers.search import FULL_SEARCH_FAILURE_WARNING, KeywordIngestionResult
 from nptu_assistant.rag.models import Evidence
 
@@ -170,16 +171,57 @@ def _error(code: str, message: str) -> ToolExecutionResult:
     )
 
 
+class UnitResolutionError(Exception):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
 class ToolExecutor:
     def __init__(
         self,
         retriever: StructuredRetriever,
         refresher: AnnouncementRefresher | None = None,
         keyword_ingestor: KeywordAnnouncementIngestor | None = None,
+        unit_resolver: UnitSourceResolver | None = None,
     ) -> None:
         self._retriever = retriever
         self._refresher = refresher
         self._keyword_ingestor = keyword_ingestor
+        self._unit_resolver = unit_resolver
+
+    def _resolve_unit_source(
+        self,
+        parsed: SearchAnnouncementsArguments,
+    ) -> tuple[str, str] | None:
+        if self._unit_resolver is None:
+            return None
+        resolution = self._unit_resolver.resolve(parsed.unit, parsed.query)
+        if resolution.status is UnitResolutionStatus.NONE:
+            return None
+        if resolution.status is UnitResolutionStatus.UNKNOWN:
+            raise UnitResolutionError(
+                "unknown_unit",
+                f"無法辨識「{resolution.requested}」對應的校內單位，請提供正式單位名稱。",
+            )
+        if resolution.status is UnitResolutionStatus.AMBIGUOUS:
+            candidates = "、".join(resolution.candidates)
+            raise UnitResolutionError(
+                "ambiguous_unit",
+                f"單位名稱可能對應多個單位（{candidates}），請指定完整名稱。",
+            )
+        if resolution.status is UnitResolutionStatus.UNSUPPORTED:
+            raise UnitResolutionError(
+                "unsupported_unit_source",
+                f"目前尚未設定「{resolution.canonical_unit}」的官方公告來源。",
+            )
+        if resolution.source is None or resolution.canonical_unit is None:
+            raise UnitResolutionError(
+                "unknown_unit",
+                "無法確認單位的官方公告來源，請提供完整單位名稱。",
+            )
+        return resolution.canonical_unit, resolution.source.name
 
     def _refresh_warning(self, parsed: SearchAnnouncementsArguments) -> str | None:
         if parsed.sort is not AnnouncementSort.NEWEST or self._refresher is None:
@@ -196,7 +238,25 @@ class ToolExecutor:
         arguments = parsed.model_dump()
         arguments["canonical_urls"] = None
         warning: str | None = None
-        if parsed.query and self._keyword_ingestor is not None:
+        resolved_source = self._resolve_unit_source(parsed)
+        if resolved_source is not None:
+            canonical_unit, source_name = resolved_source
+            arguments["unit"] = canonical_unit
+            if parsed.sort is AnnouncementSort.RELEVANCE:
+                arguments["sort"] = AnnouncementSort.NEWEST
+            arguments["canonical_urls"] = ()
+            if self._refresher is None:
+                warning = REFRESH_FAILURE_WARNING
+            else:
+                try:
+                    refresh = self._refresher.ensure_fresh(source_name)
+                    arguments["canonical_urls"] = (
+                        () if refresh.canonical_urls is None else refresh.canonical_urls
+                    )
+                    warning = refresh.warning
+                except Exception:
+                    warning = REFRESH_FAILURE_WARNING
+        elif parsed.query and self._keyword_ingestor is not None:
             try:
                 arguments["query"] = self._keyword_ingestor.normalize(parsed.query)
                 if parsed.unit:
@@ -209,7 +269,10 @@ class ToolExecutor:
                 warning = FULL_SEARCH_FAILURE_WARNING
         elif not parsed.query:
             warning = self._refresh_warning(parsed)
-        return self._retriever.search_announcements(**arguments), warning
+        evidence = self._retriever.search_announcements(**arguments)
+        if resolved_source is not None:
+            evidence = [replace(item, unit=resolved_source[0]) for item in evidence]
+        return evidence, warning
 
     def execute(self, name: str, arguments: str) -> ToolExecutionResult:
         validators: dict[str, type[BaseModel]] = {
@@ -240,6 +303,8 @@ class ToolExecutor:
                 item = self._retriever.get_announcement(parsed.announcement_id)
                 evidence = [item] if item else []
                 content_limit = 8_000
+        except UnitResolutionError as exc:
+            return _error(exc.code, exc.message)
         except ValueError:
             return _error("invalid_tool_arguments", "工具參數格式或範圍不正確。")
         except Exception:

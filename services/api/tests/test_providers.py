@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import httpx
@@ -60,24 +61,263 @@ def test_fake_llm_runs_a_deterministic_tool_then_grounded_answer() -> None:
             {
                 "type": "function_call_output",
                 "call_id": "fake-announcements",
-                "output": '{"results":[{"id":"announcement-1","title":"測試公告","content":"公告內容","score":0.8}],"count":1}',
-            },
-            {
-                "type": "function_call_output",
-                "call_id": "fake-documents",
-                "output": '{"results":[{"id":"document-1","title":"無關文件","content":"無關內容","score":0.2}],"count":1}',
+                "output": '{"results":[{"id":"announcement-1","kind":"announcement","title":"測試公告","url":"https://www.nptu.edu.tw/a","unit":"教務處","published_at":"2026-07-13","content":"公告內容","score":0.8}],"count":1}',
             },
         ],
         tools=[],
     )
 
-    assert {call.name for call in first.tool_calls} == {
-        "search_announcements",
-        "search_documents",
-    }
+    assert [call.name for call in first.tool_calls] == ["search_announcements"]
+    assert json.loads(first.tool_calls[0].arguments)["query"] is None
     assert second.generated is not None
     assert second.generated.used_source_ids == ["announcement-1"]
-    assert "公告內容" in second.generated.answer
+    assert "2026-07-13｜測試公告" in second.generated.answer
+    assert "https://www.nptu.edu.tw/a" in second.generated.answer
+
+
+def test_fake_llm_treats_general_recent_announcements_as_an_unfiltered_listing() -> None:
+    turn = FakeLlmProvider().create_turn(
+        instructions="test",
+        input_items=[{"role": "user", "content": "一般最近公告"}],
+        tools=[],
+    )
+
+    assert [call.name for call in turn.tool_calls] == ["search_announcements"]
+    assert json.loads(turn.tool_calls[0].arguments)["query"] is None
+
+
+def test_fake_llm_routes_unit_announcement_and_unit_introduction_to_different_tools() -> None:
+    provider = FakeLlmProvider()
+
+    announcement = provider.create_turn(
+        instructions="test",
+        input_items=[{"role": "user", "content": "資訊學院最新公告"}],
+        tools=[],
+    )
+    introduction = provider.create_turn(
+        instructions="test",
+        input_items=[{"role": "user", "content": "資訊學院介紹"}],
+        tools=[],
+    )
+
+    assert [call.name for call in announcement.tool_calls] == ["search_announcements"]
+    arguments = json.loads(announcement.tool_calls[0].arguments)
+    assert arguments["unit"] == "資訊學院"
+    assert arguments["sort"] == "newest"
+    assert arguments["limit"] == 5
+    assert [call.name for call in introduction.tool_calls] == ["search_documents"]
+
+
+@pytest.mark.parametrize(
+    ("question", "expected_limit"),
+    [
+        ("資訊學院最新 20 則公告", 20),
+        ("資訊學院最新十二則公告", 12),
+        ("資訊學院最新 30 則公告", 20),
+    ],
+)
+def test_fake_llm_honors_explicit_announcement_count_up_to_twenty(
+    question: str,
+    expected_limit: int,
+) -> None:
+    turn = FakeLlmProvider().create_turn(
+        instructions="test",
+        input_items=[{"role": "user", "content": question}],
+        tools=[],
+    )
+
+    arguments = json.loads(turn.tool_calls[0].arguments)
+    assert arguments["limit"] == expected_limit
+    assert arguments["query"] is None
+
+
+def test_fake_llm_explains_when_requested_announcement_count_exceeds_limit() -> None:
+    question = "資訊學院最新 30 則公告"
+    turn = FakeLlmProvider().create_turn(
+        instructions="test",
+        input_items=[
+            {"role": "user", "content": question},
+            {
+                "type": "function_call_output",
+                "call_id": "fake-announcements",
+                "output": json.dumps(
+                    {
+                        "results": [
+                            {
+                                "id": "announcement-1",
+                                "kind": "announcement",
+                                "title": "測試公告",
+                                "url": "https://ccs.nptu.edu.tw/a",
+                                "unit": "資訊學院",
+                                "published_at": "2026-07-13",
+                                "score": 0.0,
+                            }
+                        ],
+                        "count": 1,
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+        ],
+        tools=[],
+    )
+
+    assert turn.generated is not None
+    assert "單次查詢上限為 20 則" in turn.generated.answer
+
+
+def test_fake_llm_treats_document_disclaimer_announcement_text_as_document_intent() -> None:
+    provider = FakeLlmProvider()
+    question = (
+        "學生申請請假時，應依規定檢附證明文件，並在期限內完成申請程序。"
+        "核准結果仍應以國立屏東大學最新公告及正式文件為準。"
+    )
+
+    first = provider.create_turn(
+        instructions="test",
+        input_items=[{"role": "user", "content": question}],
+        tools=[],
+    )
+    final = provider.create_turn(
+        instructions="test",
+        input_items=[
+            {"role": "user", "content": question},
+            {
+                "type": "function_call_output",
+                "call_id": "fake-documents",
+                "output": json.dumps(
+                    {
+                        "results": [
+                            {
+                                "id": "document-1",
+                                "kind": "official_document",
+                                "title": "學生請假規定",
+                                "url": "https://www.nptu.edu.tw/rule",
+                                "unit": "學務處",
+                                "published_at": "2026-01-01",
+                                "content": "請假申請應檢附證明文件。",
+                                "score": 0.8,
+                            }
+                        ],
+                        "count": 1,
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+        ],
+        tools=[],
+    )
+
+    assert [call.name for call in first.tool_calls] == ["search_documents"]
+    assert final.generated is not None
+    assert "請假申請應檢附證明文件" in final.generated.answer
+    assert "根據「學生請假規定」" in final.generated.answer
+
+
+def test_fake_llm_preserves_all_announcement_results_and_source_ids_in_tool_order() -> None:
+    provider = FakeLlmProvider()
+    results = [
+        {
+            "id": f"announcement-{index}",
+            "kind": "announcement",
+            "title": f"公告{index}",
+            "url": f"https://ccs.nptu.edu.tw/a/{index}",
+            "unit": "資訊學院",
+            "published_at": f"2026-07-{14 - index:02d}",
+            "content": f"內容{index}",
+            "score": index / 10,
+        }
+        for index in range(1, 6)
+    ]
+
+    turn = provider.create_turn(
+        instructions="test",
+        input_items=[
+            {"role": "user", "content": "資訊學院最新公告"},
+            {
+                "type": "function_call_output",
+                "call_id": "fake-announcements",
+                "output": json.dumps({"results": results, "count": 5}, ensure_ascii=False),
+            },
+        ],
+        tools=[],
+    )
+
+    assert turn.generated is not None
+    assert turn.generated.used_source_ids == [f"announcement-{index}" for index in range(1, 6)]
+    assert turn.generated.answer.index("公告1") < turn.generated.answer.index("公告5")
+    assert all(item["url"] in turn.generated.answer for item in results)
+    assert "announcement-1" not in turn.generated.answer
+
+
+def test_fake_llm_rejects_zero_relevance_official_documents() -> None:
+    turn = FakeLlmProvider().create_turn(
+        instructions="test",
+        input_items=[
+            {"role": "user", "content": "請假規定"},
+            {
+                "type": "function_call_output",
+                "call_id": "fake-documents",
+                "output": json.dumps(
+                    {
+                        "results": [
+                            {
+                                "id": "document-unrelated",
+                                "kind": "official_document",
+                                "title": "無關文件",
+                                "url": "https://www.nptu.edu.tw/unrelated",
+                                "content": "與問題無關的內容",
+                                "score": 0.0,
+                            }
+                        ],
+                        "count": 1,
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+        ],
+        tools=[],
+    )
+
+    assert turn.generated is not None
+    assert turn.generated.response_kind is ResponseKind.INSUFFICIENT
+    assert turn.generated.used_source_ids == []
+    assert "無關文件" not in turn.generated.answer
+
+
+@pytest.mark.parametrize(
+    ("code", "kind"),
+    [
+        ("unknown_unit", ResponseKind.CLARIFICATION),
+        ("ambiguous_unit", ResponseKind.CLARIFICATION),
+        ("unsupported_unit_source", ResponseKind.INSUFFICIENT),
+    ],
+)
+def test_fake_llm_uses_structured_unit_error_without_guessing(
+    code: str,
+    kind: ResponseKind,
+) -> None:
+    message = "請提供可辨識且已支援的正式單位名稱。"
+    turn = FakeLlmProvider().create_turn(
+        instructions="test",
+        input_items=[
+            {"role": "user", "content": "火星學院最新公告"},
+            {
+                "type": "function_call_output",
+                "call_id": "fake-announcements",
+                "output": json.dumps(
+                    {"error": {"code": code, "message": message}},
+                    ensure_ascii=False,
+                ),
+            },
+        ],
+        tools=[],
+    )
+
+    assert turn.generated is not None
+    assert turn.generated.answer == message
+    assert turn.generated.response_kind is kind
+    assert turn.generated.used_source_ids == []
 
 
 def test_openai_provider_parses_function_calls_and_preserves_output_items() -> None:

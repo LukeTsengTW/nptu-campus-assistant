@@ -40,6 +40,15 @@ class Source(TimestampMixin, Base):
     source_type: Mapped[str] = mapped_column(String(50), nullable=False)
     crawl_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     crawl_interval_minutes: Mapped[int] = mapped_column(Integer, default=60, nullable=False)
+    canonical_urls: Mapped[list[str]] = mapped_column(
+        JSONB,
+        default=list,
+        server_default=text("'[]'::jsonb"),
+        nullable=False,
+    )
+    last_successful_crawl_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
 
     documents: Mapped[list[Document]] = relationship(back_populates="source")
     announcements: Mapped[list[Announcement]] = relationship(back_populates="source")

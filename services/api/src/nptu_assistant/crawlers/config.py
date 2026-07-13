@@ -1,23 +1,79 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from soupsieve import SelectorSyntaxError, compile as compile_selector
 
-from nptu_assistant.core.security import is_allowed_nptu_url
+from nptu_assistant.core.security import is_allowed_nptu_url, is_allowed_source_url
+
+
+class HtmlListingSelectors(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    listing: str
+    item: str
+    date: str
+    title_link: str
+    link_attribute: str = "href"
+
+    @field_validator("listing", "item", "date", "title_link")
+    @classmethod
+    def validate_selector(cls, value: str) -> str:
+        if not value:
+            raise ValueError("CSS selector 不得為空")
+        try:
+            compile_selector(value)
+        except SelectorSyntaxError as exc:
+            raise ValueError(f"CSS selector 語法錯誤：{value}") from exc
+        return value
+
+    @field_validator("link_attribute")
+    @classmethod
+    def validate_link_attribute(cls, value: str) -> str:
+        if not re.fullmatch(r"[A-Za-z_:][A-Za-z0-9_.:-]*", value):
+            raise ValueError("link attribute 名稱不合法")
+        return value
+
+
+class DetailPageConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    enabled: bool = False
+    content_selector: str | None = None
+
+    @field_validator("content_selector")
+    @classmethod
+    def validate_content_selector(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not value:
+            raise ValueError("detail content selector 不得為空")
+        try:
+            compile_selector(value)
+        except SelectorSyntaxError as exc:
+            raise ValueError(f"CSS selector 語法錯誤：{value}") from exc
+        return value
 
 
 class CrawlerSourceConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
     name: str
     adapter: str
     url: str
     unit: str
+    aliases: list[str] = Field(default_factory=list)
     category: str | None = None
     enabled: bool = True
     crawl_interval_minutes: int = Field(default=60, ge=1)
     max_items: int = Field(default=50, ge=1, le=200)
+    allowed_hosts: list[str] = Field(default_factory=list)
+    selectors: HtmlListingSelectors | None = None
+    detail: DetailPageConfig | None = None
 
     @field_validator("url")
     @classmethod
@@ -27,8 +83,56 @@ class CrawlerSourceConfig(BaseModel):
             raise ValueError("crawler URL 必須是 NPTU 官方 HTTPS 網址")
         return value
 
+    @field_validator("name", "unit")
+    @classmethod
+    def validate_required_text(cls, value: str) -> str:
+        if not value:
+            raise ValueError("source name 與 unit 不得為空")
+        return value
+
+    @field_validator("aliases")
+    @classmethod
+    def validate_aliases(cls, value: list[str]) -> list[str]:
+        normalized = [alias.strip() for alias in value]
+        if any(not alias for alias in normalized):
+            raise ValueError("來源別名不得為空")
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("來源別名不可重複")
+        return normalized
+
+    @field_validator("allowed_hosts")
+    @classmethod
+    def validate_allowed_hosts(cls, value: list[str]) -> list[str]:
+        normalized = [host.strip().lower().rstrip(".") for host in value]
+        if any(
+            not host
+            or not re.fullmatch(r"[a-z0-9.-]+", host)
+            or not is_allowed_nptu_url(f"https://{host}/")
+            for host in normalized
+        ):
+            raise ValueError("allowed host 必須是 NPTU 官方網域")
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("allowed host 不可重複")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_html_source(self) -> "CrawlerSourceConfig":
+        if self.adapter != "nptu_html_list":
+            return self
+        if not self.aliases:
+            raise ValueError("HTML 單位來源必須設定至少一個別名")
+        if not self.allowed_hosts:
+            raise ValueError("HTML 單位來源必須設定 allowed hosts")
+        if self.selectors is None:
+            raise ValueError("HTML 單位來源必須設定 selectors")
+        if not is_allowed_source_url(self.url, self.allowed_hosts):
+            raise ValueError("來源 URL host 不在來源 allowlist")
+        return self
+
 
 class KeywordSearchConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
     name: str
     session_url: str
     bootstrap_url: str

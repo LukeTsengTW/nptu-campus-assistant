@@ -6,10 +6,13 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+import yaml
 from fastapi.testclient import TestClient
 from sqlalchemy import select
+from sqlalchemy.exc import DataError
 
 from nptu_assistant.core.settings import Settings
+from nptu_assistant.crawlers.models import AnnouncementCandidate
 from nptu_assistant.crawlers.service import CrawlerService
 from nptu_assistant.api.schemas import AnswerType
 from nptu_assistant.db.models import Announcement, Conversation, ConversationEvent, Document, Source
@@ -40,8 +43,18 @@ class NoNetworkHttpClient:
         raise AssertionError(f"fixture attempted a network request: {url}")
 
 
-def test_fixture_ingestion_crawl_and_grounded_chat() -> None:
+def test_fixture_ingestion_crawl_and_grounded_chat(tmp_path: Path) -> None:
     database_url = os.environ["DATABASE_URL"]
+    crawler_payload = yaml.safe_load(
+        (WORKSPACE_ROOT / "data/sources/announcements.yaml").read_text(encoding="utf-8")
+    )
+    for source in crawler_payload["sources"]:
+        source["enabled"] = False
+    crawler_config = tmp_path / "announcements.yaml"
+    crawler_config.write_text(
+        yaml.safe_dump(crawler_payload, allow_unicode=True),
+        encoding="utf-8",
+    )
     settings = Settings(
         _env_file=None,
         app_env="test",
@@ -53,7 +66,7 @@ def test_fixture_ingestion_crawl_and_grounded_chat() -> None:
         admin_api_key="integration-admin-key",
         cors_allowed_origins="http://localhost:3000",
         official_documents_path="data/fixtures/official-documents",
-        crawler_config_path="data/sources/announcements.yaml",
+        crawler_config_path=str(crawler_config),
         crawler_request_interval_seconds=0,
     )
     headers = {"X-Admin-Key": "integration-admin-key"}
@@ -322,9 +335,10 @@ def test_announcement_content_change_reports_updated_then_unchanged(tmp_path: Pa
     )
     settings = Settings(_env_file=None, database_url=os.environ["DATABASE_URL"])
     factory = create_session_factory(settings)
+    repository = SqlAnnouncementRepository(factory)
     service = CrawlerService(
         config,
-        SqlAnnouncementRepository(factory),
+        repository,
         NoNetworkHttpClient(),
         workspace_root=tmp_path,
     )
@@ -337,3 +351,145 @@ def test_announcement_content_change_reports_updated_then_unchanged(tmp_path: Pa
     assert first.created == 1
     assert second.updated == 1
     assert third.unchanged == 1
+    assert repository.canonical_urls_for_source(f"integration-fixture-{unique}") == (
+        canonical_url,
+    )
+    assert repository.latest_crawled_at(f"integration-fixture-{unique}") is not None
+
+
+def test_announcement_source_snapshot_tri_state_and_metadata_only_update() -> None:
+    settings = Settings(_env_file=None, database_url=os.environ["DATABASE_URL"])
+    factory = create_session_factory(settings)
+    repository = SqlAnnouncementRepository(factory)
+    unique = uuid.uuid4().hex
+    source_name = f"integration-source-snapshot-{unique}"
+    source_url = "https://ccs.nptu.edu.tw/index.php"
+    canonical_url = f"https://ccs.nptu.edu.tw/{unique}/announcement"
+    crawled_at = datetime.now(timezone.utc)
+
+    assert repository.latest_crawled_at(source_name) is None
+    assert repository.canonical_urls_for_source(source_name) is None
+
+    repository.record_source_refresh(
+        source_name=source_name,
+        source_url=source_url,
+        unit="資訊學院",
+        interval_minutes=60,
+        canonical_urls=(),
+        crawled_at=crawled_at,
+    )
+
+    assert repository.latest_crawled_at(source_name) == crawled_at
+    assert repository.canonical_urls_for_source(source_name) == ()
+
+    ordered_urls = (
+        canonical_url,
+        f"https://ccs.nptu.edu.tw/{unique}/second",
+        canonical_url,
+    )
+    repository.record_source_refresh(
+        source_name=source_name,
+        source_url=source_url,
+        unit="資訊學院",
+        interval_minutes=60,
+        canonical_urls=ordered_urls,
+        crawled_at=crawled_at + timedelta(minutes=1),
+    )
+    assert repository.canonical_urls_for_source(source_name) == ordered_urls[:2]
+
+    original = AnnouncementCandidate(
+        title="快照整合測試公告",
+        canonical_url=canonical_url,
+        unit="舊單位",
+        category="舊分類",
+        published_at=date(2026, 7, 1),
+        deadline_at=None,
+        body="內容不變",
+        warning=None,
+    )
+    updated_metadata = AnnouncementCandidate(
+        title=original.title,
+        canonical_url=canonical_url,
+        unit="資訊學院",
+        category="學術單位公告",
+        published_at=date(2026, 7, 2),
+        deadline_at=date(2026, 7, 31),
+        body=original.body,
+        warning="測試警告",
+    )
+
+    assert repository.upsert(
+        original,
+        source_name=source_name,
+        source_url=source_url,
+        interval_minutes=60,
+    ) == "created"
+    assert repository.upsert(
+        updated_metadata,
+        source_name=source_name,
+        source_url=source_url,
+        interval_minutes=60,
+    ) == "unchanged"
+
+    with factory() as session:
+        stored = session.scalar(
+            select(Announcement).where(Announcement.canonical_url == canonical_url)
+        )
+    assert stored is not None
+    assert stored.unit == "資訊學院"
+    assert stored.category == "學術單位公告"
+    assert stored.published_at == date(2026, 7, 2)
+    assert stored.deadline_at == date(2026, 7, 31)
+    assert stored.warning == "測試警告"
+
+
+def test_bulk_announcement_upsert_rolls_back_every_item_on_one_database_error() -> None:
+    settings = Settings(_env_file=None, database_url=os.environ["DATABASE_URL"])
+    factory = create_session_factory(settings)
+    repository = SqlAnnouncementRepository(factory)
+    unique = uuid.uuid4().hex
+    good_url = f"https://ccs.nptu.edu.tw/{unique}/good"
+    bad_url = f"https://ccs.nptu.edu.tw/{unique}/bad"
+    candidates = [
+        AnnouncementCandidate(
+            title="可寫入公告",
+            canonical_url=good_url,
+            unit="資訊學院",
+            category="學術單位公告",
+            published_at=date(2026, 7, 13),
+            deadline_at=None,
+            body="正常內容",
+        ),
+        AnnouncementCandidate(
+            title="過長" * 251,
+            canonical_url=bad_url,
+            unit="資訊學院",
+            category="學術單位公告",
+            published_at=date(2026, 7, 12),
+            deadline_at=None,
+            body="會觸發資料庫長度限制",
+        ),
+    ]
+
+    source_name = f"integration-atomic-{unique}"
+    crawled_at = datetime.now(timezone.utc)
+
+    with pytest.raises(DataError):
+        repository.commit_source_refresh(
+            candidates,
+            source_name=source_name,
+            source_url="https://ccs.nptu.edu.tw/index.php",
+            source_unit="資訊學院",
+            interval_minutes=60,
+            crawled_at=crawled_at,
+        )
+
+    with factory() as session:
+        stored_urls = session.scalars(
+            select(Announcement.canonical_url).where(
+                Announcement.canonical_url.in_([good_url, bad_url])
+            )
+        ).all()
+    assert stored_urls == []
+    assert repository.latest_crawled_at(source_name) is None
+    assert repository.canonical_urls_for_source(source_name) is None

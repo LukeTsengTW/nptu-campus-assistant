@@ -6,7 +6,11 @@ from pydantic import ValidationError
 from nptu_assistant.api.schemas import SourceReference
 from nptu_assistant.core.logging import redact_sensitive_fields
 from nptu_assistant.core.rate_limit import InMemoryRateLimiter
-from nptu_assistant.core.security import is_allowed_nptu_url
+from nptu_assistant.core.security import (
+    canonicalize_nptu_url,
+    is_allowed_nptu_url,
+    is_allowed_source_url,
+)
 from nptu_assistant.core.settings import Settings, WORKSPACE_ROOT, resolve_workspace_path
 
 
@@ -65,10 +69,31 @@ def test_settings_reject_wildcard_cors() -> None:
         ("https://evil-nptu.edu.tw/", False),
         ("http://www.nptu.edu.tw/", False),
         ("https://nptu.edu.tw.evil.example/", False),
+        ("https://user@nptu.edu.tw/", False),
+        ("https://nptu.edu.tw:8443/", False),
+        ("https://nptu.edu.tw:443/", True),
     ],
 )
 def test_nptu_url_allowlist(url: str, allowed: bool) -> None:
     assert is_allowed_nptu_url(url) is allowed
+
+
+def test_source_url_allowlist_uses_domain_boundaries() -> None:
+    allowed_hosts = ["ccs.nptu.edu.tw"]
+
+    assert is_allowed_source_url("https://ccs.nptu.edu.tw/index.php", allowed_hosts)
+    assert is_allowed_source_url("https://news.ccs.nptu.edu.tw/item", allowed_hosts)
+    assert not is_allowed_source_url("https://www.nptu.edu.tw/item", allowed_hosts)
+    assert not is_allowed_source_url("https://evilccs.nptu.edu.tw/item", allowed_hosts)
+
+
+def test_canonicalize_nptu_url_removes_fragment_and_default_port() -> None:
+    assert canonicalize_nptu_url(
+        "https://CCS.NPTU.EDU.TW:443/p/406.php?Lang=zh-tw#content"
+    ) == "https://ccs.nptu.edu.tw/p/406.php?Lang=zh-tw"
+
+    with pytest.raises(ValueError, match="NPTU"):
+        canonicalize_nptu_url("https://example.com/item")
 
 
 def test_rate_limiter_blocks_after_limit() -> None:

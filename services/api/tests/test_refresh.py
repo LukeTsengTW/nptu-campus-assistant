@@ -12,28 +12,59 @@ from nptu_assistant.crawlers.refresh import (
     AnnouncementRefreshScheduler,
     RefreshResult,
 )
+from nptu_assistant.crawlers.service import CrawlRunResult
 
 
 NOW = datetime(2026, 7, 13, 12, 0, tzinfo=timezone.utc)
 
 
 class MemoryFreshnessRepository:
-    def __init__(self, last_crawled_at: datetime | None) -> None:
+    def __init__(
+        self,
+        last_crawled_at: datetime | None,
+        canonical_urls: tuple[str, ...] | None = None,
+    ) -> None:
         self.last_crawled_at_value = last_crawled_at
+        self.canonical_urls_value = canonical_urls
+        self.refreshes: list[dict[str, object]] = []
 
     def latest_crawled_at(self, source_name: str) -> datetime | None:
         assert source_name == "nptu-overview"
         return self.last_crawled_at_value
 
+    def canonical_urls_for_source(self, source_name: str) -> tuple[str, ...] | None:
+        assert source_name == "nptu-overview"
+        return self.canonical_urls_value
+
+    def record_source_refresh(self, **values: object) -> None:
+        self.refreshes.append(values)
+        self.last_crawled_at_value = values["crawled_at"]  # type: ignore[assignment]
+        self.canonical_urls_value = values["canonical_urls"]  # type: ignore[assignment]
+
 
 class RecordingCrawler:
-    def __init__(self, summary: CrawlSummary | None = None) -> None:
+    def __init__(
+        self,
+        summary: CrawlSummary | None = None,
+        canonical_urls: tuple[str, ...] = (
+            "https://www.nptu.edu.tw/p/406-1000-200001.php",
+        ),
+        *,
+        persisted_source_snapshots: bool = False,
+    ) -> None:
         self.summary = summary or CrawlSummary(unchanged=20)
+        self.canonical_urls = canonical_urls
+        self.persisted_source_snapshots = persisted_source_snapshots
         self.calls: list[list[str] | None] = []
 
-    def run(self, source_names: list[str] | None = None) -> CrawlSummary:
+    def run_with_urls(self, source_names: list[str] | None = None) -> CrawlRunResult:
         self.calls.append(source_names)
-        return self.summary
+        names = source_names or ["nptu-overview"]
+        return CrawlRunResult(
+            self.summary,
+            {name: self.canonical_urls for name in names} if not self.summary.failed else {},
+            frozenset(names) if self.persisted_source_snapshots else frozenset(),
+        )
 
 
 class BlockingCrawler(RecordingCrawler):
@@ -42,11 +73,14 @@ class BlockingCrawler(RecordingCrawler):
         self.started = threading.Event()
         self.release = threading.Event()
 
-    def run(self, source_names: list[str] | None = None) -> CrawlSummary:
+    def run_with_urls(self, source_names: list[str] | None = None) -> CrawlRunResult:
         self.calls.append(source_names)
         self.started.set()
         assert self.release.wait(timeout=1)
-        return self.summary
+        return CrawlRunResult(
+            self.summary,
+            {"nptu-overview": self.canonical_urls},
+        )
 
 
 class RecordingCoordinator:
@@ -78,11 +112,12 @@ def make_coordinator(
     config: Path,
     crawler: RecordingCrawler,
     last_crawled_at: datetime | None,
+    canonical_urls: tuple[str, ...] | None = None,
 ) -> AnnouncementRefreshCoordinator:
     return AnnouncementRefreshCoordinator(
         config,
         crawler,
-        MemoryFreshnessRepository(last_crawled_at),
+        MemoryFreshnessRepository(last_crawled_at, canonical_urls),
         now=lambda: NOW,
     )
 
@@ -91,12 +126,19 @@ def test_fresh_source_skips_crawl(tmp_path: Path) -> None:
     config = tmp_path / "announcements.yaml"
     write_config(config)
     crawler = RecordingCrawler()
-    coordinator = make_coordinator(config, crawler, NOW - timedelta(minutes=59))
+    cached_urls = ("https://www.nptu.edu.tw/cached",)
+    coordinator = make_coordinator(
+        config,
+        crawler,
+        NOW - timedelta(minutes=59),
+        cached_urls,
+    )
 
     result = coordinator.ensure_fresh("nptu-overview")
 
     assert result.attempted is False
     assert result.succeeded is True
+    assert result.canonical_urls == cached_urls
     assert crawler.calls == []
 
 
@@ -111,7 +153,9 @@ def test_due_source_crawls_once_then_stays_fresh_in_memory(tmp_path: Path) -> No
 
     assert first.attempted is True
     assert first.succeeded is True
+    assert first.canonical_urls == crawler.canonical_urls
     assert second.attempted is False
+    assert second.canonical_urls == crawler.canonical_urls
     assert crawler.calls == [["nptu-overview"]]
 
 
@@ -119,12 +163,63 @@ def test_failed_refresh_returns_stable_warning(tmp_path: Path) -> None:
     config = tmp_path / "announcements.yaml"
     write_config(config)
     crawler = RecordingCrawler(CrawlSummary(failed=1, errors=["HTTP 503"]))
-    coordinator = make_coordinator(config, crawler, None)
+    cached_urls = ("https://www.nptu.edu.tw/last-success",)
+    repository = MemoryFreshnessRepository(NOW - timedelta(minutes=61), cached_urls)
+    coordinator = AnnouncementRefreshCoordinator(
+        config,
+        crawler,
+        repository,
+        now=lambda: NOW,
+    )
 
     result = coordinator.ensure_fresh("nptu-overview")
 
     assert result.succeeded is False
     assert result.warning == "最新公告更新失敗，以下內容來自資料庫最後成功收錄的資料。"
+    assert result.canonical_urls == cached_urls
+    assert repository.refreshes == []
+
+
+def test_successful_empty_refresh_persists_an_empty_source_snapshot(tmp_path: Path) -> None:
+    config = tmp_path / "announcements.yaml"
+    write_config(config)
+    crawler = RecordingCrawler(CrawlSummary(), canonical_urls=())
+    repository = MemoryFreshnessRepository(None, ("https://www.nptu.edu.tw/old",))
+    coordinator = AnnouncementRefreshCoordinator(
+        config,
+        crawler,
+        repository,
+        now=lambda: NOW,
+    )
+
+    result = coordinator.ensure_fresh("nptu-overview")
+
+    assert result.succeeded is True
+    assert result.canonical_urls == ()
+    assert repository.canonical_urls_value == ()
+    assert repository.last_crawled_at_value == NOW
+    assert repository.refreshes[0]["unit"] == "國立屏東大學"
+
+
+def test_coordinator_does_not_write_a_second_snapshot_after_atomic_crawler_commit(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "announcements.yaml"
+    write_config(config)
+    crawler = RecordingCrawler(persisted_source_snapshots=True)
+    repository = MemoryFreshnessRepository(None)
+    coordinator = AnnouncementRefreshCoordinator(
+        config,
+        crawler,
+        repository,
+        now=lambda: NOW,
+    )
+
+    result = coordinator.ensure_fresh("nptu-overview")
+
+    assert result.succeeded is True
+    assert result.canonical_urls == crawler.canonical_urls
+    assert repository.refreshes == []
 
 
 def test_parallel_refreshes_only_crawl_once(tmp_path: Path) -> None:

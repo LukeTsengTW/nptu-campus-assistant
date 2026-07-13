@@ -4,7 +4,7 @@ import uuid
 from collections import defaultdict
 from datetime import date
 
-from sqlalchemy import desc, func, literal, select
+from sqlalchemy import case, desc, func, literal, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from nptu_assistant.api.schemas import AnswerType
@@ -118,6 +118,8 @@ class SqlRetriever:
         _validate_limit(limit)
         if date_from and date_to and date_from > date_to:
             raise ValueError("起始日期不得晚於結束日期")
+        if canonical_urls is not None:
+            canonical_urls = tuple(dict.fromkeys(canonical_urls))
         if canonical_urls == ():
             return []
 
@@ -134,12 +136,14 @@ class SqlRetriever:
             fallback_relevance_filter = raw_score_expression >= FAILED_SEARCH_MIN_SIMILARITY
         else:
             score_expression = literal(0.65).label("score")
-        filters = [_public_announcement_source_filter()]
+        filters = (
+            [] if canonical_urls is not None else [_public_announcement_source_filter()]
+        )
         if canonical_urls is not None:
             filters.append(Announcement.canonical_url.in_(canonical_urls))
         elif fallback_relevance_filter is not None:
             filters.append(fallback_relevance_filter)
-        if unit:
+        if unit and canonical_urls is None:
             filters.append(Announcement.unit.ilike(f"%{unit}%"))
         if date_from:
             filters.append(Announcement.published_at >= date_from)
@@ -151,19 +155,32 @@ class SqlRetriever:
             .join(Source, Source.id == Announcement.source_id)
             .where(*filters)
         )
+        canonical_order = (
+            case(
+                {url: index for index, url in enumerate(canonical_urls)},
+                value=Announcement.canonical_url,
+                else_=len(canonical_urls),
+            )
+            if canonical_urls is not None
+            else None
+        )
         effective_sort = sort if query or sort is not AnnouncementSort.RELEVANCE else AnnouncementSort.NEWEST
         if effective_sort is AnnouncementSort.RELEVANCE:
-            statement = statement.order_by(desc("score"), Announcement.published_at.desc())
+            order = [desc("score"), Announcement.published_at.desc()]
         elif effective_sort is AnnouncementSort.OLDEST:
-            statement = statement.order_by(Announcement.published_at.asc())
+            order = [Announcement.published_at.asc()]
         else:
-            statement = statement.order_by(
-                Announcement.published_at.desc(),
-                Announcement.last_crawled_at.desc(),
-            )
+            order = [Announcement.published_at.desc()]
+            if canonical_urls is None:
+                order.append(Announcement.last_crawled_at.desc())
+        if canonical_order is not None:
+            order.append(canonical_order)
+        statement = statement.order_by(*order)
 
         with self._factory() as session:
-            rows = session.execute(statement.limit(limit)).all()
+            rows = session.execute(
+                statement if canonical_urls is not None else statement.limit(limit)
+            ).all()
         return [
             Evidence(
                 id=str(item.id),
@@ -176,7 +193,7 @@ class SqlRetriever:
                 score=max(0.0, min(1.0, float(score or 0.0))),
             )
             for item, score in rows
-        ]
+        ][:limit]
 
     def get_announcement(self, announcement_id: str) -> Evidence | None:
         try:

@@ -102,11 +102,17 @@ cd services/api
 uv run nptu-assistant crawl-announcements
 ```
 
-新增來源時，先更新 `data/sources/announcements.yaml`，再建立獨立 adapter 與 fixtures。不得傳入任意 URL。
+新增相同版型的 HTML 公告來源時，先更新 `data/sources/announcements.yaml` 的單位別名、host allowlist 與 CSS selectors，再新增真實結構 fixture 及 parser tests；只有版型無法由通用 `nptu_html_list` 表達時才新增 adapter。不得傳入任意 URL。
 
-API 啟動後每 60 秒檢查已啟用來源是否到期；`nptu-overview` 的實際刷新間隔由 `crawl_interval_minutes: 60` 控制。使用者查詢最新公告時也會先做相同檢查。未到期不會重新請求官網；到期時最多處理 RSS 前 20 則。需要立即刷新時，可執行上方的 `crawl-announcements` 指令。
+API 啟動後每 60 秒檢查已啟用來源是否到期；`nptu-overview` 與資訊學院來源的實際刷新間隔都由各自的 `crawl_interval_minutes` 控制。使用者查詢最新公告時也會先做相同檢查。未到期不會重新請求官網；到期時每個來源最多處理 20 則。需要立即刷新時，可執行上方的 `crawl-announcements` 指令。
 
-刷新失敗時，系統保留最後成功收錄的資料並在回答附上警告。所有回答來源仍從資料庫產生，模型不能指定任意爬取 URL。
+刷新成功後，系統會在同一資料庫交易中寫入公告與該來源本次的 canonical URL 快照；手動 crawl 也走相同流程。查詢結果只會從這份快照對應的資料庫公告產生。刷新失敗時整批回滾、保留上次成功快照並在回答附上警告。所有回答來源 URL 仍從資料庫產生，模型不能指定任意爬取 URL。
+
+## 依單位查詢最新公告
+
+目前正式支援資訊學院官方網站，例如「資訊學院最新公告」。未指定數量時回傳 5 則，一次最多 20 則；明確要求最舊公告時才改用由舊到新排序。單位名稱由後端以設定檔別名做最長、非重疊匹配，模型不能自行選擇網站。
+
+尚未設定官方公告來源的已知單位會明確回覆目前未支援；未知或可能對應多個單位的名稱會要求釐清，不會改查全校總覽、猜測網址或擴大到其他單位資料。
 
 ## 建置與載入 Extension
 
@@ -167,4 +173,5 @@ corepack pnpm --filter @nptu/shared generate
 - 公告刷新鎖是 process-local。部署多個 API worker 前，必須改用 PostgreSQL advisory lock 或獨立 scheduler worker，避免同一來源被不同 process 同時爬取。
 - Rate limiter 為單 process 記憶體實作。
 - NPTU 網站改版時需以真實 HTML 更新對應 adapter fixture 與 parser。
+- 依單位官方網站查詢目前只設定資訊學院；其他學術與行政單位須完成 allowlist、fixture 與測試後才會啟用。
 - 本專案不提供登入、成績、選課、個人校務資料、教師評價或代送表單功能。

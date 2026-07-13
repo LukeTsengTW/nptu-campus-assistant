@@ -117,6 +117,47 @@ class SqlDocumentRepository:
             )
 
 
+def _upsert_announcement(
+    session: Session,
+    candidate: AnnouncementCandidate,
+    source: Source,
+    now: datetime,
+) -> str:
+    digest = content_hash("\n".join([candidate.title, candidate.body]))
+    existing = session.scalar(
+        select(Announcement).where(Announcement.canonical_url == candidate.canonical_url)
+    )
+    if existing:
+        existing.title = candidate.title
+        existing.unit = candidate.unit
+        existing.category = candidate.category
+        existing.published_at = candidate.published_at
+        existing.deadline_at = candidate.deadline_at
+        existing.body = candidate.body
+        existing.warning = candidate.warning
+        existing.last_crawled_at = now
+        if existing.content_hash == digest:
+            return "unchanged"
+        existing.content_hash = digest
+        return "updated"
+    session.add(
+        Announcement(
+            source_id=source.id,
+            title=candidate.title,
+            unit=candidate.unit,
+            category=candidate.category,
+            published_at=candidate.published_at,
+            deadline_at=candidate.deadline_at,
+            canonical_url=candidate.canonical_url,
+            body=candidate.body,
+            warning=candidate.warning,
+            content_hash=digest,
+            last_crawled_at=now,
+        )
+    )
+    return "created"
+
+
 class SqlAnnouncementRepository:
     def __init__(self, factory: sessionmaker[Session]) -> None:
         self._factory = factory
@@ -124,10 +165,38 @@ class SqlAnnouncementRepository:
     def latest_crawled_at(self, source_name: str) -> datetime | None:
         with self._factory() as session:
             return session.scalar(
-                select(func.max(Announcement.last_crawled_at))
-                .join(Source, Source.id == Announcement.source_id)
-                .where(Source.name == source_name)
+                select(Source.last_successful_crawl_at).where(Source.name == source_name)
             )
+
+    def canonical_urls_for_source(self, source_name: str) -> tuple[str, ...] | None:
+        with self._factory() as session:
+            source = session.scalar(select(Source).where(Source.name == source_name))
+            if source is None or source.last_successful_crawl_at is None:
+                return None
+            return tuple(source.canonical_urls)
+
+    def record_source_refresh(
+        self,
+        *,
+        source_name: str,
+        source_url: str,
+        unit: str,
+        interval_minutes: int,
+        canonical_urls: tuple[str, ...],
+        crawled_at: datetime,
+    ) -> None:
+        with self._factory.begin() as session:
+            source = get_or_create_source(
+                session,
+                name=source_name,
+                base_url=_base_url(source_url),
+                unit=unit,
+                source_type="announcement",
+                crawl_enabled=True,
+                crawl_interval_minutes=interval_minutes,
+            )
+            source.canonical_urls = list(dict.fromkeys(canonical_urls))
+            source.last_successful_crawl_at = crawled_at
 
     def upsert(
         self,
@@ -137,7 +206,6 @@ class SqlAnnouncementRepository:
         source_url: str,
         interval_minutes: int,
     ) -> str:
-        digest = content_hash("\n".join([candidate.title, candidate.body]))
         now = datetime.now(timezone.utc)
         with self._factory.begin() as session:
             source = get_or_create_source(
@@ -149,40 +217,55 @@ class SqlAnnouncementRepository:
                 crawl_enabled=True,
                 crawl_interval_minutes=interval_minutes,
             )
-            existing = session.scalar(
-                select(Announcement).where(Announcement.canonical_url == candidate.canonical_url)
+            return _upsert_announcement(session, candidate, source, now)
+
+    def upsert_many(
+        self,
+        candidates: list[AnnouncementCandidate],
+        *,
+        source_name: str,
+        source_url: str,
+        source_unit: str,
+        interval_minutes: int,
+    ) -> list[str]:
+        return self.commit_source_refresh(
+            candidates,
+            source_name=source_name,
+            source_url=source_url,
+            source_unit=source_unit,
+            interval_minutes=interval_minutes,
+            crawled_at=datetime.now(timezone.utc),
+        )
+
+    def commit_source_refresh(
+        self,
+        candidates: list[AnnouncementCandidate],
+        *,
+        source_name: str,
+        source_url: str,
+        source_unit: str,
+        interval_minutes: int,
+        crawled_at: datetime,
+    ) -> list[str]:
+        with self._factory.begin() as session:
+            source = get_or_create_source(
+                session,
+                name=source_name,
+                base_url=_base_url(source_url),
+                unit=source_unit,
+                source_type="announcement",
+                crawl_enabled=True,
+                crawl_interval_minutes=interval_minutes,
             )
-            if existing and existing.content_hash == digest:
-                existing.last_crawled_at = now
-                existing.warning = candidate.warning
-                return "unchanged"
-            if existing:
-                existing.title = candidate.title
-                existing.unit = candidate.unit
-                existing.category = candidate.category
-                existing.published_at = candidate.published_at
-                existing.deadline_at = candidate.deadline_at
-                existing.body = candidate.body
-                existing.warning = candidate.warning
-                existing.content_hash = digest
-                existing.last_crawled_at = now
-                return "updated"
-            session.add(
-                Announcement(
-                    source_id=source.id,
-                    title=candidate.title,
-                    unit=candidate.unit,
-                    category=candidate.category,
-                    published_at=candidate.published_at,
-                    deadline_at=candidate.deadline_at,
-                    canonical_url=candidate.canonical_url,
-                    body=candidate.body,
-                    warning=candidate.warning,
-                    content_hash=digest,
-                    last_crawled_at=now,
-                )
+            results = [
+                _upsert_announcement(session, candidate, source, crawled_at)
+                for candidate in candidates
+            ]
+            source.canonical_urls = list(
+                dict.fromkeys(candidate.canonical_url for candidate in candidates)
             )
-            return "created"
+            source.last_successful_crawl_at = crawled_at
+            return results
 
     def list(
         self,

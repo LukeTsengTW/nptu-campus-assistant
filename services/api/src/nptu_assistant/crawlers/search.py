@@ -3,10 +3,10 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date
-import re
 from typing import Protocol
 
 from nptu_assistant.api.schemas import CrawlSummary
+from nptu_assistant.crawlers.aliases import AliasNormalizer
 from nptu_assistant.crawlers.adapters.nptu_search import (
     AnnouncementSearchResult,
     NptuAssociationSearchAdapter,
@@ -34,18 +34,7 @@ class KeywordIngestionResult:
     canonical_urls: tuple[str, ...] | None = None
 
 
-class KeywordAliasResolver:
-    def __init__(self, aliases: Mapping[str, str]) -> None:
-        self._aliases = dict(aliases)
-
-    def normalize(self, text: str) -> str:
-        normalized = text.strip()
-        if not self._aliases:
-            return normalized
-        aliases = sorted(self._aliases, key=len, reverse=True)
-        pattern = re.compile("|".join(re.escape(alias) for alias in aliases))
-        return pattern.sub(lambda match: self._aliases[match.group(0)], normalized)
-
+class KeywordAliasResolver(AliasNormalizer):
     def expand(self, query: str) -> KeywordExpansion:
         query = query.strip()
         if not query:
