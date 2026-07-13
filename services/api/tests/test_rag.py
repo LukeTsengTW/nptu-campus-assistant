@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from nptu_assistant.api.schemas import Confidence
+from nptu_assistant.rag.prompts import SYSTEM_INSTRUCTIONS
 from nptu_assistant.rag.service import confidence_for_score, sanitize_user_facing_text
 
 
@@ -19,3 +20,12 @@ def test_user_facing_sanitizer_keeps_only_allowlisted_urls() -> None:
 
     assert allowed in answer
     assert "example.com" not in answer
+
+
+def test_system_instructions_define_department_aliases_without_electrical_department_ambiguity():
+    assert "詢問科系、學院、學程或中心名稱時，使用 search_documents" in SYSTEM_INSTRUCTIONS
+    assert "電科系＝電腦科學與人工智慧學系" in SYSTEM_INSTRUCTIONS
+    assert "不得解讀為電腦與通訊學系" in SYSTEM_INSTRUCTIONS
+    assert "資工系＝資訊工程學系" in SYSTEM_INSTRUCTIONS
+    assert "機器人系、智機系＝智慧機器人學系" in SYSTEM_INSTRUCTIONS
+    assert "英語系、英文系＝英語學系" in SYSTEM_INSTRUCTIONS
