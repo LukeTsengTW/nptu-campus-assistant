@@ -110,10 +110,13 @@ class SqlRetriever:
         unit: str | None = None,
         date_from: date | None = None,
         date_to: date | None = None,
+        canonical_urls: tuple[str, ...] | None = None,
     ) -> list[Evidence]:
         _validate_limit(limit)
         if date_from and date_to and date_from > date_to:
             raise ValueError("起始日期不得晚於結束日期")
+        if canonical_urls == ():
+            return []
 
         query = query.strip() if query else ""
         unit = unit.strip() if unit else None
@@ -126,6 +129,8 @@ class SqlRetriever:
             else literal(0.65).label("score")
         )
         filters = [_public_announcement_source_filter()]
+        if canonical_urls is not None:
+            filters.append(Announcement.canonical_url.in_(canonical_urls))
         if unit:
             filters.append(Announcement.unit.ilike(f"%{unit}%"))
         if date_from:

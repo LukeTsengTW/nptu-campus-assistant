@@ -61,6 +61,7 @@ class StubKeywordIngestor:
             retrieval_query=self.normalize(query),
             summary=CrawlSummary(created=1),
             warning=None,
+            canonical_urls=("https://www.nptu.edu.tw/p/406-1000-200001.php",),
         )
 
     def normalize(self, text: str) -> str:
@@ -195,6 +196,7 @@ def test_executor_ingests_keyword_before_database_search_and_normalizes_filters(
             "unit": "電腦科學與人工智慧學系",
             "date_from": None,
             "date_to": None,
+            "canonical_urls": ("https://www.nptu.edu.tw/p/406-1000-200001.php",),
         },
     )
 
@@ -235,3 +237,5 @@ def test_executor_does_not_ingest_null_query_and_falls_back_on_ingestion_failure
     assert ingestor.queries == ["電科系"]
     assert len(retriever.calls) == 2
     assert retriever.calls[0][1]["query"] == "電腦科學與人工智慧學系"
+    assert retriever.calls[0][1]["canonical_urls"] is None
+    assert retriever.calls[1][1]["canonical_urls"] is None

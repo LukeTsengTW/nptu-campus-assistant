@@ -85,6 +85,47 @@ def test_newest_announcements_use_structured_limit_and_fixture_filter() -> None:
     assert "LIMIT 5" in statement
 
 
+def test_newest_keyword_search_is_limited_to_current_canonical_urls() -> None:
+    session = FakeSession()
+    urls = (
+        "https://www.nptu.edu.tw/p/406-1000-200001.php",
+        "https://csai.nptu.edu.tw/p/406-1096-200002.php",
+    )
+
+    make_retriever(session).search_announcements(
+        query="電腦科學與人工智慧學系",
+        limit=5,
+        sort=AnnouncementSort.NEWEST,
+        unit=None,
+        date_from=None,
+        date_to=None,
+        canonical_urls=urls,
+    )
+    statement = sql(session.statements[0])
+
+    assert "announcements.canonical_url IN" in statement
+    assert urls[0] in statement
+    assert urls[1] in statement
+    assert "ORDER BY announcements.published_at DESC" in statement
+
+
+def test_successful_empty_keyword_scope_returns_no_announcements() -> None:
+    session = FakeSession()
+
+    result = make_retriever(session).search_announcements(
+        query="查無結果關鍵字",
+        limit=5,
+        sort=AnnouncementSort.NEWEST,
+        unit=None,
+        date_from=None,
+        date_to=None,
+        canonical_urls=(),
+    )
+
+    assert result == []
+    assert session.statements == []
+
+
 def test_relevance_announcements_use_similarity_and_structured_filters() -> None:
     session = FakeSession()
 
