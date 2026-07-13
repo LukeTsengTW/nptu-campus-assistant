@@ -7,6 +7,8 @@ import pytest
 from pydantic import ValidationError
 
 from nptu_assistant.api.schemas import AnswerType
+from nptu_assistant.api.schemas import CrawlSummary
+from nptu_assistant.crawlers.search import KeywordIngestionResult
 from nptu_assistant.rag.models import Evidence
 from nptu_assistant.rag.tools import (
     AnnouncementSort,
@@ -44,6 +46,25 @@ class StubRetriever:
     def get_announcement(self, announcement_id: str) -> Evidence | None:
         self.calls.append(("get_announcement", announcement_id))
         return None
+
+
+class StubKeywordIngestor:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.fail = fail
+        self.queries: list[str] = []
+
+    def ingest(self, query: str) -> KeywordIngestionResult:
+        self.queries.append(query)
+        if self.fail:
+            raise RuntimeError("official search unavailable")
+        return KeywordIngestionResult(
+            retrieval_query=self.normalize(query),
+            summary=CrawlSummary(created=1),
+            warning=None,
+        )
+
+    def normalize(self, text: str) -> str:
+        return text.replace("電科系", "電腦科學與人工智慧學系")
 
 
 def test_tool_definitions_are_strict_and_require_every_property() -> None:
@@ -142,3 +163,75 @@ def test_executor_returns_structured_errors_without_executing_unknown_tools() ->
     assert invalid["error"]["code"] == "invalid_tool_arguments"
     assert unknown["error"]["code"] == "unknown_tool"
     assert retriever.calls == []
+
+
+def test_executor_ingests_keyword_before_database_search_and_normalizes_filters() -> None:
+    retriever = StubRetriever()
+    ingestor = StubKeywordIngestor()
+    executor = ToolExecutor(retriever, keyword_ingestor=ingestor)
+
+    result = executor.execute(
+        "search_announcements",
+        json.dumps(
+            {
+                "query": "電科系 獎學金",
+                "limit": 3,
+                "sort": "relevance",
+                "unit": "電科系",
+                "date_from": None,
+                "date_to": None,
+            }
+        ),
+    )
+
+    assert result.warning is None
+    assert ingestor.queries == ["電科系 獎學金"]
+    assert retriever.calls[0] == (
+        "search_announcements",
+        {
+            "query": "電腦科學與人工智慧學系 獎學金",
+            "limit": 3,
+            "sort": AnnouncementSort.RELEVANCE,
+            "unit": "電腦科學與人工智慧學系",
+            "date_from": None,
+            "date_to": None,
+        },
+    )
+
+
+def test_executor_does_not_ingest_null_query_and_falls_back_on_ingestion_failure() -> None:
+    retriever = StubRetriever()
+    ingestor = StubKeywordIngestor(fail=True)
+    executor = ToolExecutor(retriever, keyword_ingestor=ingestor)
+
+    failed = executor.execute(
+        "search_announcements",
+        json.dumps(
+            {
+                "query": "電科系",
+                "limit": 3,
+                "sort": "relevance",
+                "unit": None,
+                "date_from": None,
+                "date_to": None,
+            }
+        ),
+    )
+    executor.execute(
+        "search_announcements",
+        json.dumps(
+            {
+                "query": None,
+                "limit": 3,
+                "sort": "oldest",
+                "unit": None,
+                "date_from": None,
+                "date_to": None,
+            }
+        ),
+    )
+
+    assert failed.warning == "本次官網公告搜尋失敗，以下內容來自資料庫最後成功收錄的資料。"
+    assert ingestor.queries == ["電科系"]
+    assert len(retriever.calls) == 2
+    assert retriever.calls[0][1]["query"] == "電腦科學與人工智慧學系"

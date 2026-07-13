@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from urllib.parse import urlsplit
 from urllib.robotparser import RobotFileParser
 
@@ -41,9 +41,23 @@ class CrawlHttpClient:
         if not is_allowed_nptu_url(url):
             raise ValueError("拒絕非 NPTU allowlist URL")
         self._ensure_allowed_by_robots(url)
-        return self._request(url)
+        return self._request("get", url)
 
-    def _request(self, url: str) -> str:
+    def submit_form(self, method: str, url: str, fields: Mapping[str, str]) -> str:
+        normalized_method = method.lower()
+        if normalized_method not in {"get", "post"}:
+            raise ValueError("搜尋表單僅允許 GET 或 POST")
+        if not is_allowed_nptu_url(url):
+            raise ValueError("拒絕非 NPTU allowlist URL")
+        self._ensure_allowed_by_robots(url)
+        return self._request(normalized_method, url, fields)
+
+    def _request(
+        self,
+        method: str,
+        url: str,
+        fields: Mapping[str, str] | None = None,
+    ) -> str:
         host = urlsplit(url).netloc.lower()
         elapsed = time.monotonic() - self._last_request.get(host, 0.0)
         if elapsed < self._interval:
@@ -51,7 +65,12 @@ class CrawlHttpClient:
         last_error: Exception | None = None
         for attempt in range(3):
             try:
-                response = self._client.get(url)
+                response = self._client.request(
+                    method.upper(),
+                    url,
+                    params=fields if method == "get" else None,
+                    data=fields if method == "post" else None,
+                )
                 response.raise_for_status()
                 if not is_allowed_nptu_url(str(response.url)):
                     raise ValueError("redirect target is outside the NPTU allowlist")
@@ -69,7 +88,7 @@ class CrawlHttpClient:
         parser = self._robots.get(origin)
         if parser is None:
             robots_url = f"{origin}/robots.txt"
-            robots_text = self._request(robots_url)
+            robots_text = self._request("get", robots_url)
             parser = RobotFileParser(robots_url)
             parser.parse(robots_text.splitlines())
             self._robots[origin] = parser

@@ -6,11 +6,13 @@ from nptu_assistant.api.errors import AppError
 from nptu_assistant.api.services import AnnouncementService, HealthService
 from nptu_assistant.core.settings import Settings, WORKSPACE_ROOT, resolve_workspace_path
 from nptu_assistant.crawlers.http import CrawlHttpClient
+from nptu_assistant.crawlers.config import load_keyword_search_config
 from nptu_assistant.crawlers.refresh import (
     AnnouncementRefreshCoordinator,
     AnnouncementRefreshScheduler,
 )
 from nptu_assistant.crawlers.service import CrawlerService
+from nptu_assistant.crawlers.search import KeywordAnnouncementSearchService
 from nptu_assistant.db.repositories import SqlAnnouncementRepository, SqlDocumentRepository
 from nptu_assistant.db.session import create_session_factory
 from nptu_assistant.ingestion.service import DocumentIngestionService
@@ -73,6 +75,11 @@ def build_services(settings: Settings) -> dict[str, object]:
         http_client,
         workspace_root=WORKSPACE_ROOT,
     )
+    keyword_search_service = KeywordAnnouncementSearchService(
+        load_keyword_search_config(resolve_workspace_path(settings.crawler_config_path)),
+        announcement_repository,
+        http_client,
+    )
     announcement_refresher = AnnouncementRefreshCoordinator(
         resolve_workspace_path(settings.crawler_config_path),
         crawler_service,
@@ -87,6 +94,7 @@ def build_services(settings: Settings) -> dict[str, object]:
                 llm,
                 SqlConversationStore(factory),
                 announcement_refresher,
+                keyword_search_service,
             )
             if llm
             else None

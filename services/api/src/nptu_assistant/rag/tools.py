@@ -9,6 +9,7 @@ from typing import Protocol
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from nptu_assistant.crawlers.refresh import REFRESH_FAILURE_WARNING, RefreshResult
+from nptu_assistant.crawlers.search import FULL_SEARCH_FAILURE_WARNING, KeywordIngestionResult
 from nptu_assistant.rag.models import Evidence
 
 
@@ -133,6 +134,14 @@ class AnnouncementRefresher(Protocol):
         raise NotImplementedError
 
 
+class KeywordAnnouncementIngestor(Protocol):
+    def ingest(self, query: str) -> KeywordIngestionResult:
+        raise NotImplementedError
+
+    def normalize(self, text: str) -> str:
+        raise NotImplementedError
+
+
 @dataclass(frozen=True, slots=True)
 class ToolExecutionResult:
     output: str
@@ -165,9 +174,11 @@ class ToolExecutor:
         self,
         retriever: StructuredRetriever,
         refresher: AnnouncementRefresher | None = None,
+        keyword_ingestor: KeywordAnnouncementIngestor | None = None,
     ) -> None:
         self._retriever = retriever
         self._refresher = refresher
+        self._keyword_ingestor = keyword_ingestor
 
     def _refresh_warning(self, parsed: SearchAnnouncementsArguments) -> str | None:
         if parsed.sort is not AnnouncementSort.NEWEST or self._refresher is None:
@@ -176,6 +187,26 @@ class ToolExecutor:
             return self._refresher.ensure_fresh("nptu-overview").warning
         except Exception:
             return REFRESH_FAILURE_WARNING
+
+    def _search_announcements(
+        self,
+        parsed: SearchAnnouncementsArguments,
+    ) -> tuple[list[Evidence], str | None]:
+        arguments = parsed.model_dump()
+        warning: str | None = None
+        if parsed.query and self._keyword_ingestor is not None:
+            try:
+                arguments["query"] = self._keyword_ingestor.normalize(parsed.query)
+                if parsed.unit:
+                    arguments["unit"] = self._keyword_ingestor.normalize(parsed.unit)
+                ingestion = self._keyword_ingestor.ingest(parsed.query)
+                arguments["query"] = ingestion.retrieval_query
+                warning = ingestion.warning
+            except Exception:
+                warning = FULL_SEARCH_FAILURE_WARNING
+        elif not parsed.query:
+            warning = self._refresh_warning(parsed)
+        return self._retriever.search_announcements(**arguments), warning
 
     def execute(self, name: str, arguments: str) -> ToolExecutionResult:
         validators: dict[str, type[BaseModel]] = {
@@ -197,8 +228,7 @@ class ToolExecutor:
         refresh_warning: str | None = None
         try:
             if isinstance(parsed, SearchAnnouncementsArguments):
-                refresh_warning = self._refresh_warning(parsed)
-                evidence = self._retriever.search_announcements(**parsed.model_dump())
+                evidence, refresh_warning = self._search_announcements(parsed)
                 content_limit = 2_000
             elif isinstance(parsed, SearchDocumentsArguments):
                 evidence = self._retriever.search_documents(**parsed.model_dump())

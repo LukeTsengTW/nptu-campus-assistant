@@ -38,3 +38,13 @@ uv run pytest ../../tests/integration
 未設定 `RUN_POSTGRES_INTEGRATION=1` 時，該組測試會明確顯示 skipped，不會改用 SQLite。GitHub Actions 會啟動 `pgvector/pgvector:pg17`，執行兩次 migration、兩次 seed、完整整合測試、OpenAPI drift 檢查與 Extension test/build。
 
 所有自動化測試使用 Fake LLM 與 Fake Embedding Provider。live OpenAI 與 NPTU smoke tests 必須另外標示，不能成為預設測試的必要條件。
+
+啟用 NPTU 關鍵字公告搜尋 live smoke test：
+
+```powershell
+$env:RUN_LIVE_KEYWORD_SEARCH="1"
+cd services/api
+uv run pytest tests/test_live_keyword_search.py -q
+```
+
+此測試會請求 NPTU 官網，驗證 session、搜尋表單與結果 DOM；不寫入資料庫。未設定 `RUN_LIVE_KEYWORD_SEARCH=1` 時顯示 skipped。
