@@ -109,6 +109,68 @@
         }
       }
     },
+    "/v1/conversations/{conversation_id}": {
+      "delete": {
+        "summary": "Delete Conversation",
+        "operationId": "delete_conversation_v1_conversations__conversation_id__delete",
+        "parameters": [
+          {
+            "name": "conversation_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Conversation Id"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "429": {
+            "description": "統一錯誤 envelope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "統一錯誤 envelope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "統一錯誤 envelope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/announcements": {
       "get": {
         "summary": "Announcements",
@@ -566,6 +628,19 @@
             "maxLength": 2000,
             "minLength": 1,
             "title": "Question"
+          },
+          "conversation_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 100,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Conversation Id"
           }
         },
         "type": "object",
@@ -576,6 +651,10 @@
       },
       "ChatResponse": {
         "properties": {
+          "conversation_id": {
+            "type": "string",
+            "title": "Conversation Id"
+          },
           "answer": {
             "type": "string",
             "title": "Answer"
@@ -607,6 +686,7 @@
         },
         "type": "object",
         "required": [
+          "conversation_id",
           "answer",
           "answer_type",
           "confidence",
@@ -763,6 +843,13 @@
       },
       "SourceReference": {
         "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/AnswerType"
+          },
           "title": {
             "type": "string",
             "title": "Title"
@@ -796,6 +883,8 @@
         },
         "type": "object",
         "required": [
+          "id",
+          "kind",
           "title",
           "url",
           "unit",

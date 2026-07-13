@@ -1,45 +1,26 @@
 from __future__ import annotations
 
-import re
+import uuid
 from collections import defaultdict
+from datetime import date
 
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, func, literal, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from nptu_assistant.api.schemas import AnswerType
 from nptu_assistant.db.models import Announcement, Document, DocumentChunk, Source
 from nptu_assistant.providers.protocols import EmbeddingProvider
 from nptu_assistant.rag.models import Evidence
-from nptu_assistant.rag.routing import QuestionRoute
+from nptu_assistant.rag.tools import AnnouncementSort
 
 
-_GENERIC_ANNOUNCEMENT_TERMS = (
-    "幫我",
-    "查",
-    "找",
-    "列出",
-    "顯示",
-    "最新",
-    "最近",
-    "有哪些",
-    "公告如下",
-    "公告",
-    "？",
-    "?",
-)
+def _public_announcement_source_filter() -> object:
+    return Source.name.not_ilike("%fixture%")
 
 
-def normalize_announcement_keyword(question: str) -> str:
-    keyword = question.strip()
-    for term in _GENERIC_ANNOUNCEMENT_TERMS:
-        keyword = keyword.replace(term, "")
-    keyword = re.sub(r"前\s*[0-9一二三四五六七八九十]+\s*[個則筆篇項]?", "", keyword)
-    keyword = re.sub(r"[0-9一二三四五六七八九十]+\s*[個則筆篇項]", "", keyword)
-    return re.sub(r"\s+", " ", keyword).strip()
-
-
-def is_fixture_source(source_name: str) -> bool:
-    return "fixture" in source_name.lower()
+def _validate_limit(limit: int) -> None:
+    if not 1 <= limit <= 20:
+        raise ValueError("limit 必須介於 1 到 20")
 
 
 class SqlRetriever:
@@ -51,20 +32,16 @@ class SqlRetriever:
         self._factory = factory
         self._embedding_provider = embedding_provider
 
-    def search(self, question: str, route: QuestionRoute) -> list[Evidence]:
-        results: list[Evidence] = []
-        if route in {QuestionRoute.DOCUMENT, QuestionRoute.MIXED}:
-            results.extend(self._search_documents(question))
-        if route in {QuestionRoute.ANNOUNCEMENT, QuestionRoute.MIXED}:
-            results.extend(self._search_announcements(question))
-        return sorted(results, key=lambda item: item.score, reverse=True)[:20]
-
-    def _search_documents(self, question: str) -> list[Evidence]:
-        vector = self._embedding_provider.embed([question])[0]
+    def search_documents(self, *, query: str, limit: int = 6) -> list[Evidence]:
+        query = query.strip()
+        if not query:
+            raise ValueError("文件 query 不得為空")
+        _validate_limit(limit)
+        vector = self._embedding_provider.embed([query])[0]
         vector_score = (1 - DocumentChunk.embedding.cosine_distance(vector)).label("score")
         keyword_score = func.greatest(
-            func.similarity(DocumentChunk.content, question),
-            func.similarity(Document.title, question),
+            func.similarity(DocumentChunk.content, query),
+            func.similarity(Document.title, query),
         ).label("score")
         base_columns = (DocumentChunk, Document, Source)
         with self._factory() as session:
@@ -84,10 +61,15 @@ class SqlRetriever:
                 .order_by(desc("score"))
                 .limit(20)
             ).all()
-        return self._rrf_merge(vector_rows, keyword_rows)
+        return self._rrf_merge(vector_rows, keyword_rows, limit=limit)
 
     @staticmethod
-    def _rrf_merge(vector_rows: list[object], keyword_rows: list[object]) -> list[Evidence]:
+    def _rrf_merge(
+        vector_rows: list[object],
+        keyword_rows: list[object],
+        *,
+        limit: int = 6,
+    ) -> list[Evidence]:
         ranks: dict[str, float] = defaultdict(float)
         raw_scores: dict[str, float] = defaultdict(float)
         records: dict[str, tuple[DocumentChunk, Document, Source]] = {}
@@ -97,7 +79,10 @@ class SqlRetriever:
                 key = str(chunk.id)
                 records[key] = (chunk, document, source)
                 ranks[key] += 1.0 / (60 + rank)
-                raw_scores[key] = max(raw_scores[key], max(0.0, min(1.0, float(raw_score or 0.0))))
+                raw_scores[key] = max(
+                    raw_scores[key],
+                    max(0.0, min(1.0, float(raw_score or 0.0))),
+                )
         evidence = []
         for key, (chunk, document, source) in records.items():
             rrf_component = min(1.0, ranks[key] * 30.0)
@@ -114,35 +99,58 @@ class SqlRetriever:
                     score=score,
                 )
             )
-        return sorted(evidence, key=lambda item: item.score, reverse=True)[:6]
+        return sorted(evidence, key=lambda item: item.score, reverse=True)[:limit]
 
-    def _search_announcements(self, question: str) -> list[Evidence]:
-        keyword = normalize_announcement_keyword(question)
-        score_expression = func.greatest(
-            func.similarity(Announcement.title, keyword),
-            func.similarity(Announcement.body, keyword),
-        ).label("score")
-        public_sources = Source.name.not_like("%fixture%")
+    def search_announcements(
+        self,
+        *,
+        query: str | None,
+        limit: int,
+        sort: AnnouncementSort,
+        unit: str | None = None,
+        date_from: date | None = None,
+        date_to: date | None = None,
+    ) -> list[Evidence]:
+        _validate_limit(limit)
+        if date_from and date_to and date_from > date_to:
+            raise ValueError("起始日期不得晚於結束日期")
+
+        query = query.strip() if query else ""
+        unit = unit.strip() if unit else None
+        score_expression = (
+            func.greatest(
+                func.similarity(Announcement.title, query),
+                func.similarity(Announcement.body, query),
+            ).label("score")
+            if query
+            else literal(0.65).label("score")
+        )
+        filters = [_public_announcement_source_filter()]
+        if unit:
+            filters.append(Announcement.unit.ilike(f"%{unit}%"))
+        if date_from:
+            filters.append(Announcement.published_at >= date_from)
+        if date_to:
+            filters.append(Announcement.published_at <= date_to)
+
+        statement = (
+            select(Announcement, score_expression)
+            .join(Source, Source.id == Announcement.source_id)
+            .where(*filters)
+        )
+        effective_sort = sort if query or sort is not AnnouncementSort.RELEVANCE else AnnouncementSort.NEWEST
+        if effective_sort is AnnouncementSort.RELEVANCE:
+            statement = statement.order_by(desc("score"), Announcement.published_at.desc())
+        elif effective_sort is AnnouncementSort.OLDEST:
+            statement = statement.order_by(Announcement.published_at.asc())
+        else:
+            statement = statement.order_by(
+                Announcement.published_at.desc(),
+                Announcement.last_crawled_at.desc(),
+            )
+
         with self._factory() as session:
-            if keyword:
-                rows = session.execute(
-                    select(Announcement, score_expression)
-                    .join(Source, Source.id == Announcement.source_id)
-                    .where(public_sources)
-                    .order_by(desc("score"), Announcement.published_at.desc())
-                    .limit(20)
-                ).all()
-            else:
-                rows = [
-                    (item, 0.65)
-                    for item in session.scalars(
-                        select(Announcement)
-                        .join(Source, Source.id == Announcement.source_id)
-                        .where(public_sources)
-                        .order_by(Announcement.published_at.desc(), Announcement.last_crawled_at.desc())
-                        .limit(20)
-                    ).all()
-                ]
+            rows = session.execute(statement.limit(limit)).all()
         return [
             Evidence(
                 id=str(item.id),
@@ -156,3 +164,30 @@ class SqlRetriever:
             )
             for item, score in rows
         ]
+
+    def get_announcement(self, announcement_id: str) -> Evidence | None:
+        try:
+            parsed_id = uuid.UUID(announcement_id)
+        except (ValueError, AttributeError):
+            return None
+        with self._factory() as session:
+            item = session.scalar(
+                select(Announcement)
+                .join(Source, Source.id == Announcement.source_id)
+                .where(
+                    Announcement.id == parsed_id,
+                    _public_announcement_source_filter(),
+                )
+            )
+        if item is None:
+            return None
+        return Evidence(
+            id=str(item.id),
+            kind=AnswerType.ANNOUNCEMENT,
+            title=item.title,
+            url=item.canonical_url,
+            unit=item.unit,
+            published_at=item.published_at,
+            content=item.body,
+            score=1.0,
+        )

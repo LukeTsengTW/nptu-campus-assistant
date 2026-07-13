@@ -1,8 +1,14 @@
 import type { ChatResponse } from "@nptu/shared";
 import { FormEvent, useEffect, useId, useRef, useState } from "react";
 
-import { sendChatMessage } from "../lib/messages";
-import { loadPanelOpen, savePanelOpen } from "../lib/storage";
+import { clearChatConversation, sendChatMessage } from "../lib/messages";
+import {
+  clearConversationId,
+  loadConversationId,
+  loadPanelOpen,
+  saveConversationId,
+  savePanelOpen,
+} from "../lib/storage";
 
 
 type ChatEntry =
@@ -10,17 +16,23 @@ type ChatEntry =
   | { id: number; role: "assistant"; response: ChatResponse };
 
 type Props = {
-  sendQuestion?: (question: string) => Promise<ChatResponse>;
+  sendQuestion?: (question: string, conversationId?: string) => Promise<ChatResponse>;
+  clearConversation?: (conversationId: string) => Promise<void>;
   initialOpen?: boolean;
 };
 
 
-export function ChatWidget({ sendQuestion = sendChatMessage, initialOpen }: Props) {
+export function ChatWidget({
+  sendQuestion = sendChatMessage,
+  clearConversation = clearChatConversation,
+  initialOpen,
+}: Props) {
   const [open, setOpen] = useState(initialOpen ?? false);
   const [question, setQuestion] = useState("");
   const [messages, setMessages] = useState<ChatEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [conversationId, setConversationId] = useState<string | null>(null);
   const inputId = useId();
   const requestGeneration = useRef(0);
 
@@ -28,6 +40,7 @@ export function ChatWidget({ sendQuestion = sendChatMessage, initialOpen }: Prop
     if (initialOpen === undefined) {
       void loadPanelOpen().then(setOpen).catch(() => undefined);
     }
+    void loadConversationId().then(setConversationId).catch(() => undefined);
   }, [initialOpen]);
 
   const toggle = () => {
@@ -47,8 +60,10 @@ export function ChatWidget({ sendQuestion = sendChatMessage, initialOpen }: Prop
     setLoading(true);
     const generation = ++requestGeneration.current;
     try {
-      const response = await sendQuestion(trimmed);
+      const response = await sendQuestion(trimmed, conversationId ?? undefined);
       if (requestGeneration.current !== generation) return;
+      setConversationId(response.conversation_id);
+      void saveConversationId(response.conversation_id).catch(() => undefined);
       setMessages((current) => [
         ...current,
         { id: Date.now() + 1, role: "assistant", response },
@@ -67,6 +82,12 @@ export function ChatWidget({ sendQuestion = sendChatMessage, initialOpen }: Prop
     setError(null);
     setQuestion("");
     setLoading(false);
+    const currentConversationId = conversationId;
+    setConversationId(null);
+    void clearConversationId().catch(() => undefined);
+    if (currentConversationId) {
+      void clearConversation(currentConversationId).catch(() => undefined);
+    }
   };
 
   return (

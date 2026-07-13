@@ -10,6 +10,7 @@ describe("ApiClient", () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
       ok: true,
       json: vi.fn().mockResolvedValue({
+        conversation_id: "conversation-1",
         answer: "回答",
         answer_type: "insufficient_information",
         confidence: "low",
@@ -18,12 +19,26 @@ describe("ApiClient", () => {
       }),
     }));
 
-    const result = await new ApiClient("http://127.0.0.1:8000").chat("測試");
+    const result = await new ApiClient("http://127.0.0.1:8000").chat("測試", "conversation-1");
 
     expect(result.answer).toBe("回答");
     expect(fetch).toHaveBeenCalledWith(
       "http://127.0.0.1:8000/v1/chat",
-      expect.objectContaining({ method: "POST" }),
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ question: "測試", conversation_id: "conversation-1" }),
+      }),
+    );
+  });
+
+  it("刪除 server conversation state", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true }));
+
+    await new ApiClient("http://127.0.0.1:8000").deleteConversation("conversation-1");
+
+    expect(fetch).toHaveBeenCalledWith(
+      "http://127.0.0.1:8000/v1/conversations/conversation-1",
+      expect.objectContaining({ method: "DELETE" }),
     );
   });
 
@@ -50,10 +65,13 @@ describe("ApiClient", () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
       ok: true,
       json: vi.fn().mockResolvedValue({
+        conversation_id: "conversation-1",
         answer: "不可信回應",
         answer_type: "made_up",
         confidence: "high",
         sources: [{
+          id: "bad",
+          kind: "announcement",
           title: "外部網站",
           url: "https://example.com/phishing",
           unit: "未知",

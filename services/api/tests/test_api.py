@@ -27,8 +27,12 @@ class StubHealth:
 
 
 class StubChat:
-    def answer(self, question: str) -> ChatResponse:
+    def __init__(self) -> None:
+        self.deleted: list[str] = []
+
+    def answer(self, question: str, conversation_id: str | None = None) -> ChatResponse:
         return ChatResponse(
+            conversation_id=conversation_id or "conversation-new",
             answer=f"測試回答：{question}",
             answer_type=AnswerType.INSUFFICIENT_INFORMATION,
             confidence=Confidence.LOW,
@@ -36,10 +40,18 @@ class StubChat:
             warning="目前收錄的官方資料不足以確認",
         )
 
+    def delete_conversation(self, conversation_id: str) -> bool:
+        self.deleted.append(conversation_id)
+        return True
+
 
 class FailingChat:
-    def answer(self, question: str) -> ChatResponse:
-        del question
+    def answer(self, question: str, conversation_id: str | None = None) -> ChatResponse:
+        del question, conversation_id
+        raise RuntimeError("do not expose this internal message")
+
+    def delete_conversation(self, conversation_id: str) -> bool:
+        del conversation_id
         raise RuntimeError("do not expose this internal message")
 
 
@@ -95,9 +107,26 @@ def test_chat_validates_and_returns_schema() -> None:
     invalid = client.post("/v1/chat", json={"question": " "})
 
     assert response.status_code == 200
+    assert response.json()["conversation_id"] == "conversation-new"
     assert response.json()["answer"].endswith("測試問題")
     assert invalid.status_code == 422
     assert "error" in invalid.json()
+
+
+def test_chat_accepts_existing_conversation_and_delete_clears_server_state() -> None:
+    chat = StubChat()
+    client = make_client(chat_service=chat)
+
+    response = client.post(
+        "/v1/chat",
+        json={"question": "第三則", "conversation_id": "conversation-existing"},
+    )
+    deleted = client.delete("/v1/conversations/conversation-existing")
+
+    assert response.status_code == 200
+    assert response.json()["conversation_id"] == "conversation-existing"
+    assert deleted.status_code == 204
+    assert chat.deleted == ["conversation-existing"]
 
 
 def test_announcements_have_paginated_shape() -> None:
@@ -212,3 +241,12 @@ def test_openapi_documents_the_unified_error_envelope() -> None:
     ]["schema"]
 
     assert error_schema["$ref"].endswith("/ErrorResponse")
+
+
+def test_openapi_keeps_question_compatible_and_adds_conversation_source_identity() -> None:
+    schema = make_client().app.openapi()["components"]["schemas"]
+
+    assert schema["ChatRequest"]["required"] == ["question"]
+    assert "conversation_id" in schema["ChatRequest"]["properties"]
+    assert "conversation_id" in schema["ChatResponse"]["required"]
+    assert {"id", "kind", "title", "url"} <= set(schema["SourceReference"]["required"])

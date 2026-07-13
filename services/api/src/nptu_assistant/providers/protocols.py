@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from nptu_assistant.rag.models import Evidence, GeneratedAnswer
+from nptu_assistant.rag.models import ModelTurn
 
 
 class EmbeddingProvider(Protocol):
@@ -10,4 +10,10 @@ class EmbeddingProvider(Protocol):
 
 
 class LlmProvider(Protocol):
-    def generate(self, question: str, evidence: list[Evidence]) -> GeneratedAnswer: ...
+    def create_turn(
+        self,
+        *,
+        instructions: str,
+        input_items: list[dict[str, object]],
+        tools: list[dict[str, object]],
+    ) -> ModelTurn: ...

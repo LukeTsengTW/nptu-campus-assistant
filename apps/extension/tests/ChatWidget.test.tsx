@@ -7,12 +7,15 @@ import { ChatWidget } from "../src/components/ChatWidget";
 
 
 const response = {
+  conversation_id: "conversation-1",
   answer: "申請期限請依公告辦理。",
   answer_type: "announcement" as const,
   confidence: "high" as const,
   warning: null,
   sources: [
     {
+      id: "announcement-1",
+      kind: "announcement" as const,
       title: "115學年度申請公告",
       url: "https://www.nptu.edu.tw/announcement",
       unit: "教務處",
@@ -83,5 +86,28 @@ describe("ChatWidget", () => {
 
     await waitFor(() => expect(screen.queryByText("正在查詢官方資料…")).not.toBeInTheDocument());
     expect(screen.queryByText(response.answer)).not.toBeInTheDocument();
+  });
+
+  it("後續問題重送 conversation id，清除時刪除 server state", async () => {
+    const user = userEvent.setup();
+    const sendQuestion = vi.fn().mockResolvedValue(response);
+    const clearConversation = vi.fn().mockResolvedValue(undefined);
+    render(
+      <ChatWidget
+        sendQuestion={sendQuestion}
+        clearConversation={clearConversation}
+        initialOpen
+      />,
+    );
+
+    await user.type(screen.getByLabelText("輸入校務問題"), "最近公告");
+    await user.click(screen.getByRole("button", { name: "送出問題" }));
+    await screen.findByText(response.answer);
+    await user.type(screen.getByLabelText("輸入校務問題"), "第三則");
+    await user.click(screen.getByRole("button", { name: "送出問題" }));
+
+    await waitFor(() => expect(sendQuestion).toHaveBeenLastCalledWith("第三則", "conversation-1"));
+    await user.click(screen.getByRole("button", { name: "清除對話" }));
+    expect(clearConversation).toHaveBeenCalledWith("conversation-1");
   });
 });

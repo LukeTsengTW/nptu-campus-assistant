@@ -23,6 +23,7 @@ class Confidence(StrEnum):
 
 class ChatRequest(BaseModel):
     question: str = Field(min_length=1, max_length=2000)
+    conversation_id: str | None = Field(default=None, min_length=1, max_length=100)
 
     @field_validator("question", mode="before")
     @classmethod
@@ -33,6 +34,8 @@ class ChatRequest(BaseModel):
 class SourceReference(BaseModel):
     model_config = ConfigDict(use_enum_values=True)
 
+    id: str
+    kind: AnswerType
     title: str
     url: str
     unit: str
@@ -48,6 +51,7 @@ class SourceReference(BaseModel):
 
 
 class ChatResponse(BaseModel):
+    conversation_id: str
     answer: str
     answer_type: AnswerType
     confidence: Confidence

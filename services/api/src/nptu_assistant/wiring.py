@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from openai import OpenAI
+
 from nptu_assistant.api.errors import AppError
 from nptu_assistant.api.services import AnnouncementService, HealthService
 from nptu_assistant.core.settings import Settings, WORKSPACE_ROOT, resolve_workspace_path
@@ -10,6 +12,7 @@ from nptu_assistant.db.session import create_session_factory
 from nptu_assistant.ingestion.service import DocumentIngestionService
 from nptu_assistant.providers.fake import FakeEmbeddingProvider, FakeLlmProvider
 from nptu_assistant.providers.openai import OpenAIEmbeddingProvider, OpenAILlmProvider
+from nptu_assistant.rag.conversation import SqlConversationStore
 from nptu_assistant.rag.retrieval import SqlRetriever
 from nptu_assistant.rag.service import ChatService
 
@@ -26,11 +29,20 @@ class UnavailableEmbeddingProvider:
 
 def build_services(settings: Settings) -> dict[str, object]:
     factory = create_session_factory(settings)
+    openai_client = (
+        OpenAI(api_key=settings.openai_api_key.get_secret_value())
+        if settings.has_openai_key
+        and (
+            settings.embedding_provider == "openai"
+            or settings.llm_provider == "openai"
+        )
+        else None
+    )
     if settings.embedding_provider == "fake":
         embedding = FakeEmbeddingProvider(settings.openai_embedding_dimensions)
-    elif settings.has_openai_key:
+    elif openai_client is not None:
         embedding = OpenAIEmbeddingProvider(
-            settings.openai_api_key.get_secret_value(),
+            openai_client,
             settings.openai_embedding_model,
             settings.openai_embedding_dimensions,
         )
@@ -38,9 +50,9 @@ def build_services(settings: Settings) -> dict[str, object]:
         embedding = UnavailableEmbeddingProvider()
     if settings.llm_provider == "fake":
         llm = FakeLlmProvider()
-    elif settings.has_openai_key:
+    elif openai_client is not None:
         llm = OpenAILlmProvider(
-            settings.openai_api_key.get_secret_value(),
+            openai_client,
             settings.openai_text_model,
         )
     else:
@@ -53,7 +65,15 @@ def build_services(settings: Settings) -> dict[str, object]:
     )
     return {
         "health_service": HealthService(factory, settings),
-        "chat_service": ChatService(SqlRetriever(factory, embedding), llm) if llm else None,
+        "chat_service": (
+            ChatService(
+                SqlRetriever(factory, embedding),
+                llm,
+                SqlConversationStore(factory),
+            )
+            if llm
+            else None
+        ),
         "announcement_service": AnnouncementService(announcement_repository),
         "ingestion_service": DocumentIngestionService(
             resolve_workspace_path(settings.official_documents_path),

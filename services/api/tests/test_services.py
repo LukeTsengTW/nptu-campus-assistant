@@ -13,6 +13,7 @@ from nptu_assistant.ingestion.service import DocumentIngestionService
 from nptu_assistant.providers.fake import FakeEmbeddingProvider
 from nptu_assistant.api.services import HealthService
 from nptu_assistant.core.settings import Settings
+from nptu_assistant.wiring import build_services
 
 
 class HealthySession:
@@ -57,6 +58,34 @@ def test_health_service_reports_ok_degraded_and_unhealthy() -> None:
     assert HealthService(HealthyFactory(), fake_settings).check()["status"] == "ok"
     assert HealthService(HealthyFactory(), openai_without_key).check()["status"] == "degraded"
     assert HealthService(FailingFactory(), fake_settings).check()["status"] == "unhealthy"
+
+
+def test_wiring_shares_one_openai_client_between_text_and_embeddings(monkeypatch) -> None:
+    clients: list[object] = []
+
+    class FakeOpenAIClient:
+        pass
+
+    def create_client(*, api_key: str) -> object:
+        assert api_key == "test-key"
+        client = FakeOpenAIClient()
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr("nptu_assistant.wiring.OpenAI", create_client)
+    services = build_services(
+        Settings(
+            _env_file=None,
+            openai_api_key="test-key",
+            llm_provider="openai",
+            embedding_provider="openai",
+        )
+    )
+    chat_service = services["chat_service"]
+
+    assert len(clients) == 1
+    assert chat_service._llm._client is clients[0]
+    assert chat_service._tool_executor._retriever._embedding_provider._client is clients[0]
 
 
 class MemoryDocumentRepository:

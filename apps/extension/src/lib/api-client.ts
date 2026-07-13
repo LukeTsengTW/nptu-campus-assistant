@@ -25,6 +25,8 @@ function isSourceReference(value: unknown): boolean {
   if (!value || typeof value !== "object") return false;
   const source = value as Record<string, unknown>;
   return (
+    typeof source.id === "string" &&
+    typeof source.kind === "string" && ["official_document", "announcement"].includes(source.kind) &&
     typeof source.title === "string" &&
     typeof source.unit === "string" &&
     isOfficialNptuUrl(source.url) &&
@@ -38,6 +40,7 @@ function isChatResponse(value: unknown): value is ChatResponse {
   if (!value || typeof value !== "object") return false;
   const record = value as Record<string, unknown>;
   return (
+    typeof record.conversation_id === "string" &&
     typeof record.answer === "string" &&
     typeof record.answer_type === "string" && ANSWER_TYPES.has(record.answer_type) &&
     typeof record.confidence === "string" && CONFIDENCE_LEVELS.has(record.confidence) &&
@@ -54,14 +57,17 @@ export class ApiClient {
     this.baseUrl = baseUrl.replace(/\/$/, "");
   }
 
-  async chat(question: string): Promise<ChatResponse> {
+  async chat(question: string, conversationId?: string): Promise<ChatResponse> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
     try {
       const response = await fetch(`${this.baseUrl}/v1/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question }),
+        body: JSON.stringify({
+          question,
+          ...(conversationId ? { conversation_id: conversationId } : {}),
+        }),
         signal: controller.signal,
       });
       const payload: unknown = await response.json().catch(() => null);
@@ -85,6 +91,16 @@ export class ApiClient {
       throw new Error("無法連線到後端服務。");
     } finally {
       clearTimeout(timeout);
+    }
+  }
+
+  async deleteConversation(conversationId: string): Promise<void> {
+    const response = await fetch(
+      `${this.baseUrl}/v1/conversations/${encodeURIComponent(conversationId)}`,
+      { method: "DELETE" },
+    );
+    if (!response.ok) {
+      throw new Error("無法清除伺服器對話狀態。")
     }
   }
 }

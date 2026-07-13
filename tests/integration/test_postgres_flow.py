@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import uuid
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -10,7 +11,8 @@ from sqlalchemy import select
 
 from nptu_assistant.core.settings import Settings
 from nptu_assistant.crawlers.service import CrawlerService
-from nptu_assistant.db.models import Document
+from nptu_assistant.api.schemas import AnswerType
+from nptu_assistant.db.models import Announcement, Conversation, ConversationEvent, Document, Source
 from nptu_assistant.db.repositories import SqlAnnouncementRepository, SqlDocumentRepository
 from nptu_assistant.db.session import create_session_factory
 from nptu_assistant.ingestion.cleaning import extract_clean_html
@@ -18,6 +20,10 @@ from nptu_assistant.ingestion.parsers import parse_document
 from nptu_assistant.ingestion.service import DocumentIngestionService
 from nptu_assistant.main import create_app
 from nptu_assistant.providers.fake import FakeEmbeddingProvider
+from nptu_assistant.rag.conversation import SqlConversationStore
+from nptu_assistant.rag.models import Evidence
+from nptu_assistant.rag.retrieval import SqlRetriever
+from nptu_assistant.rag.tools import AnnouncementSort
 
 
 pytestmark = pytest.mark.skipif(
@@ -85,12 +91,164 @@ def test_fixture_ingestion_crawl_and_grounded_chat() -> None:
         announcements = client.get("/v1/announcements?page=1&page_size=20")
 
         assert announcement_chat.status_code == 200
-        assert announcement_chat.json()["answer_type"] == "announcement"
-        assert announcement_chat.json()["sources"]
+        assert all(
+            source["url"] != "https://academic.nptu.edu.tw/p/406-1.php"
+            for source in announcement_chat.json()["sources"]
+        )
         assert announcements.status_code == 200
         assert announcements.json()["total"] >= 1
         published_dates = [item["published_at"] for item in announcements.json()["items"]]
         assert published_dates == sorted(published_dates, reverse=True)
+
+
+def test_structured_announcement_retrieval_filters_sorts_and_gets_by_id() -> None:
+    settings = Settings(_env_file=None, database_url=os.environ["DATABASE_URL"])
+    factory = create_session_factory(settings)
+    unique = uuid.uuid4().hex
+    unit = f"整合測試單位-{unique}"
+    query = f"獎學金-{unique}"
+    now = datetime.now(timezone.utc)
+
+    with factory.begin() as session:
+        public_source = Source(
+            name=f"integration-live-{unique}",
+            base_url="https://www.nptu.edu.tw",
+            unit=unit,
+            source_type="announcement",
+            crawl_enabled=False,
+            crawl_interval_minutes=60,
+        )
+        fixture_source = Source(
+            name=f"integration-fixture-{unique}",
+            base_url="https://www.nptu.edu.tw",
+            unit=unit,
+            source_type="announcement",
+            crawl_enabled=False,
+            crawl_interval_minutes=60,
+        )
+        session.add_all([public_source, fixture_source])
+        session.flush()
+        public_items = []
+        for index in range(6):
+            item = Announcement(
+                source_id=public_source.id,
+                title=f"{query} 第 {index + 1} 則",
+                unit=unit,
+                category=None,
+                published_at=date(2026, 7, index + 1),
+                deadline_at=None,
+                canonical_url=f"https://www.nptu.edu.tw/{unique}/{index}",
+                body=f"{query} 內容 {index + 1}",
+                warning=None,
+                content_hash=f"{index:064x}",
+                last_crawled_at=now + timedelta(minutes=index),
+            )
+            public_items.append(item)
+            session.add(item)
+        fixture = Announcement(
+            source_id=fixture_source.id,
+            title=f"{query} fixture",
+            unit=unit,
+            category=None,
+            published_at=date(2026, 7, 31),
+            deadline_at=None,
+            canonical_url=f"https://www.nptu.edu.tw/{unique}/fixture",
+            body=f"{query} fixture content",
+            warning=None,
+            content_hash="f" * 64,
+            last_crawled_at=now,
+        )
+        session.add(fixture)
+        session.flush()
+        public_ids = [str(item.id) for item in public_items]
+        fixture_id = str(fixture.id)
+        fixture_url = fixture.canonical_url
+
+    retriever = SqlRetriever(factory, FakeEmbeddingProvider(1536))
+    newest = retriever.search_announcements(
+        query=None,
+        limit=5,
+        sort=AnnouncementSort.NEWEST,
+        unit=unit,
+    )
+    relevance = retriever.search_announcements(
+        query=query,
+        limit=3,
+        sort=AnnouncementSort.RELEVANCE,
+        unit=unit,
+    )
+    oldest = retriever.search_announcements(
+        query=None,
+        limit=2,
+        sort=AnnouncementSort.OLDEST,
+        unit=unit,
+    )
+    ranged = retriever.search_announcements(
+        query=None,
+        limit=20,
+        sort=AnnouncementSort.NEWEST,
+        unit=unit,
+        date_from=date(2026, 7, 2),
+        date_to=date(2026, 7, 3),
+    )
+
+    assert [item.id for item in newest] == list(reversed(public_ids))[:5]
+    assert len(relevance) == 3
+    assert all(query in item.title for item in relevance)
+    assert [item.id for item in oldest] == public_ids[:2]
+    assert [item.published_at for item in ranged] == [date(2026, 7, 3), date(2026, 7, 2)]
+    assert all(item.url != fixture_url for item in newest + relevance + oldest + ranged)
+    assert retriever.get_announcement(public_ids[0]).id == public_ids[0]
+    assert retriever.get_announcement(fixture_id) is None
+    assert retriever.get_announcement(str(uuid.uuid4())) is None
+
+
+def test_postgres_conversation_store_redacts_expires_and_deletes() -> None:
+    settings = Settings(_env_file=None, database_url=os.environ["DATABASE_URL"])
+    factory = create_session_factory(settings)
+    store = SqlConversationStore(factory)
+    context = store.load_or_create(None)
+    source = Evidence(
+        id=str(uuid.uuid4()),
+        kind=AnswerType.ANNOUNCEMENT,
+        title="測試公告",
+        url="https://www.nptu.edu.tw/conversation-test",
+        unit="教務處",
+        published_at=date(2026, 7, 12),
+        content="內容",
+        score=0.8,
+    )
+
+    store.save_turn(
+        conversation_id=context.conversation_id,
+        user_message="我的學號 123456789，第三則是什麼？",
+        assistant_message="第三則是測試公告。",
+        warning=None,
+        tool_events=[{"tool_name": "search_announcements", "evidence": [source]}],
+        sources=[source],
+    )
+    loaded = store.load_or_create(context.conversation_id)
+
+    assert any(item.get("role") == "assistant" for item in loaded.input_items)
+    assert loaded.evidence[0].id == source.id
+    with factory.begin() as session:
+        user_event = session.scalar(
+            select(ConversationEvent).where(
+                ConversationEvent.conversation_id == uuid.UUID(context.conversation_id),
+                ConversationEvent.event_type == "user",
+            )
+        )
+        assert user_event.content == "[已隱去可能的個人或敏感資料]"
+        conversation = session.get(Conversation, uuid.UUID(context.conversation_id))
+        conversation.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+
+    replacement = store.load_or_create(context.conversation_id)
+
+    assert replacement.conversation_id != context.conversation_id
+    with factory() as session:
+        assert session.get(Conversation, uuid.UUID(context.conversation_id)) is None
+    assert store.delete(replacement.conversation_id) is True
+    assert store.delete(replacement.conversation_id) is False
 
 
 def test_document_content_change_creates_a_version_chain(tmp_path: Path) -> None:

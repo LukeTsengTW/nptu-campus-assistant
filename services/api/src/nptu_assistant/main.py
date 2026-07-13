@@ -9,7 +9,7 @@ from typing import Any
 from fastapi import Depends, FastAPI, Header, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from nptu_assistant.api.errors import AppError
@@ -40,12 +40,17 @@ def _error_responses(*status_codes: int) -> dict[int, dict[str, object]]:
 
 
 class _UnavailableChat:
-    def answer(self, question: str) -> ChatResponse:
+    def answer(self, question: str, conversation_id: str | None = None) -> ChatResponse:
+        del question, conversation_id
         raise AppError(
             "provider_unavailable",
             "目前未設定回答服務，請檢查後端 Provider 設定。",
             status_code=503,
         )
+
+    def delete_conversation(self, conversation_id: str) -> bool:
+        del conversation_id
+        return False
 
 
 class _EmptyAnnouncements:
@@ -218,7 +223,17 @@ def create_app(
         dependencies=[Depends(rate_limit("chat", 20))],
     )
     def chat(payload: ChatRequest) -> ChatResponse:
-        return chat_service.answer(payload.question)
+        return chat_service.answer(payload.question, payload.conversation_id)
+
+    @app.delete(
+        "/v1/conversations/{conversation_id}",
+        status_code=204,
+        responses=_error_responses(429, 500, 503),
+        dependencies=[Depends(rate_limit("chat", 20))],
+    )
+    def delete_conversation(conversation_id: str) -> Response:
+        chat_service.delete_conversation(conversation_id)
+        return Response(status_code=204)
 
     @app.get(
         "/v1/announcements",
