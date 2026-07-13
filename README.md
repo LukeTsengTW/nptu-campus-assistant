@@ -42,6 +42,32 @@ Invoke-RestMethod http://127.0.0.1:8000/health
 
 Compose 會等待 PostgreSQL healthy，執行 `alembic upgrade head` 後啟動 API。
 
+### Windows 登入自動啟動
+
+Docker Desktop 須保留「登入 Windows 時啟動」設定。接著在 repository 根目錄執行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install-windows-autostart.ps1
+```
+
+此命令為目前使用者建立 `NPTU Campus Assistant Backend` 登入排程。排程會等待 Docker Desktop 引擎就緒、執行 `docker compose up -d`，再等待 API health check 成功。`db` 與 `api` 容器也會在 Docker 引擎重新啟動後自動恢復。
+
+立即執行及檢查：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\start-nptu-assistant.ps1
+Get-ScheduledTask -TaskName "NPTU Campus Assistant Backend"
+Invoke-RestMethod http://127.0.0.1:8000/health
+```
+
+啟動日誌位於 `%LOCALAPPDATA%\NptuCampusAssistant\startup.log`。停用、重新啟用或移除排程：
+
+```powershell
+Disable-ScheduledTask -TaskName "NPTU Campus Assistant Backend"
+Enable-ScheduledTask -TaskName "NPTU Campus Assistant Backend"
+Unregister-ScheduledTask -TaskName "NPTU Campus Assistant Backend" -Confirm:$false
+```
+
 手動 migration 與 seed：
 
 ```powershell
