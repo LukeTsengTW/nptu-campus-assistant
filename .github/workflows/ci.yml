@@ -68,6 +68,7 @@ jobs:
 
       - name: TypeScript tests and builds
         run: |
+          pnpm --filter @nptu/extension typecheck
           pnpm test
           pnpm build
 
