@@ -126,6 +126,27 @@ def test_successful_empty_keyword_scope_returns_no_announcements() -> None:
     assert session.statements == []
 
 
+def test_failed_live_search_fallback_requires_database_relevance() -> None:
+    session = FakeSession()
+
+    make_retriever(session).search_announcements(
+        query="電腦科學與人工智慧學系",
+        limit=5,
+        sort=AnnouncementSort.NEWEST,
+        unit=None,
+        date_from=None,
+        date_to=None,
+        canonical_urls=None,
+    )
+    statement = sql(session.statements[0]).lower()
+
+    assert "similarity(announcements.title, '電腦科學與人工智慧學系')" in statement
+    assert "similarity(announcements.body, '電腦科學與人工智慧學系')" in statement
+    assert "similarity(coalesce(announcements.unit, ''), '電腦科學與人工智慧學系')" in statement
+    assert ">= 0.1" in statement
+    assert "order by announcements.published_at desc" in statement
+
+
 def test_relevance_announcements_use_similarity_and_structured_filters() -> None:
     session = FakeSession()
 

@@ -176,6 +176,45 @@ class SearchHttpClient:
         return RESULT_FIXTURE.read_text(encoding="utf-8")
 
 
+def test_keyword_search_service_refreshes_form_and_retries_transient_auth_failure() -> None:
+    class ExpiringFormHttpClient(SearchHttpClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.bootstrap_requests = 0
+            self.failed_once = False
+
+        def submit_form(self, method: str, url: str, fields: dict[str, str]) -> str:
+            if "Action=mobileloadmod" in url:
+                self.bootstrap_requests += 1
+                self.form_requests.append((method, url, dict(fields)))
+                return BOOTSTRAP_FIXTURE.read_text(encoding="utf-8")
+            self.submissions.append((fields["SchKey"], fields["SchType"]))
+            if fields["SchType"] == "com" and not self.failed_once:
+                self.failed_once = True
+                raise RuntimeError("FR_Request_Authfailed")
+            return RESULT_FIXTURE.read_text(encoding="utf-8")
+
+    http = ExpiringFormHttpClient()
+    result = KeywordAnnouncementSearchService(
+        keyword_config(),
+        MemoryAnnouncementRepository(),
+        http,
+    ).ingest("電科系")
+
+    assert http.bootstrap_requests == 2
+    assert http.submissions[:3] == [
+        ("電科系", "part"),
+        ("電科系", "com"),
+        ("電科系", "com"),
+    ]
+    assert result.summary.failed == 1
+    assert result.summary.errors == ["公告缺少發布日期：跨域講座"]
+    assert result.warning == PARTIAL_SEARCH_FAILURE_WARNING
+    assert result.canonical_urls == (
+        "https://csai.nptu.edu.tw/p/406-1096-197001.php?Lang=zh-tw",
+    )
+
+
 def test_keyword_search_service_submits_variants_deduplicates_and_ingests() -> None:
     repository = MemoryAnnouncementRepository()
     http = SearchHttpClient()

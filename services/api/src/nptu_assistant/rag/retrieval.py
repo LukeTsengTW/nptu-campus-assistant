@@ -14,6 +14,9 @@ from nptu_assistant.rag.models import Evidence
 from nptu_assistant.rag.tools import AnnouncementSort
 
 
+FAILED_SEARCH_MIN_SIMILARITY = 0.1
+
+
 def _public_announcement_source_filter() -> object:
     return Source.name.not_ilike("%fixture%")
 
@@ -120,17 +123,22 @@ class SqlRetriever:
 
         query = query.strip() if query else ""
         unit = unit.strip() if unit else None
-        score_expression = (
-            func.greatest(
+        fallback_relevance_filter: object | None = None
+        if query:
+            raw_score_expression = func.greatest(
                 func.similarity(Announcement.title, query),
                 func.similarity(Announcement.body, query),
-            ).label("score")
-            if query
-            else literal(0.65).label("score")
-        )
+                func.similarity(func.coalesce(Announcement.unit, ""), query),
+            )
+            score_expression = raw_score_expression.label("score")
+            fallback_relevance_filter = raw_score_expression >= FAILED_SEARCH_MIN_SIMILARITY
+        else:
+            score_expression = literal(0.65).label("score")
         filters = [_public_announcement_source_filter()]
         if canonical_urls is not None:
             filters.append(Announcement.canonical_url.in_(canonical_urls))
+        elif fallback_relevance_filter is not None:
+            filters.append(fallback_relevance_filter)
         if unit:
             filters.append(Announcement.unit.ilike(f"%{unit}%"))
         if date_from:
