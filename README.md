@@ -16,7 +16,14 @@
 ```powershell
 corepack pnpm install
 cd services/api
-uv sync --extra dev
+uv sync --frozen --extra dev
+```
+
+`.venv` 僅能在建立它的作業系統使用；不得將 Docker、WSL 或其他 Linux 環境建立的 `.venv` 複製到 Windows。若 `services/api/.venv/pyvenv.cfg` 的 `home` 是 `/usr/local/bin`，請在 `services/api` 重建本機環境：
+
+```powershell
+Remove-Item -LiteralPath .venv -Recurse -Force
+uv sync --frozen --extra dev
 ```
 
 ## 環境設定
@@ -38,9 +45,10 @@ uv sync --extra dev
 ```powershell
 docker compose up -d --build
 Invoke-RestMethod http://127.0.0.1:8000/health
+Invoke-RestMethod 'http://127.0.0.1:8000/v1/announcements?page=1&page_size=20'
 ```
 
-Compose 會等待 PostgreSQL healthy，執行 `alembic upgrade head` 後啟動 API。
+Compose 會等待 PostgreSQL healthy，執行 `alembic upgrade head` 後啟動 API。公告 API 回傳目前資料庫中已收錄的公告；初次啟動時，背景工作會檢查來源是否需要刷新。
 
 ### Windows 登入自動啟動
 
@@ -96,7 +104,7 @@ uv run nptu-assistant crawl-announcements
 
 新增來源時，先更新 `data/sources/announcements.yaml`，再建立獨立 adapter 與 fixtures。不得傳入任意 URL。
 
-API 啟動後每 60 秒檢查已啟用來源是否到期；`nptu-overview` 的實際刷新間隔由 `crawl_interval_minutes: 60` 控制。使用者查詢最新公告時也會先做相同檢查。未到期不會重新請求官網；到期時最多處理 RSS 前 20 則。
+API 啟動後每 60 秒檢查已啟用來源是否到期；`nptu-overview` 的實際刷新間隔由 `crawl_interval_minutes: 60` 控制。使用者查詢最新公告時也會先做相同檢查。未到期不會重新請求官網；到期時最多處理 RSS 前 20 則。需要立即刷新時，可執行上方的 `crawl-announcements` 指令。
 
 刷新失敗時，系統保留最後成功收錄的資料並在回答附上警告。所有回答來源仍從資料庫產生，模型不能指定任意爬取 URL。
 
@@ -155,7 +163,8 @@ corepack pnpm --filter @nptu/shared generate
 
 ## 已知限制
 
-- MVP 的管理操作同步執行，沒有 queue 或排程平台。
+- 管理操作同步執行，沒有外部 queue 或集中式排程平台；公告刷新使用 API process 內的背景工作。
+- 公告刷新鎖是 process-local。部署多個 API worker 前，必須改用 PostgreSQL advisory lock 或獨立 scheduler worker，避免同一來源被不同 process 同時爬取。
 - Rate limiter 為單 process 記憶體實作。
 - NPTU 網站改版時需以真實 HTML 更新對應 adapter fixture 與 parser。
 - 本專案不提供登入、成績、選課、個人校務資料、教師評價或代送表單功能。
