@@ -6,6 +6,7 @@ sources:
     category: 總覽
     enabled: true
     crawl_interval_minutes: 60
+    max_items: 20
   - name: local-fixture
     adapter: fixture
     url: data/fixtures/announcements/overview.xml
