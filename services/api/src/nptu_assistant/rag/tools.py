@@ -136,7 +136,7 @@ class AnnouncementRefresher(Protocol):
 
 
 class KeywordAnnouncementIngestor(Protocol):
-    def ingest(self, query: str) -> KeywordIngestionResult:
+    def ingest(self, query: str, *, max_items: int) -> KeywordIngestionResult:
         raise NotImplementedError
 
     def normalize(self, text: str) -> str:
@@ -201,7 +201,7 @@ class ToolExecutor:
                 arguments["query"] = self._keyword_ingestor.normalize(parsed.query)
                 if parsed.unit:
                     arguments["unit"] = self._keyword_ingestor.normalize(parsed.unit)
-                ingestion = self._keyword_ingestor.ingest(parsed.query)
+                ingestion = self._keyword_ingestor.ingest(parsed.query, max_items=parsed.limit)
                 arguments["query"] = ingestion.retrieval_query
                 arguments["canonical_urls"] = ingestion.canonical_urls
                 warning = ingestion.warning

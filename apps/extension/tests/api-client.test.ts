@@ -61,6 +61,36 @@ describe("ApiClient", () => {
     );
   });
 
+  it("允許官網公告即時搜尋超過舊的 15 秒期限", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.stubGlobal("fetch", vi.fn().mockImplementation((_input: string, init?: RequestInit) => (
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener(
+            "abort",
+            () => reject(new DOMException("The operation was aborted.", "AbortError")),
+            { once: true },
+          );
+        })
+      )));
+
+      const request = new ApiClient("http://127.0.0.1:8000").chat("查電科系最新公告");
+      let settled = false;
+      void request.then(
+        () => { settled = true; },
+        () => { settled = true; },
+      );
+
+      await vi.advanceTimersByTimeAsync(15_001);
+      expect(settled).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(44_999);
+      await expect(request).rejects.toThrow("查詢逾時，請稍後再試。");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("rejects an invalid answer type and unsafe source URL", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
       ok: true,

@@ -104,9 +104,10 @@ class KeywordAnnouncementSearchService:
             tuple(self._config.search_types),
         )
 
-    def ingest(self, query: str) -> KeywordIngestionResult:
+    def ingest(self, query: str, *, max_items: int | None = None) -> KeywordIngestionResult:
         expansion = self._resolver.expand(query)
         summary = CrawlSummary()
+        item_limit = self._config.max_items if max_items is None else min(max_items, self._config.max_items)
         try:
             form: SearchForm | None = self._load_form()
         except Exception as exc:
@@ -153,7 +154,7 @@ class KeywordAnnouncementSearchService:
             unique_results.values(),
             key=lambda item: (item.published_at is not None, item.published_at or date.min),
             reverse=True,
-        )[: self._config.max_items]
+        )[:item_limit]
 
         ingested_urls: list[str] = []
         for result in ordered:

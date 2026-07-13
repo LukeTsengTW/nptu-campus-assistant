@@ -308,3 +308,25 @@ def test_keyword_search_service_limits_unique_results_before_detail_fetch() -> N
     assert len(repository.candidates) == 20
     assert repository.candidates[0].published_at == date(2026, 7, 25)
     assert repository.candidates[-1].published_at == date(2026, 7, 6)
+
+
+def test_keyword_search_service_respects_requested_limit_before_detail_fetch() -> None:
+    rows = "".join(
+        f'<tr><td class="date">2026-07-{index:02d}</td><td><a href="https://www.nptu.edu.tw/p/406-1000-{index}.php">公告 {index}</a></td><td class="unit">測試單位</td></tr>'
+        for index in range(1, 6)
+    )
+
+    class ManyResultsHttpClient(SearchHttpClient):
+        def submit_form(self, method: str, url: str, fields: dict[str, str]) -> str:
+            if "Action=mobileloadmod" in url:
+                return BOOTSTRAP_FIXTURE.read_text(encoding="utf-8")
+            self.submissions.append((fields["SchKey"], fields["SchType"]))
+            return FORM_FIXTURE.read_text(encoding="utf-8") + f'<div data-search-results><table>{rows}</table></div>'
+
+    repository = MemoryAnnouncementRepository()
+    result = KeywordAnnouncementSearchService(
+        keyword_config(max_items=20, aliases={}), repository, ManyResultsHttpClient()
+    ).ingest("人工智慧", max_items=2)
+
+    assert result.summary.created == 2
+    assert len(repository.candidates) == 2

@@ -7,6 +7,7 @@ type ErrorEnvelope = { error?: { message?: unknown } };
 const ANSWER_TYPES = new Set(["official_document", "announcement", "insufficient_information"]);
 const CONFIDENCE_LEVELS = new Set(["high", "medium", "low"]);
 const NETWORK_ERROR_MESSAGE = "無法連線到後端服務，請確認本機 API 已啟動。";
+const DEFAULT_CHAT_TIMEOUT_MS = 60_000;
 
 
 function isOfficialNptuUrl(value: unknown): value is string {
@@ -53,7 +54,7 @@ function isChatResponse(value: unknown): value is ChatResponse {
 export class ApiClient {
   private readonly baseUrl: string;
 
-  constructor(baseUrl: string, private readonly timeoutMs = 15_000) {
+  constructor(baseUrl: string, private readonly timeoutMs = DEFAULT_CHAT_TIMEOUT_MS) {
     this.baseUrl = baseUrl.replace(/\/$/, "");
   }
 

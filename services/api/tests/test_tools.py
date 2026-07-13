@@ -52,9 +52,11 @@ class StubKeywordIngestor:
     def __init__(self, *, fail: bool = False) -> None:
         self.fail = fail
         self.queries: list[str] = []
+        self.limits: list[int] = []
 
-    def ingest(self, query: str) -> KeywordIngestionResult:
+    def ingest(self, query: str, *, max_items: int) -> KeywordIngestionResult:
         self.queries.append(query)
+        self.limits.append(max_items)
         if self.fail:
             raise RuntimeError("official search unavailable")
         return KeywordIngestionResult(
@@ -187,6 +189,7 @@ def test_executor_ingests_keyword_before_database_search_and_normalizes_filters(
 
     assert result.warning is None
     assert ingestor.queries == ["電科系 獎學金"]
+    assert ingestor.limits == [3]
     assert retriever.calls[0] == (
         "search_announcements",
         {
