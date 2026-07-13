@@ -40,4 +40,5 @@ def test_live_keyword_search_form_and_result_contract() -> None:
         client.close()
 
     assert "part" in form.search_types
+    assert results
     assert all(result.canonical_url.startswith("https://") for result in results)

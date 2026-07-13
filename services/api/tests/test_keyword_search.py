@@ -199,6 +199,9 @@ def test_keyword_search_service_submits_variants_deduplicates_and_ingests() -> N
     assert result.summary.created == 1
     assert result.summary.failed == 1
     assert result.warning == PARTIAL_SEARCH_FAILURE_WARNING
+    assert result.canonical_urls == (
+        "https://csai.nptu.edu.tw/p/406-1096-197001.php?Lang=zh-tw",
+    )
     assert len(repository.candidates) == 1
     assert repository.candidates[0].body == "人工智慧學程公告\n完整公告內容"
 
@@ -218,9 +221,30 @@ def test_keyword_search_service_reports_partial_and_total_failures() -> None:
 
     assert partial.warning == PARTIAL_SEARCH_FAILURE_WARNING
     assert partial.summary.created == 1
+    assert partial.canonical_urls == (
+        "https://csai.nptu.edu.tw/p/406-1096-197001.php?Lang=zh-tw",
+    )
     assert failed.warning == FULL_SEARCH_FAILURE_WARNING
     assert failed.summary.failed == 1
+    assert failed.canonical_urls is None
     assert "hidden" not in " ".join(failed.summary.errors).lower()
+
+
+def test_keyword_search_service_returns_empty_scope_for_successful_empty_search() -> None:
+    class EmptySearchHttpClient(SearchHttpClient):
+        def submit_form(self, method: str, url: str, fields: dict[str, str]) -> str:
+            if "Action=mobileloadmod" in url:
+                return BOOTSTRAP_FIXTURE.read_text(encoding="utf-8")
+            return FORM_FIXTURE.read_text(encoding="utf-8") + '<div data-search-results></div>'
+
+    result = KeywordAnnouncementSearchService(
+        keyword_config(aliases={}),
+        MemoryAnnouncementRepository(),
+        EmptySearchHttpClient(),
+    ).ingest("查無結果關鍵字")
+
+    assert result.canonical_urls == ()
+    assert result.warning is None
 
 
 def test_keyword_search_service_limits_unique_results_before_detail_fetch() -> None:

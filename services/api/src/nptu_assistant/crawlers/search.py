@@ -30,6 +30,7 @@ class KeywordIngestionResult:
     retrieval_query: str
     summary: CrawlSummary
     warning: str | None = None
+    canonical_urls: tuple[str, ...] | None = None
 
 
 class KeywordAliasResolver:
@@ -146,6 +147,7 @@ class KeywordAnnouncementSearchService:
             reverse=True,
         )[: self._config.max_items]
 
+        ingested_urls: list[str] = []
         for result in ordered:
             if result.published_at is None:
                 summary.failed += 1
@@ -174,6 +176,7 @@ class KeywordAnnouncementSearchService:
                     source_url=self._config.url,
                     interval_minutes=self._config.crawl_interval_minutes,
                 )
+                ingested_urls.append(result.canonical_url)
                 if outcome == "created":
                     summary.created += 1
                 elif outcome == "updated":
@@ -190,4 +193,9 @@ class KeywordAnnouncementSearchService:
             warning = PARTIAL_SEARCH_FAILURE_WARNING
         else:
             warning = None
-        return KeywordIngestionResult(expansion.retrieval_query, summary, warning)
+        return KeywordIngestionResult(
+            expansion.retrieval_query,
+            summary,
+            warning,
+            tuple(ingested_urls) if successful_searches else None,
+        )
