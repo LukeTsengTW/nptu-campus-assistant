@@ -29,3 +29,12 @@ def test_system_instructions_define_department_aliases_without_electrical_depart
     assert "資工系＝資訊工程學系" in SYSTEM_INSTRUCTIONS
     assert "機器人系、智機系＝智慧機器人學系" in SYSTEM_INSTRUCTIONS
     assert "英語系、英文系＝英語學系" in SYSTEM_INSTRUCTIONS
+
+
+def test_system_instructions_define_administrative_unit_aliases() -> None:
+    assert "詢問行政單位、處室、組、中心或室名稱時，使用 search_documents" in SYSTEM_INSTRUCTIONS
+    assert "計網中心＝計算機與網路中心" in SYSTEM_INSTRUCTIONS
+    assert "校友組＝校友服務組" in SYSTEM_INSTRUCTIONS
+    assert "育成中心＝創新育成中心" in SYSTEM_INSTRUCTIONS
+    assert "國文組、外生組＝國際學生組" in SYSTEM_INSTRUCTIONS
+    assert "推廣中心＝推廣教育中心" in SYSTEM_INSTRUCTIONS
