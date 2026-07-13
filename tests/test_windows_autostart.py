@@ -1,17 +1,24 @@
 from __future__ import annotations
 
 import json
-import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import os
 from pathlib import Path
+import shutil
 import subprocess
 import threading
 
+import pytest
 import yaml
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 POWERSHELL = "powershell.exe"
+
+pytestmark = pytest.mark.skipif(
+    os.name != "nt" or shutil.which(POWERSHELL) is None,
+    reason="Windows 自動啟動測試需要 powershell.exe",
+)
 
 
 class _HealthHandler(BaseHTTPRequestHandler):

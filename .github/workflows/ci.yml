@@ -78,3 +78,20 @@ jobs:
             echo "Potential OpenAI secret found in tracked files"
             exit 1
           fi
+
+  windows-autostart:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install backend test dependencies
+        run: uv sync --project services/api --extra dev --frozen
+
+      - name: Windows auto-start tests
+        run: uv run --project services/api pytest tests/test_windows_autostart.py
