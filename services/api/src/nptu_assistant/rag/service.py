@@ -18,7 +18,12 @@ from nptu_assistant.rag.models import (
     ResponseKind,
 )
 from nptu_assistant.rag.prompts import SYSTEM_INSTRUCTIONS
-from nptu_assistant.rag.tools import StructuredRetriever, ToolExecutor, tool_definitions
+from nptu_assistant.rag.tools import (
+    AnnouncementRefresher,
+    StructuredRetriever,
+    ToolExecutor,
+    tool_definitions,
+)
 
 
 INSUFFICIENT_ANSWER = "目前收錄的官方資料不足以確認。"
@@ -78,10 +83,11 @@ class ChatService:
         retriever: StructuredRetriever,
         llm: LlmProvider,
         conversation_store: ConversationStore,
+        announcement_refresher: AnnouncementRefresher | None = None,
     ) -> None:
         self._llm = llm
         self._conversation_store = conversation_store
-        self._tool_executor = ToolExecutor(retriever)
+        self._tool_executor = ToolExecutor(retriever, announcement_refresher)
 
     def delete_conversation(self, conversation_id: str) -> bool:
         return self._conversation_store.delete(conversation_id)
@@ -94,6 +100,7 @@ class ChatService:
         ]
         evidence_by_id = {item.id: item for item in context.evidence}
         tool_events: list[dict[str, object]] = []
+        tool_warnings: list[str] = []
         tool_rounds = 0
 
         while True:
@@ -116,6 +123,8 @@ class ChatService:
                     result = self._tool_executor.execute(call.name, call.arguments)
                     for item in result.evidence:
                         evidence_by_id[item.id] = item
+                    if result.warning and result.warning not in tool_warnings:
+                        tool_warnings.append(result.warning)
                     tool_events.append(
                         {
                             "tool_name": call.name,
@@ -142,6 +151,7 @@ class ChatService:
                 context.conversation_id,
                 turn.generated,
                 evidence_by_id,
+                tool_warnings,
             )
             self._conversation_store.save_turn(
                 conversation_id=context.conversation_id,
@@ -158,6 +168,7 @@ class ChatService:
         conversation_id: str,
         generated: GeneratedAnswer,
         evidence_by_id: dict[str, Evidence],
+        tool_warnings: list[str],
     ) -> ChatResponse:
         used: list[Evidence] = []
         seen: set[str] = set()
@@ -174,6 +185,8 @@ class ChatService:
             if generated.warning
             else None
         )
+        warning_parts = [item for item in [warning, *tool_warnings] if item]
+        warning = "\n".join(dict.fromkeys(warning_parts)) or None
         if not answer:
             answer = INSUFFICIENT_ANSWER
 

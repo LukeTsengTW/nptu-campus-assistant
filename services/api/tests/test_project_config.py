@@ -25,3 +25,13 @@ def test_dockerfile_installs_dependencies_before_local_project() -> None:
 
     assert dependency_sync < readme_copy < project_sync
     assert dependency_sync < source_copy < project_sync
+
+
+def test_live_announcement_source_uses_twenty_items_and_hourly_refresh() -> None:
+    payload = yaml.safe_load(
+        (WORKSPACE_ROOT / "data/sources/announcements.yaml").read_text(encoding="utf-8")
+    )
+    source = next(item for item in payload["sources"] if item["name"] == "nptu-overview")
+
+    assert source["max_items"] == 20
+    assert source["crawl_interval_minutes"] == 60

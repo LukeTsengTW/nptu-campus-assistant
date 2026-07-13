@@ -8,6 +8,7 @@ from typing import Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from nptu_assistant.crawlers.refresh import REFRESH_FAILURE_WARNING, RefreshResult
 from nptu_assistant.rag.models import Evidence
 
 
@@ -127,10 +128,16 @@ class StructuredRetriever(Protocol):
     def get_announcement(self, announcement_id: str) -> Evidence | None: ...
 
 
+class AnnouncementRefresher(Protocol):
+    def ensure_fresh(self, source_name: str) -> RefreshResult:
+        raise NotImplementedError
+
+
 @dataclass(frozen=True, slots=True)
 class ToolExecutionResult:
     output: str
     evidence: list[Evidence]
+    warning: str | None = None
 
 
 def _serialize_evidence(item: Evidence, *, content_limit: int) -> dict[str, object]:
@@ -154,8 +161,21 @@ def _error(code: str, message: str) -> ToolExecutionResult:
 
 
 class ToolExecutor:
-    def __init__(self, retriever: StructuredRetriever) -> None:
+    def __init__(
+        self,
+        retriever: StructuredRetriever,
+        refresher: AnnouncementRefresher | None = None,
+    ) -> None:
         self._retriever = retriever
+        self._refresher = refresher
+
+    def _refresh_warning(self, parsed: SearchAnnouncementsArguments) -> str | None:
+        if parsed.sort is not AnnouncementSort.NEWEST or self._refresher is None:
+            return None
+        try:
+            return self._refresher.ensure_fresh("nptu-overview").warning
+        except Exception:
+            return REFRESH_FAILURE_WARNING
 
     def execute(self, name: str, arguments: str) -> ToolExecutionResult:
         validators: dict[str, type[BaseModel]] = {
@@ -174,8 +194,10 @@ class ToolExecutor:
         except (json.JSONDecodeError, ValidationError, ValueError):
             return _error("invalid_tool_arguments", "工具參數格式或範圍不正確。")
 
+        refresh_warning: str | None = None
         try:
             if isinstance(parsed, SearchAnnouncementsArguments):
+                refresh_warning = self._refresh_warning(parsed)
                 evidence = self._retriever.search_announcements(**parsed.model_dump())
                 content_limit = 2_000
             elif isinstance(parsed, SearchDocumentsArguments):
@@ -195,8 +217,10 @@ class ToolExecutor:
                 _serialize_evidence(item, content_limit=content_limit) for item in evidence
             ],
             "count": len(evidence),
+            "warning": refresh_warning,
         }
         return ToolExecutionResult(
             output=json.dumps(payload, ensure_ascii=False),
             evidence=evidence,
+            warning=refresh_warning,
         )

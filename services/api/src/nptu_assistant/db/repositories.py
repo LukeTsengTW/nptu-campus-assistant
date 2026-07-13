@@ -121,6 +121,14 @@ class SqlAnnouncementRepository:
     def __init__(self, factory: sessionmaker[Session]) -> None:
         self._factory = factory
 
+    def latest_crawled_at(self, source_name: str) -> datetime | None:
+        with self._factory() as session:
+            return session.scalar(
+                select(func.max(Announcement.last_crawled_at))
+                .join(Source, Source.id == Announcement.source_id)
+                .where(Source.name == source_name)
+            )
+
     def upsert(
         self,
         candidate: AnnouncementCandidate,

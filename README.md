@@ -96,6 +96,10 @@ uv run nptu-assistant crawl-announcements
 
 新增來源時，先更新 `data/sources/announcements.yaml`，再建立獨立 adapter 與 fixtures。不得傳入任意 URL。
 
+API 啟動後每 60 秒檢查已啟用來源是否到期；`nptu-overview` 的實際刷新間隔由 `crawl_interval_minutes: 60` 控制。使用者查詢最新公告時也會先做相同檢查。未到期不會重新請求官網；到期時最多處理 RSS 前 20 則。
+
+刷新失敗時，系統保留最後成功收錄的資料並在回答附上警告。所有回答來源仍從資料庫產生，模型不能指定任意爬取 URL。
+
 ## 建置與載入 Extension
 
 ```powershell

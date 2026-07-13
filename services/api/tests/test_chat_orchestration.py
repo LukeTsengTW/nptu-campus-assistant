@@ -8,6 +8,7 @@ import pytest
 
 from nptu_assistant.api.errors import AppError
 from nptu_assistant.api.schemas import AnswerType
+from nptu_assistant.crawlers.refresh import RefreshResult
 from nptu_assistant.rag.models import (
     ConversationContext,
     Evidence,
@@ -17,7 +18,7 @@ from nptu_assistant.rag.models import (
     ToolCall,
 )
 from nptu_assistant.rag.service import ChatService, INSUFFICIENT_ANSWER
-from nptu_assistant.rag.tools import AnnouncementSort
+from nptu_assistant.rag.tools import AnnouncementSort, ToolExecutor
 
 
 def evidence(
@@ -100,6 +101,21 @@ class StubConversationStore:
         self.saved = kwargs
 
 
+class RecordingRefresher:
+    def __init__(self, warning: str | None = None) -> None:
+        self.warning = warning
+        self.calls: list[str] = []
+
+    def ensure_fresh(self, source_name: str) -> RefreshResult:
+        self.calls.append(source_name)
+        return RefreshResult(
+            source_name=source_name,
+            attempted=True,
+            succeeded=self.warning is None,
+            warning=self.warning,
+        )
+
+
 def function_turn(call_id: str, name: str, arguments: dict[str, object]) -> ModelTurn:
     item = {
         "type": "function_call",
@@ -159,6 +175,85 @@ def test_chat_executes_tool_and_returns_backend_allowlisted_sources() -> None:
     assert function_output["call_id"] == "call-1"
     assert json.loads(function_output["output"])["count"] == 1
     assert store.saved is not None
+
+
+def test_newest_announcement_tool_refreshes_before_database_search() -> None:
+    retriever = StubRetriever({"search_announcements": [evidence()]})
+    refresher = RecordingRefresher()
+    executor = ToolExecutor(retriever, refresher)
+
+    result = executor.execute("search_announcements", json.dumps(announcement_args()))
+
+    assert refresher.calls == ["nptu-overview"]
+    assert len(result.evidence) == 1
+
+
+def test_non_newest_announcement_tool_does_not_request_refresh() -> None:
+    arguments = announcement_args()
+    arguments["sort"] = "relevance"
+    refresher = RecordingRefresher()
+    executor = ToolExecutor(StubRetriever({"search_announcements": []}), refresher)
+
+    executor.execute("search_announcements", json.dumps(arguments))
+
+    assert refresher.calls == []
+
+
+def test_refresh_failure_keeps_database_evidence_and_returns_warning() -> None:
+    warning = "最新公告更新失敗，以下內容來自資料庫最後成功收錄的資料。"
+    executor = ToolExecutor(
+        StubRetriever({"search_announcements": [evidence()]}),
+        RecordingRefresher(warning),
+    )
+
+    result = executor.execute("search_announcements", json.dumps(announcement_args()))
+
+    assert len(result.evidence) == 1
+    assert result.warning == warning
+    assert json.loads(result.output)["warning"] == warning
+
+
+def test_chat_surfaces_refresh_warning_with_database_sources() -> None:
+    item = evidence()
+    warning = "最新公告更新失敗，以下內容來自資料庫最後成功收錄的資料。"
+    provider = ScriptedProvider(
+        [
+            function_turn("call-1", "search_announcements", announcement_args()),
+            final_turn("依據資料庫中的公告內容。", [item.id]),
+        ]
+    )
+
+    response = ChatService(
+        StubRetriever({"search_announcements": [item]}),
+        provider,
+        StubConversationStore(),
+        announcement_refresher=RecordingRefresher(warning),
+    ).answer("幫我查最新公告")
+
+    assert response.answer == "依據資料庫中的公告內容。"
+    assert response.warning == warning
+    assert response.sources[0].url == item.url
+
+
+def test_refresh_failure_without_database_evidence_remains_insufficient() -> None:
+    warning = "最新公告更新失敗，以下內容來自資料庫最後成功收錄的資料。"
+    provider = ScriptedProvider(
+        [
+            function_turn("call-1", "search_announcements", announcement_args()),
+            final_turn("目前收錄的官方資料不足以確認。", [], kind=ResponseKind.INSUFFICIENT),
+        ]
+    )
+
+    response = ChatService(
+        StubRetriever({"search_announcements": []}),
+        provider,
+        StubConversationStore(),
+        announcement_refresher=RecordingRefresher(warning),
+    ).answer("幫我查最新公告")
+
+    assert response.answer == INSUFFICIENT_ANSWER
+    assert response.answer_type is AnswerType.INSUFFICIENT_INFORMATION
+    assert response.sources == []
 
 
 def test_chat_supports_parallel_tools_in_one_model_turn() -> None:

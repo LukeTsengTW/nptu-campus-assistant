@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import uuid
 import logging
 import re
+from contextlib import asynccontextmanager
 from datetime import date
 from typing import Any
 
@@ -94,6 +96,7 @@ def create_app(
     announcement_service: Any | None = None,
     ingestion_service: Any | None = None,
     crawler_service: Any | None = None,
+    refresh_scheduler: Any | None = None,
     rate_limiter: RateLimiter | None = None,
 ) -> FastAPI:
     settings = settings or get_settings()
@@ -116,7 +119,25 @@ def create_app(
         announcement_service = announcement_service or defaults["announcement_service"]
         ingestion_service = ingestion_service or defaults["ingestion_service"]
         crawler_service = crawler_service or defaults["crawler_service"]
-    app = FastAPI(title="NPTU 校務資訊助理 API", version="0.1.0")
+        refresh_scheduler = refresh_scheduler or defaults["refresh_scheduler"]
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI):
+        if refresh_scheduler is None:
+            yield
+            return
+        task = asyncio.create_task(refresh_scheduler.run())
+        try:
+            yield
+        finally:
+            refresh_scheduler.stop()
+            await task
+
+    app = FastAPI(
+        title="NPTU 校務資訊助理 API",
+        version="0.1.0",
+        lifespan=lifespan,
+    )
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins,

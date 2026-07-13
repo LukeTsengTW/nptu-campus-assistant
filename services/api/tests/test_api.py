@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 from fastapi.testclient import TestClient
 
 from nptu_assistant.api.schemas import (
@@ -73,6 +75,21 @@ class StubOperation:
         return CrawlSummary(created=1)
 
 
+class StubScheduler:
+    def __init__(self) -> None:
+        self.started = False
+        self.stopped = False
+        self._stop = asyncio.Event()
+
+    async def run(self) -> None:
+        self.started = True
+        await self._stop.wait()
+
+    def stop(self) -> None:
+        self.stopped = True
+        self._stop.set()
+
+
 def make_client(*, chat_service=None, rate_limiter=None, raise_server_exceptions: bool = True) -> TestClient:
     settings = Settings(
         _env_file=None,
@@ -91,6 +108,31 @@ def make_client(*, chat_service=None, rate_limiter=None, raise_server_exceptions
         rate_limiter=rate_limiter,
     )
     return TestClient(app, raise_server_exceptions=raise_server_exceptions)
+
+
+def test_app_lifespan_starts_and_stops_refresh_scheduler() -> None:
+    scheduler = StubScheduler()
+    settings = Settings(
+        _env_file=None,
+        admin_api_enabled=True,
+        admin_api_key="test-admin-key",
+        cors_allowed_origins="http://localhost:3000",
+        openai_api_key=None,
+    )
+    app = create_app(
+        settings=settings,
+        health_service=StubHealth(),
+        chat_service=StubChat(),
+        announcement_service=StubAnnouncements(),
+        ingestion_service=StubOperation(),
+        crawler_service=StubOperation(),
+        refresh_scheduler=scheduler,
+    )
+
+    with TestClient(app):
+        assert scheduler.started is True
+
+    assert scheduler.stopped is True
 
 
 def test_health_returns_degraded_without_llm() -> None:
