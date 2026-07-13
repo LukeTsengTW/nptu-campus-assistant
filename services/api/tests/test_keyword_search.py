@@ -58,6 +58,56 @@ def test_keyword_search_config_and_alias_expansion() -> None:
     assert KeywordAliasResolver(config.aliases).normalize("電科系") == "電腦科學與人工智慧學系"
 
 
+@pytest.mark.parametrize(
+    ("alias", "canonical"),
+    [
+        ("電科系", "電腦科學與人工智慧學系"),
+        ("資工系", "資訊工程學系"),
+        ("電通系", "電腦與通訊學系"),
+        ("資管系", "資訊管理學系"),
+        ("機器人系", "智慧機器人學系"),
+        ("智機系", "智慧機器人學系"),
+        ("商大數系", "商業大數據學系"),
+        ("行流系", "行銷與流通管理學系"),
+        ("休閒系", "休閒事業經營學系"),
+        ("不動系", "不動產經營學系"),
+        ("不動產系", "不動產經營學系"),
+        ("企管系", "企業管理學系"),
+        ("國貿系", "國際經營與貿易學系"),
+        ("財金系", "財務金融學系"),
+        ("會計系", "會計學系"),
+        ("教育系", "教育學系"),
+        ("特教系", "特殊教育學系"),
+        ("幼教系", "幼兒教育學系"),
+        ("視藝系", "視覺藝術學系"),
+        ("音樂系", "音樂學系"),
+        ("文創系", "文化創意產業學系"),
+        ("社發系", "社會發展學系"),
+        ("中文系", "中國語文學系"),
+        ("應日系", "應用日語學系"),
+        ("應英系", "應用英語學系"),
+        ("英語系", "英語學系"),
+        ("英文系", "英語學系"),
+        ("原民專班", "文化發展學士學位學程原住民專班"),
+        ("科傳系", "科學傳播學系"),
+        ("應化系", "應用化學系"),
+        ("化學系", "應用化學系"),
+        ("應物系", "應用物理系"),
+        ("物理系", "應用物理系"),
+        ("應數系", "應用數學系"),
+        ("數學系", "應用數學系"),
+        ("體育系", "體育學系"),
+    ],
+)
+def test_keyword_aliases_normalize_requested_department_names(
+    alias: str,
+    canonical: str,
+) -> None:
+    config = load_keyword_search_config(WORKSPACE_ROOT / "data/sources/announcements.yaml")
+
+    assert KeywordAliasResolver(config.aliases).normalize(alias) == canonical
+
+
 def test_search_adapter_parses_form_and_results() -> None:
     adapter = NptuAssociationSearchAdapter()
     bootstrap = adapter.parse_bootstrap_form(

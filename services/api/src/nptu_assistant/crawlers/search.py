@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date
+import re
 from typing import Protocol
 
 from nptu_assistant.api.schemas import CrawlSummary
@@ -39,9 +40,11 @@ class KeywordAliasResolver:
 
     def normalize(self, text: str) -> str:
         normalized = text.strip()
-        for alias in sorted(self._aliases, key=len, reverse=True):
-            normalized = normalized.replace(alias, self._aliases[alias])
-        return normalized
+        if not self._aliases:
+            return normalized
+        aliases = sorted(self._aliases, key=len, reverse=True)
+        pattern = re.compile("|".join(re.escape(alias) for alias in aliases))
+        return pattern.sub(lambda match: self._aliases[match.group(0)], normalized)
 
     def expand(self, query: str) -> KeywordExpansion:
         query = query.strip()
