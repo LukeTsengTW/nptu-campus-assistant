@@ -16,7 +16,8 @@
 
 ## 程式碼查詢工具優先順序
 
-- 探索、除錯、重構或檢視程式碼時，必須先使用 `code-review-graph` MCP 工具；優先從 `get_minimal_context_tool` 開始，再依需求使用 `semantic_search_nodes_tool`、`query_graph_tool`、`get_impact_radius_tool` 或 `get_review_context_tool`。
-- 若 graph 尚未建立、MCP 不可用、查詢結果為空，或結果與問題不相關，才改用傳統搜尋：`rg` / `rg --files`，再讀取必要檔案。
-- 不得把 graph 的空結果視為已找到答案；必須確認結果與目前問題相關，否則依上述規則回退搜尋。
-- 每次確認修改完成後，必須重建或增量更新 `code-review-graph`，再進行後續 graph 查詢或交付驗證，確保結果反映最新程式碼。
+- 探索、除錯、重構或檢視程式碼時，必須先使用 `code-review-graph` MCP 的 embeddings 語意搜尋。
+- 若 embeddings 語意搜尋找不到相關結果，改用一般 graph 搜尋；優先使用 `get_minimal_context_tool`，再依需求使用 `query_graph_tool`、`get_impact_radius_tool` 或 `get_review_context_tool`。
+- 若一般 graph 搜尋仍找不到相關結果，才改用傳統搜尋：`rg` / `rg --files`，再讀取必要檔案。
+- 若 graph 尚未建立或 MCP 不可用，直接改用傳統搜尋；不得把空結果視為已找到答案，必須確認結果與目前問題相關。
+- 每次程式修改完成後，必須先增量更新 `code-review-graph`，同步語意搜尋 embeddings，再進行後續 graph 查詢或交付驗證，確保結果反映最新程式碼。
