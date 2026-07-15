@@ -19,6 +19,17 @@ cd services/api
 uv sync --frozen --extra dev
 ```
 
+## 程式碼查詢工具
+
+本專案已配置 `code-review-graph` 作為 Codex 的優先程式碼查詢工具。首次使用或重建圖資料時執行：
+
+```powershell
+uv tool install "code-review-graph==2.3.6"
+code-review-graph build --repo .
+```
+
+圖資料會放在 `.code-review-graph/`，不納入版本控制。探索、除錯與檢視程式碼時先查詢 graph；graph 不可用、查無結果或結果不相關時，再使用 `rg` / `rg --files`。
+
 `.venv` 僅能在建立它的作業系統使用；不得將 Docker、WSL 或其他 Linux 環境建立的 `.venv` 複製到 Windows。若 `services/api/.venv/pyvenv.cfg` 的 `home` 是 `/usr/local/bin`，請在 `services/api` 重建本機環境：
 
 ```powershell
