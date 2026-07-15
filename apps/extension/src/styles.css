@@ -84,6 +84,10 @@ button, textarea { font: inherit; }
 .welcome-mark { display: grid; place-items: center; width: 38px; height: 38px; margin-bottom: 16px; border-radius: 11px; background: var(--nptu-teal-soft); color: var(--nptu-teal); font-weight: 800; }
 .welcome-card h2 { margin: 0 0 7px; font-size: 17px; }
 .welcome-card p { margin: 0; color: var(--nptu-muted); font-size: 13px; line-height: 1.75; }
+.suggestion-list { display: grid; gap: 10px; margin-top: 16px; }
+.suggestion-button { width: 100%; padding: 11px 13px; border: 1px solid var(--nptu-line); border-radius: 12px; background: white; color: var(--nptu-indigo); font-size: 13px; text-align: left; cursor: pointer; transition: border-color 140ms ease, background 140ms ease; }
+.suggestion-button:hover { border-color: var(--nptu-teal); background: var(--nptu-teal-soft); }
+.suggestion-button:disabled { opacity: .55; cursor: default; }
 .message-row { display: flex; margin: 0 0 12px; }
 .user-row { justify-content: flex-end; }
 .message-bubble { max-width: 84%; padding: 11px 14px; border-radius: 15px; font-size: 14px; line-height: 1.6; }

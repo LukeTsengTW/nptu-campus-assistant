@@ -22,6 +22,12 @@ type Props = {
   initialOpen?: boolean;
 };
 
+const suggestedQuestions = [
+  "查詢近期最新公告",
+  "查詢獎學金公告",
+  "查詢選課公告",
+] as const;
+
 
 function renderAnswer(answer: string): ReactNode {
   const linkPattern = /\[([^\]\r\n]+)\]\((https?:\/\/[^\s)]+)\)/g;
@@ -81,9 +87,8 @@ export function ChatWidget({
     void savePanelOpen(next).catch(() => undefined);
   };
 
-  const submit = async (event: FormEvent) => {
-    event.preventDefault();
-    const trimmed = question.trim();
+  const submitQuestion = async (value: string) => {
+    const trimmed = value.trim();
     if (!trimmed || loading) return;
     const userEntry: ChatEntry = { id: Date.now(), role: "user", text: trimmed };
     setMessages((current) => [...current, userEntry]);
@@ -106,6 +111,11 @@ export function ChatWidget({
     } finally {
       if (requestGeneration.current === generation) setLoading(false);
     }
+  };
+
+  const submit = (event: FormEvent) => {
+    event.preventDefault();
+    void submitQuestion(question);
   };
 
   const clear = () => {
@@ -138,11 +148,26 @@ export function ChatWidget({
 
           <div className="assistant-thread" aria-live="polite">
             {messages.length === 0 && !error && (
-              <div className="welcome-card">
-                <div className="welcome-mark">查</div>
-                <h2>從官方資料開始找答案</h2>
-                <p>可詢問校務辦法、申請資格，或搜尋近期公告與截止日。</p>
-              </div>
+              <>
+                <div className="welcome-card">
+                  <div className="welcome-mark">查</div>
+                  <h2>從官方資料開始找答案</h2>
+                  <p>可詢問校務辦法、申請資格，或搜尋近期公告與截止日。</p>
+                </div>
+                <div className="suggestion-list" aria-label="建議問題">
+                  {suggestedQuestions.map((suggestion) => (
+                    <button
+                      className="suggestion-button"
+                      type="button"
+                      key={suggestion}
+                      onClick={() => void submitQuestion(suggestion)}
+                      disabled={loading}
+                    >
+                      {suggestion}
+                    </button>
+                  ))}
+                </div>
+              </>
             )}
             {messages.map((message) =>
               message.role === "user" ? (

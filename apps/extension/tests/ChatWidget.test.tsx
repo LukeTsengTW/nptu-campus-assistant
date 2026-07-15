@@ -58,6 +58,20 @@ describe("ChatWidget", () => {
     );
   });
 
+  it("顯示三個公告建議並直接送出點選的 prompt", async () => {
+    const user = userEvent.setup();
+    const sendQuestion = vi.fn().mockResolvedValue(response);
+    render(<ChatWidget sendQuestion={sendQuestion} initialOpen />);
+
+    for (const suggestion of ["查詢近期最新公告", "查詢獎學金公告", "查詢選課公告"]) {
+      expect(screen.getByRole("button", { name: suggestion })).toBeVisible();
+    }
+
+    await user.click(screen.getByRole("button", { name: "查詢獎學金公告" }));
+    await waitFor(() => expect(sendQuestion).toHaveBeenCalledWith("查詢獎學金公告", undefined));
+    expect(screen.queryByRole("button", { name: "查詢近期最新公告" })).not.toBeInTheDocument();
+  });
+
   it("顯示 API 錯誤並可清除對話", async () => {
     const user = userEvent.setup();
     const sendQuestion = vi.fn().mockRejectedValue(new Error("後端無法連線"));
