@@ -243,6 +243,35 @@ def test_executor_ingests_keyword_before_database_search_and_normalizes_filters(
     )
 
 
+@pytest.mark.parametrize("query", ["查詢最新公告", "最近有哪些公告?"])
+def test_executor_treats_generic_announcement_requests_as_newest_listing(
+    query: str,
+) -> None:
+    retriever = StubRetriever()
+    ingestor = StubKeywordIngestor()
+    refresher = StubRefresher()
+    executor = ToolExecutor(retriever, refresher, ingestor)
+
+    executor.execute(
+        "search_announcements",
+        json.dumps(
+            {
+                "query": query,
+                "limit": 5,
+                "sort": "relevance",
+                "unit": None,
+                "date_from": None,
+                "date_to": None,
+            }
+        ),
+    )
+
+    assert ingestor.queries == []
+    assert refresher.calls == ["nptu-overview"]
+    assert retriever.calls[0][1]["query"] is None
+    assert retriever.calls[0][1]["sort"] is AnnouncementSort.NEWEST
+
+
 def test_executor_does_not_ingest_null_query_and_falls_back_on_ingestion_failure() -> None:
     retriever = StubRetriever()
     ingestor = StubKeywordIngestor(fail=True)

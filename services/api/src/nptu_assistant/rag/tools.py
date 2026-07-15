@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, replace
 from datetime import date
 from enum import StrEnum
@@ -62,7 +63,7 @@ def tool_definitions() -> list[dict[str, object]]:
                 "properties": {
                     "query": {
                         "type": ["string", "null"],
-                        "description": "公告主題或搜尋文字；單純列出公告時使用 null。",
+                        "description": "公告主題或搜尋文字；單純列出最新或最近公告時必須使用 null，不得填入「最新公告」等意圖文字。",
                     },
                     "limit": {"type": "integer", "minimum": 1, "maximum": 20},
                     "sort": {
@@ -142,6 +143,67 @@ class KeywordAnnouncementIngestor(Protocol):
 
     def normalize(self, text: str) -> str:
         raise NotImplementedError
+
+
+_GENERIC_ANNOUNCEMENT_PHRASES = frozenset(
+    {
+        "公告",
+        "最新公告",
+        "最近公告",
+        "有哪些公告",
+        "最近有哪些公告",
+        "最新有哪些公告",
+        "有什麼公告",
+        "最近有什麼公告",
+        "最新有什麼公告",
+        "有那些公告",
+        "最近有那些公告",
+        "最新有那些公告",
+        "有哪些最新公告",
+        "有什麼最新公告",
+        "有那些最新公告",
+        "消息",
+        "最新消息",
+        "最近消息",
+        "通知",
+        "最新通知",
+        "最近通知",
+    }
+)
+_ANNOUNCEMENT_REQUEST_PREFIXES = (
+    "想知道",
+    "告訴我",
+    "幫忙",
+    "幫我",
+    "查詢",
+    "搜尋",
+    "搜索",
+    "列出",
+    "請問",
+    "看看",
+    "可以",
+    "麻煩",
+    "請",
+    "查",
+    "找",
+    "列",
+)
+
+
+def _is_generic_announcement_query(query: str | None) -> bool:
+    if not query:
+        return False
+    normalized = re.sub(r"[\s\u3000，。！？!?、：:；;「」『』（）()【】\[\]<>〈〉…]+", "", query)
+    while normalized:
+        prefix = next(
+            (item for item in _ANNOUNCEMENT_REQUEST_PREFIXES if normalized.startswith(item)),
+            None,
+        )
+        if prefix is None:
+            break
+        normalized = normalized[len(prefix) :]
+    normalized = normalized.removesuffix("一下")
+    return normalized in _GENERIC_ANNOUNCEMENT_PHRASES
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,6 +297,11 @@ class ToolExecutor:
         self,
         parsed: SearchAnnouncementsArguments,
     ) -> tuple[list[Evidence], str | None]:
+        if _is_generic_announcement_query(parsed.query):
+            updates: dict[str, object] = {"query": None}
+            if parsed.sort is AnnouncementSort.RELEVANCE:
+                updates["sort"] = AnnouncementSort.NEWEST
+            parsed = parsed.model_copy(update=updates)
         arguments = parsed.model_dump()
         arguments["canonical_urls"] = None
         warning: str | None = None
