@@ -174,7 +174,10 @@ class UnitSourceResolver:
                 next(iter(unknown_units)),
             )
 
-        route_sources = self._mentioned_source_routes(query)
+        route_text = " ".join(
+            part.strip() for part in (unit, query) if part and part.strip()
+        )
+        route_sources = self._mentioned_source_routes(route_text)
         distinct_route_sources = {source.name: source for source in route_sources}
         if len(distinct_route_sources) > 1:
             return UnitResolution(

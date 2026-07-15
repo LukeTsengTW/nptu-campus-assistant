@@ -115,6 +115,15 @@ def test_internal_scholarship_query_uses_only_internal_source() -> None:
     assert result.source.name == "student-scholarship-internal-html"
 
 
+def test_internal_scholarship_route_can_be_split_between_unit_and_query() -> None:
+    result = project_resolver().resolve("校內", "獎學金")
+
+    assert result.status is UnitResolutionStatus.RESOLVED
+    assert result.canonical_unit == "生活輔導組"
+    assert result.source is not None
+    assert result.source.name == "student-scholarship-internal-html"
+
+
 def test_explicit_internal_keyword_can_be_separated_from_scholarship_term() -> None:
     result = project_resolver().resolve(None, "查詢校內的獎學金公告")
 
