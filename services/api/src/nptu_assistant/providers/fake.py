@@ -165,9 +165,10 @@ class FakeLlmProvider:
                     url = str(result.get("url", "")).strip()
                     if result.get("kind") == "announcement":
                         published_at = str(result.get("published_at") or "日期未提供")
-                        lines.append(f"{published_at}｜{title}")
                         if url:
-                            lines.append(url)
+                            lines.append(f"[{published_at}｜{title}]({url})")
+                        else:
+                            lines.append(f"{published_at}｜{title}")
                         unit = str(result.get("unit", "")).strip()
                         if unit and unit not in announcement_units:
                             announcement_units.append(unit)

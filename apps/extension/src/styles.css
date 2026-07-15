@@ -91,6 +91,7 @@ button, textarea { font: inherit; }
 .answer-card { margin: 0 0 15px; padding: 15px; border: 1px solid var(--nptu-line); border-radius: 17px; background: white; box-shadow: 0 6px 20px rgba(29,49,103,.06); }
 .answer-label { margin-bottom: 8px; color: var(--nptu-teal); font-size: 10px; font-weight: 800; letter-spacing: .12em; }
 .answer-card > p { margin: 0; font-size: 14px; line-height: 1.78; white-space: pre-wrap; }
+.answer-link { color: var(--nptu-navy); text-decoration: underline; text-decoration-color: var(--nptu-teal); text-underline-offset: 2px; }
 .warning-box, .error-box { margin-top: 12px; padding: 10px 12px; border-left: 3px solid var(--nptu-amber); border-radius: 8px; background: #fff5df; color: #744b0f; font-size: 12px; line-height: 1.6; }
 .error-box { margin: 12px 0 0; border-left-color: #c54e55; background: #fff0f1; color: #812d34; }
 .sources-block { margin-top: 15px; padding-top: 13px; border-top: 1px solid var(--nptu-line); }

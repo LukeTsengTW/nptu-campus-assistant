@@ -1,4 +1,5 @@
 import type { ChatResponse } from "@nptu/shared";
+import type { ReactNode } from "react";
 import { FormEvent, useEffect, useId, useRef, useState } from "react";
 
 import { clearChatConversation, sendChatMessage } from "../lib/messages";
@@ -20,6 +21,37 @@ type Props = {
   clearConversation?: (conversationId: string) => Promise<void>;
   initialOpen?: boolean;
 };
+
+
+function renderAnswer(answer: string): ReactNode {
+  const linkPattern = /\[([^\]\r\n]+)\]\((https?:\/\/[^\s)]+)\)/g;
+  const nodes: ReactNode[] = [];
+  let cursor = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = linkPattern.exec(answer)) !== null) {
+    if (match.index > cursor) {
+      nodes.push(answer.slice(cursor, match.index));
+    }
+    nodes.push(
+      <a
+        className="answer-link"
+        href={match[2]}
+        key={`answer-link-${match.index}`}
+        target="_blank"
+        rel="noopener noreferrer"
+      >
+        {match[1]}
+      </a>,
+    );
+    cursor = match.index + match[0].length;
+  }
+
+  if (cursor < answer.length) {
+    nodes.push(answer.slice(cursor));
+  }
+  return nodes.length > 0 ? nodes : answer;
+}
 
 
 export function ChatWidget({
@@ -120,7 +152,7 @@ export function ChatWidget({
               ) : (
                 <article className="answer-card" key={message.id}>
                   <div className="answer-label">AI 整理說明</div>
-                  <p>{message.response.answer}</p>
+                  <p>{renderAnswer(message.response.answer)}</p>
                   {message.response.warning && (
                     <div className="warning-box">{message.response.warning}</div>
                   )}

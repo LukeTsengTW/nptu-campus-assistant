@@ -8,7 +8,7 @@ import { ChatWidget } from "../src/components/ChatWidget";
 
 const response = {
   conversation_id: "conversation-1",
-  answer: "申請期限請依公告辦理。",
+  answer: "[2026-07-10｜115學年度申請公告](https://www.nptu.edu.tw/announcement)",
   answer_type: "announcement" as const,
   confidence: "high" as const,
   warning: null,
@@ -51,8 +51,8 @@ describe("ChatWidget", () => {
 
     expect(screen.getByText("正在查詢官方資料…")).toBeVisible();
     resolveResponse(response);
-    await waitFor(() => expect(screen.getByText(response.answer)).toBeVisible());
-    expect(screen.getByRole("link", { name: /115學年度申請公告/ })).toHaveAttribute(
+    await waitFor(() => expect(screen.getByRole("link", { name: /2026-07-10｜115學年度申請公告/ })).toBeVisible());
+    expect(screen.getByRole("link", { name: /2026-07-10｜115學年度申請公告/ })).toHaveAttribute(
       "href",
       "https://www.nptu.edu.tw/announcement",
     );
@@ -85,7 +85,7 @@ describe("ChatWidget", () => {
     resolveResponse(response);
 
     await waitFor(() => expect(screen.queryByText("正在查詢官方資料…")).not.toBeInTheDocument());
-    expect(screen.queryByText(response.answer)).not.toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: /2026-07-10｜115學年度申請公告/ })).not.toBeInTheDocument();
   });
 
   it("後續問題重送 conversation id，清除時刪除 server state", async () => {
@@ -102,7 +102,7 @@ describe("ChatWidget", () => {
 
     await user.type(screen.getByLabelText("輸入校務問題"), "最近公告");
     await user.click(screen.getByRole("button", { name: "送出問題" }));
-    await screen.findByText(response.answer);
+    await screen.findByRole("link", { name: /2026-07-10｜115學年度申請公告/ });
     await user.type(screen.getByLabelText("輸入校務問題"), "第三則");
     await user.click(screen.getByRole("button", { name: "送出問題" }));
 

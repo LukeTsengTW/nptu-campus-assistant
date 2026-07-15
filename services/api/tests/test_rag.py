@@ -35,7 +35,8 @@ def test_system_instructions_define_department_aliases_without_electrical_depart
 def test_system_instructions_define_administrative_unit_aliases() -> None:
     assert "unknown_unit、ambiguous_unit" in SYSTEM_INSTRUCTIONS
     assert "unsupported_unit_source" in SYSTEM_INSTRUCTIONS
-    assert "日期｜標題" in SYSTEM_INSTRUCTIONS
+    assert "Markdown 超連結" in SYSTEM_INSTRUCTIONS
+    assert "[日期｜標題](工具回傳的 URL)" in SYSTEM_INSTRUCTIONS
     assert "result.unit" in SYSTEM_INSTRUCTIONS
     assert "計網中心＝計算機與網路中心" in SYSTEM_INSTRUCTIONS
     assert "校友組＝校友服務組" in SYSTEM_INSTRUCTIONS

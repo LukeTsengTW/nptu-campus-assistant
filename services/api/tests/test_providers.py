@@ -71,8 +71,10 @@ def test_fake_llm_runs_a_deterministic_tool_then_grounded_answer() -> None:
     assert json.loads(first.tool_calls[0].arguments)["query"] is None
     assert second.generated is not None
     assert second.generated.used_source_ids == ["announcement-1"]
-    assert "2026-07-13｜測試公告" in second.generated.answer
-    assert "https://www.nptu.edu.tw/a" in second.generated.answer
+    assert second.generated.answer == (
+        "[2026-07-13｜測試公告](https://www.nptu.edu.tw/a)\n"
+        "資料來源：教務處官方網站"
+    )
 
 
 def test_fake_llm_treats_general_recent_announcements_as_an_unfiltered_listing() -> None:
