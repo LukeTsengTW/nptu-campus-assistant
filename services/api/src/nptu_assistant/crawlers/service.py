@@ -92,7 +92,18 @@ class CrawlerService:
             fixture_path = self._workspace_root / config.url
             listing = fixture_path.read_text(encoding="utf-8")
         elif config.adapter == "nptu_html_list":
-            listing = self._http.get(config.url, allowed_hosts=config.allowed_hosts)
+            if config.dynamic_listing is None:
+                listing = self._http.get(config.url, allowed_hosts=config.allowed_hosts)
+            else:
+                fragment = self._http.submit_form(
+                    config.dynamic_listing.method,
+                    config.dynamic_listing.url,
+                    {},
+                    allowed_hosts=config.allowed_hosts,
+                )
+                listing = (
+                    f'<div id="{config.dynamic_listing.wrapper_id}">{fragment}</div>'
+                )
         else:
             listing = self._http.get(config.url)
         resolved_candidates: list[AnnouncementCandidate] = []

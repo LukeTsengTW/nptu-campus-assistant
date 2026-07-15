@@ -7,7 +7,12 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from nptu_assistant.crawlers.config import CrawlerSourceConfig, load_source_configs
+from nptu_assistant.crawlers.config import (
+    CrawlerSourceConfig,
+    KeywordSearchConfig,
+    load_keyword_search_config,
+    load_source_configs,
+)
 
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
@@ -53,6 +58,56 @@ def test_information_college_source_loads_from_project_config() -> None:
     assert source.selectors.link_attribute == "href"
     assert source.detail is not None
     assert source.detail.enabled is False
+
+
+def test_scholarship_sources_and_routes_load_from_project_config() -> None:
+    config_path = WORKSPACE_ROOT / "data/sources/announcements.yaml"
+    configs = load_source_configs(config_path)
+    external = next(item for item in configs if item.name == "student-scholarship-external-html")
+    internal = next(item for item in configs if item.name == "student-scholarship-internal-html")
+    keyword_config = load_keyword_search_config(config_path)
+
+    for source in (external, internal):
+        assert source.url == "https://staf-life.nptu.edu.tw/p/412-1074-14573.php?Lang=zh-tw"
+        assert source.unit == "生活輔導組"
+        assert source.allowed_hosts == ["staf-life.nptu.edu.tw"]
+        assert source.max_items == 20
+        assert source.crawl_interval_minutes == 60
+        assert source.selectors is not None
+        assert source.selectors.item == ".row.listBS"
+        assert source.selectors.date == "i.mdate"
+        assert source.selectors.title_link == ".mtitle > a[href]"
+        assert source.detail is not None and source.detail.enabled is False
+        assert source.dynamic_listing is not None
+        assert source.dynamic_listing.method == "post"
+        assert source.dynamic_listing.url.startswith("https://staf-life.nptu.edu.tw/app/index.php?")
+        assert source.dynamic_listing.wrapper_id == (
+            "cmb_1373_0" if source is external else "cmb_1373_1"
+        )
+
+    assert external.selectors is not None
+    assert external.selectors.listing == "#cmb_1373_0"
+    assert internal.selectors is not None
+    assert internal.selectors.listing == "#cmb_1373_1"
+    assert keyword_config.source_routes["獎學金"] == "student-scholarship-external-html"
+    assert keyword_config.source_routes["獎助學金"] == "student-scholarship-external-html"
+    assert keyword_config.source_routes["校內獎學金"] == "student-scholarship-internal-html"
+
+
+def test_invalid_source_route_config_is_rejected() -> None:
+    payload = {
+        "name": "search",
+        "session_url": "https://www.nptu.edu.tw/app/index.php",
+        "bootstrap_url": "https://www.nptu.edu.tw/app/index.php",
+        "url": "https://www.nptu.edu.tw/app/index.php",
+        "search_types": ["part"],
+        "unit": "國立屏東大學",
+        "category": "關鍵字搜尋",
+        "source_routes": {" ": "source"},
+    }
+
+    with pytest.raises(ValidationError, match="路由"):
+        KeywordSearchConfig.model_validate(payload)
 
 
 @pytest.mark.parametrize(

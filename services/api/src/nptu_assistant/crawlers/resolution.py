@@ -43,9 +43,17 @@ class UnitSourceResolver:
         self,
         sources: Sequence[CrawlerSourceConfig],
         known_aliases: Mapping[str, str],
+        source_routes: Mapping[str, str] | None = None,
     ) -> None:
         alias_to_units: dict[str, set[str]] = defaultdict(set)
         unit_to_sources: dict[str, list[CrawlerSourceConfig]] = defaultdict(list)
+        source_by_name = {source.name: source for source in sources}
+        configured_routes = dict(source_routes or {})
+        unknown_routes = sorted(set(configured_routes.values()) - set(source_by_name))
+        if unknown_routes:
+            raise ValueError(
+                "公告來源路由指向未設定的來源：" + "、".join(unknown_routes)
+            )
 
         for alias, canonical in known_aliases.items():
             alias = alias.strip()
@@ -65,6 +73,13 @@ class UnitSourceResolver:
             alias: frozenset(units) for alias, units in alias_to_units.items()
         }
         self._matcher = AliasNormalizer({alias: alias for alias in alias_to_units})
+        self._source_route_targets = {
+            alias: source_by_name[source_name]
+            for alias, source_name in configured_routes.items()
+        }
+        self._source_route_matcher = AliasNormalizer(
+            {alias: source_name for alias, source_name in configured_routes.items()}
+        )
         self._unit_to_sources = {
             unit: tuple(configs) for unit, configs in unit_to_sources.items()
         }
@@ -101,6 +116,25 @@ class UnitSourceResolver:
                 unknown.add(candidate)
         return unknown
 
+    def _mentioned_source_routes(self, text: str | None) -> tuple[CrawlerSourceConfig, ...]:
+        if not text:
+            return ()
+        matches = self._source_route_matcher.matches(text)
+        if not matches or not any(term in text for term in ("獎學金", "獎助學金")):
+            return ()
+        if "校內" in text:
+            internal_matches = tuple(
+                self._source_route_targets[match.alias]
+                for match in matches
+                if match.alias == "校內" or match.alias.startswith("校內")
+            )
+            if internal_matches:
+                return internal_matches
+        return tuple(
+            self._source_route_targets[match.alias]
+            for match in matches
+        )
+
     def resolve(self, unit: str | None, query: str | None = None) -> UnitResolution:
         requested_unit = unit.strip() if unit and unit.strip() else ""
         requested = requested_unit or (query or "").strip()
@@ -128,18 +162,48 @@ class UnitSourceResolver:
                 candidates=tuple(sorted(units)),
             )
 
-        if not units:
+        if unknown_units:
             if len(unknown_units) > 1:
                 return UnitResolution(
                     UnitResolutionStatus.AMBIGUOUS,
                     requested,
                     candidates=tuple(sorted(unknown_units)),
                 )
-            if unknown_units:
+            return UnitResolution(
+                UnitResolutionStatus.UNKNOWN,
+                next(iter(unknown_units)),
+            )
+
+        route_sources = self._mentioned_source_routes(query)
+        distinct_route_sources = {source.name: source for source in route_sources}
+        if len(distinct_route_sources) > 1:
+            return UnitResolution(
+                UnitResolutionStatus.AMBIGUOUS,
+                requested,
+                candidates=tuple(sorted(distinct_route_sources)),
+            )
+        if distinct_route_sources:
+            source = next(iter(distinct_route_sources.values()))
+            if units and source.unit not in units:
                 return UnitResolution(
-                    UnitResolutionStatus.UNKNOWN,
-                    next(iter(unknown_units)),
+                    UnitResolutionStatus.AMBIGUOUS,
+                    requested,
+                    candidates=tuple(sorted(units | {source.unit})),
                 )
+            if not source.enabled:
+                return UnitResolution(
+                    UnitResolutionStatus.UNSUPPORTED,
+                    requested,
+                    canonical_unit=source.unit,
+                )
+            return UnitResolution(
+                UnitResolutionStatus.RESOLVED,
+                requested,
+                canonical_unit=source.unit,
+                source=source,
+            )
+
+        if not units:
             if requested_unit:
                 return UnitResolution(UnitResolutionStatus.UNKNOWN, requested)
             return UnitResolution(UnitResolutionStatus.NONE, requested)

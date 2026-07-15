@@ -139,9 +139,11 @@ class RecordingRefresher:
 
 
 def project_unit_resolver() -> UnitSourceResolver:
+    keyword_config = load_keyword_search_config(CONFIG_PATH)
     return UnitSourceResolver(
         load_source_configs(CONFIG_PATH),
-        load_keyword_search_config(CONFIG_PATH).aliases,
+        keyword_config.aliases,
+        keyword_config.source_routes,
     )
 
 
@@ -469,6 +471,53 @@ def test_fake_chat_routes_information_college_to_one_source_and_keeps_all_urls()
     assert len(response.sources) == 5
     assert all(item.url in response.answer for item in items)
     assert [source.url for source in response.sources] == [item.url for item in items]
+
+
+@pytest.mark.parametrize(
+    ("question", "source_name", "url"),
+    [
+        (
+            "查詢獎學金公告",
+            "student-scholarship-external-html",
+            "https://staf-life.nptu.edu.tw/external/1",
+        ),
+        (
+            "查詢獎助學金公告",
+            "student-scholarship-external-html",
+            "https://staf-life.nptu.edu.tw/external/2",
+        ),
+        (
+            "查詢校內獎學金公告",
+            "student-scholarship-internal-html",
+            "https://staf-life.nptu.edu.tw/internal/1",
+        ),
+    ],
+)
+def test_fake_chat_routes_scholarship_query_to_one_selected_source(
+    question: str,
+    source_name: str,
+    url: str,
+) -> None:
+    item = replace(evidence("scholarship"), title=question, url=url, unit="生活輔導組")
+    retriever = StubRetriever({"search_announcements": [item]})
+    refresher = RecordingRefresher(canonical_urls=(url,))
+
+    response = ChatService(
+        retriever,
+        FakeLlmProvider(),
+        StubConversationStore(),
+        announcement_refresher=refresher,
+        unit_source_resolver=project_unit_resolver(),
+    ).answer(question)
+
+    assert refresher.calls == [source_name]
+    assert retriever.calls == [
+        (
+            "search_announcements",
+            (question, 5, AnnouncementSort.NEWEST, "生活輔導組", None, None, (url,)),
+        )
+    ]
+    assert [source.url for source in response.sources] == [url]
 
 
 @pytest.mark.parametrize(

@@ -75,6 +75,14 @@ keyword_search:
     推廣中心: 推廣教育中心
     場館組: 場館營運組
     競賽組: 競賽活動組
+  source_routes:
+    獎學金: student-scholarship-external-html
+    獎助學金: student-scholarship-external-html
+    校外獎學金: student-scholarship-external-html
+    校外獎助學金: student-scholarship-external-html
+    校內: student-scholarship-internal-html
+    校內獎學金: student-scholarship-internal-html
+    校內獎助學金: student-scholarship-internal-html
 
 sources:
   - name: nptu-overview
@@ -115,6 +123,54 @@ sources:
       date: i.mdate
       title_link: .mtitle > a[href]
       link_attribute: href
+    detail:
+      enabled: false
+  - name: student-scholarship-external-html
+    adapter: nptu_html_list
+    url: https://staf-life.nptu.edu.tw/p/412-1074-14573.php?Lang=zh-tw
+    unit: 生活輔導組
+    aliases:
+      - 校外獎助學金
+    category: 校外獎助學金公告
+    enabled: true
+    crawl_interval_minutes: 60
+    max_items: 20
+    allowed_hosts:
+      - staf-life.nptu.edu.tw
+    selectors:
+      listing: "#cmb_1373_0"
+      item: .row.listBS
+      date: i.mdate
+      title_link: .mtitle > a[href]
+      link_attribute: href
+    dynamic_listing:
+      url: https://staf-life.nptu.edu.tw/app/index.php?Action=mobileloadmod&Type=mobile_rcg_mstr&Nbr=3893
+      method: post
+      wrapper_id: cmb_1373_0
+    detail:
+      enabled: false
+  - name: student-scholarship-internal-html
+    adapter: nptu_html_list
+    url: https://staf-life.nptu.edu.tw/p/412-1074-14573.php?Lang=zh-tw
+    unit: 生活輔導組
+    aliases:
+      - 校內獎助學金
+    category: 校內獎助學金公告
+    enabled: true
+    crawl_interval_minutes: 60
+    max_items: 20
+    allowed_hosts:
+      - staf-life.nptu.edu.tw
+    selectors:
+      listing: "#cmb_1373_1"
+      item: .row.listBS
+      date: i.mdate
+      title_link: .mtitle > a[href]
+      link_attribute: href
+    dynamic_listing:
+      url: https://staf-life.nptu.edu.tw/app/index.php?Action=mobileloadmod&Type=mobile_rcg_mstr&Nbr=3892
+      method: post
+      wrapper_id: cmb_1373_1
     detail:
       enabled: false
   - name: local-fixture

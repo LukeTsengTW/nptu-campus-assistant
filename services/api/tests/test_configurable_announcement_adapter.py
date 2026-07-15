@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from bs4 import BeautifulSoup
 
 from nptu_assistant.crawlers.adapters.factory import build_adapter
 from nptu_assistant.crawlers.adapters.fixture import FixtureAdapter
@@ -20,6 +21,9 @@ WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
 CONFIG_PATH = WORKSPACE_ROOT / "data/sources/announcements.yaml"
 FIXTURE_PATH = WORKSPACE_ROOT / "data/fixtures/announcements/nptu-ccs/listing.html"
 OVERVIEW_FIXTURE_PATH = WORKSPACE_ROOT / "data/fixtures/announcements/nptu-overview/listing.html"
+SCHOLARSHIP_FIXTURE_PATH = (
+    WORKSPACE_ROOT / "data/fixtures/announcements/nptu-scholarship/listing.html"
+)
 
 
 def information_college_config() -> CrawlerSourceConfig:
@@ -30,6 +34,10 @@ def information_college_config() -> CrawlerSourceConfig:
 
 def nptu_overview_config() -> CrawlerSourceConfig:
     return next(item for item in load_source_configs(CONFIG_PATH) if item.name == "nptu-overview")
+
+
+def scholarship_source_config(name: str) -> CrawlerSourceConfig:
+    return next(item for item in load_source_configs(CONFIG_PATH) if item.name == name)
 
 
 def test_nptu_overview_uses_official_html_listing_and_sorts_by_date() -> None:
@@ -69,6 +77,40 @@ def test_information_college_fixture_parses_six_sorted_announcements() -> None:
     ]
     assert all(item.unit == "資訊學院" for item in items)
     assert all(item.category == "學術單位公告" for item in items)
+
+
+@pytest.mark.parametrize(
+    ("source_name", "titles", "listing"),
+    [
+        (
+            "student-scholarship-external-html",
+            ["【獎助學金】外部基金會獎助學金公告", "【獎學金】校外公益獎學金申請公告"],
+            "#cmb_1373_0",
+        ),
+        (
+            "student-scholarship-internal-html",
+            ["各項校內獎學金資訊一覽表"],
+            "#cmb_1373_1",
+        ),
+    ],
+)
+def test_scholarship_fixture_parses_only_configured_tab(
+    source_name: str,
+    titles: list[str],
+    listing: str,
+) -> None:
+    config = scholarship_source_config(source_name)
+    items = NptuHtmlListAdapter(config).parse_listing(
+        SCHOLARSHIP_FIXTURE_PATH.read_text(encoding="utf-8")
+    )
+
+    assert [item.title for item in items] == titles
+    assert config.selectors is not None
+    assert config.selectors.listing == listing
+    assert all(item.unit == "生活輔導組" for item in items)
+    assert all(item.category == config.category for item in items)
+    assert all(item.canonical_url.startswith("https://staf-life.nptu.edu.tw/") for item in items)
+    assert all("得獎名單" not in item.title for item in items)
 
 
 def test_parser_skips_malformed_and_duplicate_items_without_leaving_listing_scope(
@@ -221,6 +263,19 @@ class ListingHttpClient:
         self.calls.append((url, tuple(allowed_hosts) if allowed_hosts is not None else None))
         return self.content
 
+    def submit_form(
+        self,
+        method: str,
+        url: str,
+        fields: dict[str, str],
+        *,
+        allowed_hosts: list[str] | None = None,
+    ) -> str:
+        assert method == "post"
+        assert fields == {}
+        self.calls.append((url, tuple(allowed_hosts) if allowed_hosts is not None else None))
+        return self.content
+
 
 def test_crawler_uses_html_adapter_host_scope_limit_and_disabled_detail(tmp_path: Path) -> None:
     payload = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
@@ -249,6 +304,42 @@ def test_crawler_uses_html_adapter_host_scope_limit_and_disabled_detail(tmp_path
             "https://ccs.nptu.edu.tw/p/406-1025-197411,r1019.php?Lang=zh-tw",
         )
     }
+
+
+def test_crawler_refreshes_only_scholarship_tab_and_keeps_host_allowlist(tmp_path: Path) -> None:
+    payload = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
+    source = next(
+        item for item in payload["sources"] if item["name"] == "student-scholarship-external-html"
+    )
+    config_path = tmp_path / "sources.yaml"
+    config_path.write_text(yaml.safe_dump({"sources": [source]}, allow_unicode=True), encoding="utf-8")
+    repository = RecordingRepository()
+    fixture = BeautifulSoup(
+        SCHOLARSHIP_FIXTURE_PATH.read_text(encoding="utf-8"),
+        "html.parser",
+    )
+    external_tab = fixture.select_one("#cmb_1373_0")
+    assert external_tab is not None
+    client = ListingHttpClient(external_tab.decode_contents())
+    service = CrawlerService(config_path, repository, client, workspace_root=WORKSPACE_ROOT)  # type: ignore[arg-type]
+
+    result = service.run_with_urls()
+
+    assert result.summary.created == 2
+    assert [item.title for item in repository.candidates] == [
+        "【獎助學金】外部基金會獎助學金公告",
+        "【獎學金】校外公益獎學金申請公告",
+    ]
+    assert client.calls == [
+        (
+            "https://staf-life.nptu.edu.tw/app/index.php?Action=mobileloadmod&Type=mobile_rcg_mstr&Nbr=3893",
+            ("staf-life.nptu.edu.tw",),
+        )
+    ]
+    assert all(
+        url.startswith("https://staf-life.nptu.edu.tw/")
+        for url in result.canonical_urls["student-scholarship-external-html"]
+    )
 
 
 def test_crawler_commits_one_source_with_repository_bulk_transaction(tmp_path: Path) -> None:

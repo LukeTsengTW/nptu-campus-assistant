@@ -31,13 +31,45 @@
 - 刷新間隔：60 分鐘
 - Detail：停用；列表標題作為目前可檢索內容
 
+### 獎助學金專區：校外獎助學金
+
+- 設定名稱：`student-scholarship-external-html`
+- 單位與來源別名：`生活輔導組`、`校外獎助學金`
+- Adapter：設定驅動的 `nptu_html_list`
+- 列表：`https://staf-life.nptu.edu.tw/p/412-1074-14573.php?Lang=zh-tw`
+- 來源 host allowlist：`staf-life.nptu.edu.tw`
+- 列表容器：`#cmb_1373_0`
+- 公告列：`.row.listBS`
+- 日期：`i.mdate`
+- 標題與連結：`.mtitle > a[href]`
+- 單次上限：20 則
+- 刷新間隔：60 分鐘
+- Detail：停用；列表標題作為目前可檢索內容
+
+### 獎助學金專區：校內獎助學金
+
+- 設定名稱：`student-scholarship-internal-html`
+- 單位與來源別名：`生活輔導組`、`校內獎助學金`
+- Adapter：設定驅動的 `nptu_html_list`
+- 列表：同上官方獎助學金專區
+- 來源 host allowlist：`staf-life.nptu.edu.tw`
+- 列表容器：`#cmb_1373_1`
+- 公告列、日期、標題與連結：同校外來源
+- 單次上限：20 則
+- 刷新間隔：60 分鐘
+- Detail：停用；列表標題作為目前可檢索內容
+
+此官方頁面的分頁內容由同站 POST fragment 載入；`dynamic_listing` 只使用設定指定的官方端點，將回應放入上述分頁容器後再交給同一組 typed selectors 解析。校外與校內端點分別由 `Nbr=3893` 與 `Nbr=3892` 設定，仍受 `staf-life.nptu.edu.tw` allowlist 保護。
+
+獎學金來源路由由後端 `keyword_search.source_routes` 固定控制：`獎學金` 與 `獎助學金` 預設查校外來源；明確包含 `校內` 時只查校內來源。兩個來源只讀上述公告分頁，不包含得獎名單、助學金法規或申請表單分頁。
+
 資訊學院首頁的「最新公告」由 JavaScript 動態載入；設定改用首頁「更多最新公告」連結指向的同站靜態列表，讓安全 HTTP client 不需模擬瀏覽器或依賴 AJAX 私有流程即可取得完整公告列。
 
 列表解析器只讀設定容器內的公告列，清理標題、解析日期、將相對連結轉為 canonical URL、拒絕非來源 host 的連結、依 URL 去重，再以日期由新到舊穩定排序。單一壞列會記錄結構化 warning 並跳過；缺少列表容器、完全沒有公告列或所有列都無效時，整個來源視為失敗，不能用部分結果覆寫成功快照。
 
 ## 單位解析與查詢範圍
 
-`UnitSourceResolver` 合併來源設定中的 `unit`／`aliases` 與既有關鍵字別名。別名採最長、非重疊匹配，結果分為：
+`UnitSourceResolver` 合併來源設定中的 `unit`／`aliases`、既有關鍵字別名與後端來源路由。別名採最長、非重疊匹配；來源路由目標、URL、host 與 selector 全由設定控制，結果分為：
 
 - `resolved`：唯一對應已啟用來源，只刷新與查詢該來源。
 - `unknown`：文字看似單位但設定無法辨識，要求使用者提供正式名稱。

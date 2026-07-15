@@ -59,6 +59,28 @@ class DetailPageConfig(BaseModel):
         return value
 
 
+class DynamicListingConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    url: str
+    method: Literal["get", "post"] = "post"
+    wrapper_id: str
+
+    @field_validator("url")
+    @classmethod
+    def validate_url(cls, value: str) -> str:
+        if not is_allowed_nptu_url(value):
+            raise ValueError("動態公告列表 URL 必須是 NPTU 官方 HTTPS 網址")
+        return value
+
+    @field_validator("wrapper_id")
+    @classmethod
+    def validate_wrapper_id(cls, value: str) -> str:
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", value):
+            raise ValueError("動態公告列表 wrapper id 不合法")
+        return value
+
+
 class CrawlerSourceConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
@@ -74,6 +96,7 @@ class CrawlerSourceConfig(BaseModel):
     allowed_hosts: list[str] = Field(default_factory=list)
     selectors: HtmlListingSelectors | None = None
     detail: DetailPageConfig | None = None
+    dynamic_listing: DynamicListingConfig | None = None
 
     @field_validator("url")
     @classmethod
@@ -127,6 +150,11 @@ class CrawlerSourceConfig(BaseModel):
             raise ValueError("HTML 單位來源必須設定 selectors")
         if not is_allowed_source_url(self.url, self.allowed_hosts):
             raise ValueError("來源 URL host 不在來源 allowlist")
+        if self.dynamic_listing is not None:
+            if not is_allowed_source_url(self.dynamic_listing.url, self.allowed_hosts):
+                raise ValueError("動態公告列表 URL host 不在來源 allowlist")
+            if self.selectors.listing != f"#{self.dynamic_listing.wrapper_id}":
+                raise ValueError("動態公告列表 wrapper id 必須對應 listing selector")
         return self
 
 
@@ -143,6 +171,7 @@ class KeywordSearchConfig(BaseModel):
     unit: str
     category: str
     aliases: dict[str, str] = Field(default_factory=dict)
+    source_routes: dict[str, str] = Field(default_factory=dict)
     crawl_interval_minutes: int = Field(default=60, ge=1)
 
     @field_validator("session_url", "bootstrap_url", "url")
@@ -165,6 +194,20 @@ class KeywordSearchConfig(BaseModel):
         if any(not alias.strip() or not canonical.strip() for alias, canonical in value.items()):
             raise ValueError("搜尋別名與完整名稱不得為空")
         return {alias.strip(): canonical.strip() for alias, canonical in value.items()}
+
+    @field_validator("source_routes")
+    @classmethod
+    def validate_source_routes(cls, value: dict[str, str]) -> dict[str, str]:
+        routes: dict[str, str] = {}
+        for keyword, source_name in value.items():
+            normalized_keyword = keyword.strip()
+            normalized_source_name = source_name.strip()
+            if not normalized_keyword or not normalized_source_name:
+                raise ValueError("公告來源路由關鍵字與來源名稱不得為空")
+            if normalized_keyword in routes:
+                raise ValueError("公告來源路由關鍵字不可重複")
+            routes[normalized_keyword] = normalized_source_name
+        return routes
 
 
 def _load_payload(path: Path) -> dict[str, object]:

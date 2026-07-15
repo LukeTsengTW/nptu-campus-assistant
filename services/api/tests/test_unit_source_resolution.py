@@ -9,15 +9,19 @@ from nptu_assistant.crawlers.resolution import (
 
 from pathlib import Path
 
+import pytest
+
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
 CONFIG_PATH = WORKSPACE_ROOT / "data/sources/announcements.yaml"
 
 
 def project_resolver() -> UnitSourceResolver:
+    keyword_config = load_keyword_search_config(CONFIG_PATH)
     return UnitSourceResolver(
         load_source_configs(CONFIG_PATH),
-        load_keyword_search_config(CONFIG_PATH).aliases,
+        keyword_config.aliases,
+        keyword_config.source_routes,
     )
 
 
@@ -92,6 +96,53 @@ def test_no_unit_keeps_general_announcement_flow() -> None:
     assert result.source is None
 
 
+@pytest.mark.parametrize("query", ["查詢獎學金公告", "查詢獎助學金公告"])
+def test_scholarship_queries_default_to_external_source(query: str) -> None:
+    result = project_resolver().resolve(None, query)
+
+    assert result.status is UnitResolutionStatus.RESOLVED
+    assert result.canonical_unit == "生活輔導組"
+    assert result.source is not None
+    assert result.source.name == "student-scholarship-external-html"
+
+
+def test_internal_scholarship_query_uses_only_internal_source() -> None:
+    result = project_resolver().resolve(None, "查詢校內獎學金公告")
+
+    assert result.status is UnitResolutionStatus.RESOLVED
+    assert result.canonical_unit == "生活輔導組"
+    assert result.source is not None
+    assert result.source.name == "student-scholarship-internal-html"
+
+
+def test_explicit_internal_keyword_can_be_separated_from_scholarship_term() -> None:
+    result = project_resolver().resolve(None, "查詢校內的獎學金公告")
+
+    assert result.status is UnitResolutionStatus.RESOLVED
+    assert result.source is not None
+    assert result.source.name == "student-scholarship-internal-html"
+
+
+def test_non_scholarship_internal_text_does_not_trigger_source_route() -> None:
+    result = project_resolver().resolve(None, "查詢校內公告")
+
+    assert result.status is UnitResolutionStatus.NONE
+
+
+def test_unknown_unit_is_not_overridden_by_scholarship_route() -> None:
+    result = project_resolver().resolve(None, "火星學院獎學金公告")
+
+    assert result.status is UnitResolutionStatus.UNKNOWN
+    assert result.requested == "火星學院"
+
+
+def test_source_route_conflicting_with_explicit_unit_is_ambiguous() -> None:
+    result = project_resolver().resolve(None, "資訊學院校內獎學金公告")
+
+    assert result.status is UnitResolutionStatus.AMBIGUOUS
+    assert result.candidates == ("生活輔導組", "資訊學院")
+
+
 def test_duplicate_source_alias_is_ambiguous_with_stable_candidates() -> None:
     sources = [
         html_source(name="beta", unit="乙中心", alias="共同中心", host="b.nptu.edu.tw"),
@@ -133,3 +184,15 @@ def test_disabled_source_is_known_but_unsupported() -> None:
 
     assert result.status is UnitResolutionStatus.UNSUPPORTED
     assert result.canonical_unit == "測試中心"
+
+
+def test_source_route_must_target_a_configured_source() -> None:
+    source = html_source(
+        name="configured",
+        unit="測試中心",
+        alias="測試中心",
+        host="test.nptu.edu.tw",
+    )
+
+    with pytest.raises(ValueError, match="未設定"):
+        UnitSourceResolver([source], {}, {"獎學金": "missing"})

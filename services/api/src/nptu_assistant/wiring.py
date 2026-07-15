@@ -99,7 +99,11 @@ def build_services(settings: Settings) -> dict[str, object]:
                 SqlConversationStore(factory),
                 announcement_refresher,
                 keyword_search_service,
-                UnitSourceResolver(source_configs, keyword_search_config.aliases),
+                UnitSourceResolver(
+                    source_configs,
+                    keyword_search_config.aliases,
+                    keyword_search_config.source_routes,
+                ),
             )
             if llm
             else None
