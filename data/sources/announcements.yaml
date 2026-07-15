@@ -78,15 +78,23 @@ keyword_search:
 
 sources:
   - name: nptu-overview
-    adapter: nptu_overview
-    url: https://www.nptu.edu.tw/p/503-1000-1044.php?Lang=zh-tw
+    adapter: nptu_html_list
+    url: https://www.nptu.edu.tw/p/422-1000-1044.php?Lang=zh-tw
     unit: 國立屏東大學
+    aliases:
+      - 全校公告
     category: 總覽
     enabled: true
     crawl_interval_minutes: 60
     max_items: 20
     allowed_hosts:
       - nptu.edu.tw
+    selectors:
+      listing: "#pageptlist"
+      item: "table.listTB tbody tr"
+      date: 'td[data-th="日期"] .d-txt'
+      title_link: ".mtitle > a[href]"
+      link_attribute: href
     detail:
       enabled: true
   - name: information-college-html

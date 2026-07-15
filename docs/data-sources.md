@@ -5,8 +5,12 @@
 ### NPTU 官方總覽
 
 - 設定名稱：`nptu-overview`
-- Adapter：`nptu_overview`
-- Feed：`https://www.nptu.edu.tw/p/503-1000-1044.php?Lang=zh-tw`
+- Adapter：設定驅動的 `nptu_html_list`
+- 列表：`https://www.nptu.edu.tw/p/422-1000-1044.php?Lang=zh-tw`
+- 列表容器：`#pageptlist`
+- 公告列：`table.listTB tbody tr`
+- 日期：`td[data-th="日期"] .d-txt`
+- 標題與連結：`.mtitle > a[href]`
 - 單次上限：20 則
 - 刷新間隔：60 分鐘
 - Detail：啟用，URL 必須仍為 NPTU 官方 HTTPS 網址

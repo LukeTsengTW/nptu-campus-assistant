@@ -285,13 +285,18 @@ class ToolExecutor:
             )
         return resolution.canonical_unit, resolution.source.name
 
-    def _refresh_warning(self, parsed: SearchAnnouncementsArguments) -> str | None:
+    def _refresh_overview(self, parsed: SearchAnnouncementsArguments) -> RefreshResult | None:
         if parsed.sort is not AnnouncementSort.NEWEST or self._refresher is None:
             return None
         try:
-            return self._refresher.ensure_fresh("nptu-overview").warning
+            return self._refresher.ensure_fresh("nptu-overview")
         except Exception:
-            return REFRESH_FAILURE_WARNING
+            return RefreshResult(
+                "nptu-overview",
+                attempted=True,
+                succeeded=False,
+                warning=REFRESH_FAILURE_WARNING,
+            )
 
     def _search_announcements(
         self,
@@ -335,7 +340,12 @@ class ToolExecutor:
             except Exception:
                 warning = FULL_SEARCH_FAILURE_WARNING
         elif not parsed.query:
-            warning = self._refresh_warning(parsed)
+            refresh = self._refresh_overview(parsed)
+            if refresh is not None:
+                arguments["canonical_urls"] = (
+                    () if refresh.canonical_urls is None else refresh.canonical_urls
+                )
+                warning = refresh.warning
         evidence = self._retriever.search_announcements(**arguments)
         if resolved_source is not None:
             evidence = [replace(item, unit=resolved_source[0]) for item in evidence]

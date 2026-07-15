@@ -19,12 +19,30 @@ from nptu_assistant.crawlers.service import CrawlerService
 WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
 CONFIG_PATH = WORKSPACE_ROOT / "data/sources/announcements.yaml"
 FIXTURE_PATH = WORKSPACE_ROOT / "data/fixtures/announcements/nptu-ccs/listing.html"
+OVERVIEW_FIXTURE_PATH = WORKSPACE_ROOT / "data/fixtures/announcements/nptu-overview/listing.html"
 
 
 def information_college_config() -> CrawlerSourceConfig:
     return next(
         item for item in load_source_configs(CONFIG_PATH) if item.name == "information-college-html"
     )
+
+
+def nptu_overview_config() -> CrawlerSourceConfig:
+    return next(item for item in load_source_configs(CONFIG_PATH) if item.name == "nptu-overview")
+
+
+def test_nptu_overview_uses_official_html_listing_and_sorts_by_date() -> None:
+    config = nptu_overview_config()
+    items = NptuHtmlListAdapter(config).parse_listing(
+        OVERVIEW_FIXTURE_PATH.read_text(encoding="utf-8")
+    )
+
+    assert config.url == "https://www.nptu.edu.tw/p/422-1000-1044.php?Lang=zh-tw"
+    assert config.adapter == "nptu_html_list"
+    assert [item.published_at for item in items] == [date(2026, 7, 15), date(2026, 7, 14)]
+    assert [item.title for item in items] == ["總覽最新公告", "總覽前一日公告"]
+    assert all(item.unit == "國立屏東大學" for item in items)
 
 
 def test_information_college_fixture_parses_six_sorted_announcements() -> None:

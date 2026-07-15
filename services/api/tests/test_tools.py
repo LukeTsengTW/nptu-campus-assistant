@@ -270,6 +270,7 @@ def test_executor_treats_generic_announcement_requests_as_newest_listing(
     assert refresher.calls == ["nptu-overview"]
     assert retriever.calls[0][1]["query"] is None
     assert retriever.calls[0][1]["sort"] is AnnouncementSort.NEWEST
+    assert retriever.calls[0][1]["canonical_urls"] == refresher.canonical_urls
 
 
 def test_executor_does_not_ingest_null_query_and_falls_back_on_ingestion_failure() -> None:
