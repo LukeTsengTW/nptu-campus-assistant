@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from collections import deque
 from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import date
+import heapq
 import re
 from typing import Protocol
 
@@ -31,6 +31,7 @@ class SiteSearchResult:
     pages: tuple[NptuSitePage, ...]
     visited_count: int
     failed_count: int
+    query_relevant_failed_count: int = 0
 
 
 class NptuSiteSearchService:
@@ -56,19 +57,42 @@ class NptuSiteSearchService:
             raise ValueError("網站搜尋關鍵字不得為空")
         terms = tuple(term for term in re.split(r"\s+", normalized_query) if term)
         limit = self._config.max_items if max_items is None else min(max_items, self._config.max_items)
-        queue = deque(self._config.seed_urls)
-        queued = set(queue)
+        salient_relevance = max(len(term) ** 2 for term in terms)
+        queue: list[tuple[int, int, str]] = []
+        queued: set[str] = set()
         visited: set[str] = set()
+        sequence = 0
+
+        def enqueue(url: str, label: str = "") -> None:
+            nonlocal sequence
+            if url in visited or url in queued:
+                return
+            searchable_link = f"{label}\n{url}".casefold()
+            relevance = sum(
+                len(term) ** 2
+                for term in terms
+                if term in searchable_link
+            )
+            heapq.heappush(queue, (-relevance, sequence, url))
+            queued.add(url)
+            sequence += 1
+
+        for seed_url in self._config.seed_urls:
+            enqueue(seed_url)
         matches: list[NptuSitePage] = []
         failed_count = 0
+        query_relevant_failed_count = 0
 
         while queue and len(visited) < self._config.max_pages:
-            url = queue.popleft()
+            priority, _sequence, url = heapq.heappop(queue)
+            relevance = -priority
             queued.discard(url)
             try:
                 url = canonicalize_nptu_url(url)
             except ValueError:
                 failed_count += 1
+                if relevance >= salient_relevance:
+                    query_relevant_failed_count += 1
                 continue
             if url in visited or not is_allowed_source_url(url, self._config.allowed_hosts):
                 continue
@@ -82,21 +106,27 @@ class NptuSiteSearchService:
                 )
             except Exception:
                 failed_count += 1
+                if relevance >= salient_relevance:
+                    query_relevant_failed_count += 1
                 continue
 
             searchable = f"{page.title}\n{page.body}".casefold()
             if all(term in searchable for term in terms):
                 matches.append(page)
-            for link in page.links:
-                if link not in visited and link not in queued:
-                    queue.append(link)
-                    queued.add(link)
+            link_details = page.link_texts or tuple((link, "") for link in page.links)
+            for link, label in link_details:
+                enqueue(link, label)
 
         matches.sort(
             key=lambda page: (page.published_at is not None, page.published_at or date.min),
             reverse=True,
         )
-        return SiteSearchResult(tuple(matches[:limit]), len(visited), failed_count)
+        return SiteSearchResult(
+            tuple(matches[:limit]),
+            len(visited),
+            failed_count,
+            query_relevant_failed_count,
+        )
 
 
 class DocumentRepository(Protocol):
@@ -162,10 +192,15 @@ class SitePageIngestionService:
 
         warning = None
         if search_result.failed_count:
+            has_successful_page = search_result.visited_count > search_result.failed_count
             warning = (
                 SITE_SEARCH_FAILURE_WARNING
-                if not search_result.visited_count - search_result.failed_count
-                else SITE_SEARCH_PARTIAL_WARNING
+                if not has_successful_page
+                else (
+                    SITE_SEARCH_PARTIAL_WARNING
+                    if search_result.query_relevant_failed_count
+                    else None
+                )
             )
         return SitePageIngestionResult(summary, warning)
 

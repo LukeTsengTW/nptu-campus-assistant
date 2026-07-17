@@ -155,9 +155,12 @@ class KeywordAnnouncementSearchService:
                 )
                 if site_result.visited_count > site_result.failed_count:
                     successful_searches += 1
-                if site_result.failed_count:
-                    summary.failed += site_result.failed_count
-                    summary.errors.append(f"NPTU 網域頁面搜尋失敗：{site_result.failed_count} 個頁面")
+                if site_result.query_relevant_failed_count:
+                    summary.failed += site_result.query_relevant_failed_count
+                    summary.errors.append(
+                        "NPTU 網域相關頁面搜尋失敗："
+                        f"{site_result.query_relevant_failed_count} 個頁面"
+                    )
             except Exception:
                 summary.failed += 1
                 summary.errors.append("NPTU 網域搜尋失敗：RuntimeError")

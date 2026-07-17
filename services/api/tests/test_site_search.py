@@ -108,6 +108,61 @@ def test_site_search_follows_only_allowlisted_links_and_matches_pages() -> None:
     assert all(hosts == ("nptu.edu.tw",) for _, hosts in http.calls)
 
 
+def test_site_search_prioritizes_query_relevant_links_before_unrelated_pages() -> None:
+    pages = {
+        "https://www.nptu.edu.tw/": """
+        <main><h1>校首頁</h1>
+        <a href="/unavailable.php">校務連結</a>
+        <a href="/special-admission.php" title="大學特殊選才 新生入學資訊">進入</a></main>
+        """,
+        "https://www.nptu.edu.tw/special-admission.php": """
+        <main><h1>大學特殊選才</h1>
+        <p>新生入學資訊與招生簡章。</p></main>
+        """,
+    }
+    http = MappingHttpClient(pages)
+
+    result = NptuSiteSearchService(
+        site_config(max_pages=2),
+        http,
+    ).search("特殊選才 新生 入學 資訊")
+
+    assert [page.canonical_url for page in result.pages] == [
+        "https://www.nptu.edu.tw/special-admission.php",
+    ]
+    assert result.visited_count == 2
+    assert result.failed_count == 0
+    assert [url for url, _hosts in http.calls] == [
+        "https://www.nptu.edu.tw/",
+        "https://www.nptu.edu.tw/special-admission.php",
+    ]
+
+
+def test_site_page_ingestion_ignores_lower_priority_failed_pages_in_user_warning() -> None:
+    pages = {
+        "https://www.nptu.edu.tw/": """
+        <main><h1>校首頁</h1>
+        <a href="/unavailable.php" title="新生入學資訊">進入</a>
+        <a href="/special-admission.php" title="特殊選才 新生入學資訊">進入</a></main>
+        """,
+        "https://www.nptu.edu.tw/special-admission.php": """
+        <main><h1>特殊選才</h1><p>新生入學資訊。</p></main>
+        """,
+    }
+    http = MappingHttpClient(pages)
+    config = site_config(max_pages=3)
+
+    result = SitePageIngestionService(
+        NptuSiteSearchService(config, http),
+        MemoryDocumentRepository(),
+        FakeEmbeddingProvider(1536),
+        config,
+    ).ingest("特殊選才 新生 入學 資訊", max_items=5)
+
+    assert result.summary.created == 1
+    assert result.warning is None
+
+
 class MemoryDocumentRepository:
     def __init__(self) -> None:
         self.hashes: set[tuple[str, str]] = set()

@@ -61,6 +61,7 @@ class NptuSitePage:
     body: str
     published_at: date | None
     links: tuple[str, ...]
+    link_texts: tuple[tuple[str, str], ...] = ()
 
 
 class NptuSitePageAdapter:
@@ -81,10 +82,11 @@ class NptuSitePageAdapter:
         if title and not body.startswith(title):
             body = f"{title}\n{body}" if body else title
         body = normalize_text(body)[:_MAX_PAGE_TEXT]
+        link_texts = tuple(
+            self._link_details(soup, canonical_url, allowed_hosts=allowed_hosts)
+        )
         links = tuple(
-            dict.fromkeys(
-                self._links(soup, canonical_url, allowed_hosts=allowed_hosts)
-            )
+            url for url, _label in link_texts
         )
         return NptuSitePage(
             title=title or canonical_url,
@@ -92,6 +94,7 @@ class NptuSitePageAdapter:
             body=body,
             published_at=self._published_at(soup, body),
             links=links,
+            link_texts=link_texts,
         )
 
     @staticmethod
@@ -149,7 +152,25 @@ class NptuSitePageAdapter:
         *,
         allowed_hosts: list[str] | tuple[str, ...],
     ) -> list[str]:
+        return [
+            url
+            for url, _label in cls._link_details(
+                soup,
+                page_url,
+                allowed_hosts=allowed_hosts,
+            )
+        ]
+
+    @classmethod
+    def _link_details(
+        cls,
+        soup: BeautifulSoup,
+        page_url: str,
+        *,
+        allowed_hosts: list[str] | tuple[str, ...],
+    ) -> list[tuple[str, str]]:
         links: list[str] = []
+        labels: dict[str, list[str]] = {}
         for node in soup.find_all("a", href=True):
             if not isinstance(node, Tag):
                 continue
@@ -162,10 +183,26 @@ class NptuSitePageAdapter:
             if not is_allowed_source_url(target, allowed_hosts) or not cls._is_crawlable(target):
                 continue
             try:
-                links.append(canonicalize_nptu_url(target))
+                canonical_url = canonicalize_nptu_url(target)
             except ValueError:
                 continue
-        return links
+            if canonical_url not in labels:
+                links.append(canonical_url)
+                labels[canonical_url] = []
+            label = normalize_text(
+                " ".join(
+                    str(value).strip()
+                    for value in (
+                        node.get("aria-label"),
+                        node.get("title"),
+                        node.get_text(" ", strip=True),
+                    )
+                    if value
+                )
+            )
+            if label and label not in labels[canonical_url]:
+                labels[canonical_url].append(label)
+        return [(url, " ".join(labels[url])) for url in links]
 
     @staticmethod
     def _is_crawlable(url: str) -> bool:

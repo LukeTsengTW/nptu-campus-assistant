@@ -69,7 +69,9 @@
 
 ## NPTU 網域搜尋
 
-`keyword_search.site_search` 提供受後端設定控制的同網域搜尋，現行設定從 `https://www.nptu.edu.tw/` 開始，允許 `nptu.edu.tw` 根網域及其子網域，單次最多探索 40 個 HTML 頁面。它不是 Google 索引的鏡像，而是依 seed page 可達的連結做有限深度的 breadth-first 探索；每個請求仍會檢查 HTTPS、NPTU host、redirect 與 robots.txt。
+`keyword_search.site_search` 提供受後端設定控制的同網域搜尋，現行設定從 `https://www.nptu.edu.tw/` 開始，允許 `nptu.edu.tw` 根網域及其子網域，單次最多探索 40 個 HTML 頁面。它不是 Google 索引的鏡像，而是依 seed page 可達的連結做有限頁數的查詢相關性優先探索；每個請求仍會檢查 HTTPS、NPTU host、redirect 與 robots.txt。
+
+探索排序會提高較長、較具辨識度的查詢詞權重；部分頁面失敗只有在命中最具辨識度查詢詞時才會觸發不完整警告，避免無關導覽頁的連線問題遮蔽有效結果。
 
 - `search_documents`：符合查詢的 HTML 頁面會寫入既有 `documents`／向量索引，無日期頁面以爬取當日作為 `effective_from`，不會冒充公告發布日期。
 - `search_announcements`：只有頁面能解析出發布日期時才會合併到公告搜尋結果；來源名稱、seed URL 與頁面 canonical URL 由後端設定及資料庫保存。
