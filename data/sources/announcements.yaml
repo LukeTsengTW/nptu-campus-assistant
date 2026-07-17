@@ -10,6 +10,17 @@ keyword_search:
   max_items: 20
   unit: 國立屏東大學
   category: 關鍵字搜尋
+  site_search:
+    enabled: true
+    name: nptu-domain-search
+    seed_urls:
+      - https://www.nptu.edu.tw/
+    allowed_hosts:
+      - nptu.edu.tw
+    max_pages: 40
+    max_items: 20
+    unit: 國立屏東大學
+    category: NPTU 網域搜尋
   aliases:
     電科系: 電腦科學與人工智慧學系
     資工系: 資訊工程學系

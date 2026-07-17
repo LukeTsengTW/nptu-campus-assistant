@@ -14,6 +14,10 @@ from nptu_assistant.crawlers.adapters.nptu_search import (
 )
 from nptu_assistant.crawlers.config import KeywordSearchConfig
 from nptu_assistant.crawlers.models import AnnouncementCandidate
+from nptu_assistant.crawlers.site_search import (
+    NptuSiteSearchService,
+    site_page_to_announcement_result,
+)
 
 
 PARTIAL_SEARCH_FAILURE_WARNING = "部分官網公告搜尋失敗，以下結果可能不完整。"
@@ -68,12 +72,14 @@ class KeywordAnnouncementSearchService:
         repository: AnnouncementRepository,
         http_client: SearchHttpClient,
         adapter: NptuAssociationSearchAdapter | None = None,
+        site_searcher: NptuSiteSearchService | None = None,
     ) -> None:
         self._config = config
         self._repository = repository
         self._http = http_client
         self._adapter = adapter or NptuAssociationSearchAdapter()
         self._resolver = KeywordAliasResolver(config.aliases)
+        self._site_searcher = site_searcher
 
     def normalize(self, text: str) -> str:
         return self._resolver.normalize(text)
@@ -100,44 +106,61 @@ class KeywordAnnouncementSearchService:
         expansion = self._resolver.expand(query)
         summary = CrawlSummary()
         item_limit = self._config.max_items if max_items is None else min(max_items, self._config.max_items)
+        form: SearchForm | None = None
+        successful_searches = 0
         try:
-            form: SearchForm | None = self._load_form()
+            form = self._load_form()
         except Exception as exc:
             summary.failed = 1
             summary.errors.append(f"官方搜尋表單無法載入：{type(exc).__name__}")
-            return KeywordIngestionResult(
-                expansion.retrieval_query,
-                summary,
-                FULL_SEARCH_FAILURE_WARNING,
-            )
 
         results: list[AnnouncementSearchResult] = []
-        successful_searches = 0
-        for search_term in expansion.search_terms:
-            for search_type in self._config.search_types:
-                last_error: Exception | None = None
-                for _attempt in range(2):
-                    try:
-                        if form is None:
-                            form = self._load_form()
-                        if search_type not in form.search_types:
-                            raise ValueError(f"官網搜尋表單缺少分類：{search_type}")
-                        fields = dict(form.hidden_fields)
-                        fields.update({"SchKey": search_term, "SchType": search_type})
-                        content = self._http.submit_form(form.method, form.action_url, fields)
-                        parsed_results = self._adapter.parse_results(content, form.action_url)
-                        next_form = self._adapter.parse_form(content, self._config.url)
-                        results.extend(parsed_results)
-                        form = next_form
-                        successful_searches += 1
-                        break
-                    except Exception as exc:
-                        last_error = exc
-                        form = None
-                else:
-                    summary.failed += 1
-                    error_name = type(last_error).__name__ if last_error else "RuntimeError"
-                    summary.errors.append(f"{search_type} 搜尋失敗：{error_name}")
+        if form is not None:
+            for search_term in expansion.search_terms:
+                for search_type in self._config.search_types:
+                    last_error: Exception | None = None
+                    for _attempt in range(2):
+                        try:
+                            if form is None:
+                                form = self._load_form()
+                            if search_type not in form.search_types:
+                                raise ValueError(f"官網搜尋表單缺少分類：{search_type}")
+                            fields = dict(form.hidden_fields)
+                            fields.update({"SchKey": search_term, "SchType": search_type})
+                            content = self._http.submit_form(form.method, form.action_url, fields)
+                            parsed_results = self._adapter.parse_results(content, form.action_url)
+                            next_form = self._adapter.parse_form(content, self._config.url)
+                            results.extend(parsed_results)
+                            form = next_form
+                            successful_searches += 1
+                            break
+                        except Exception as exc:
+                            last_error = exc
+                            form = None
+                    else:
+                        summary.failed += 1
+                        error_name = type(last_error).__name__ if last_error else "RuntimeError"
+                        summary.errors.append(f"{search_type} 搜尋失敗：{error_name}")
+
+        if self._site_searcher is not None:
+            try:
+                site_result = self._site_searcher.search(
+                    expansion.retrieval_query,
+                    max_items=item_limit,
+                )
+                results.extend(
+                    site_page_to_announcement_result(page, config=self._site_searcher.config)
+                    for page in site_result.pages
+                    if page.published_at is not None
+                )
+                if site_result.visited_count > site_result.failed_count:
+                    successful_searches += 1
+                if site_result.failed_count:
+                    summary.failed += site_result.failed_count
+                    summary.errors.append(f"NPTU 網域頁面搜尋失敗：{site_result.failed_count} 個頁面")
+            except Exception:
+                summary.failed += 1
+                summary.errors.append("NPTU 網域搜尋失敗：RuntimeError")
 
         unique_results: dict[str, AnnouncementSearchResult] = {}
         for result in results:
@@ -173,8 +196,8 @@ class KeywordAnnouncementSearchService:
             try:
                 outcome = self._repository.upsert(
                     candidate,
-                    source_name=self._config.name,
-                    source_url=self._config.url,
+                    source_name=result.source_name or self._config.name,
+                    source_url=result.source_url or self._config.url,
                     interval_minutes=self._config.crawl_interval_minutes,
                 )
                 ingested_urls.append(result.canonical_url)

@@ -14,6 +14,10 @@ from nptu_assistant.crawlers.refresh import (
 from nptu_assistant.crawlers.resolution import UnitSourceResolver
 from nptu_assistant.crawlers.service import CrawlerService
 from nptu_assistant.crawlers.search import KeywordAnnouncementSearchService
+from nptu_assistant.crawlers.site_search import (
+    NptuSiteSearchService,
+    SitePageIngestionService,
+)
 from nptu_assistant.db.repositories import SqlAnnouncementRepository, SqlDocumentRepository
 from nptu_assistant.db.session import create_session_factory
 from nptu_assistant.ingestion.service import DocumentIngestionService
@@ -79,10 +83,26 @@ def build_services(settings: Settings) -> dict[str, object]:
         http_client,
         workspace_root=WORKSPACE_ROOT,
     )
+    site_searcher = (
+        NptuSiteSearchService(keyword_search_config.site_search, http_client)
+        if keyword_search_config.site_search and keyword_search_config.site_search.enabled
+        else None
+    )
     keyword_search_service = KeywordAnnouncementSearchService(
         keyword_search_config,
         announcement_repository,
         http_client,
+        site_searcher=site_searcher,
+    )
+    site_page_ingestor = (
+        SitePageIngestionService(
+            site_searcher,
+            document_repository,
+            embedding,
+            keyword_search_config.site_search,
+        )
+        if site_searcher and keyword_search_config.site_search
+        else None
     )
     announcement_refresher = AnnouncementRefreshCoordinator(
         crawler_config_path,
@@ -104,6 +124,7 @@ def build_services(settings: Settings) -> dict[str, object]:
                     keyword_search_config.aliases,
                     keyword_search_config.source_routes,
                 ),
+                site_page_ingestor,
             )
             if llm
             else None

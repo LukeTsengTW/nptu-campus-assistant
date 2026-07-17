@@ -12,6 +12,10 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 from nptu_assistant.crawlers.refresh import REFRESH_FAILURE_WARNING, RefreshResult
 from nptu_assistant.crawlers.resolution import UnitResolutionStatus, UnitSourceResolver
 from nptu_assistant.crawlers.search import FULL_SEARCH_FAILURE_WARNING, KeywordIngestionResult
+from nptu_assistant.crawlers.site_search import (
+    SITE_SEARCH_FAILURE_WARNING,
+    SitePageIngestionResult,
+)
 from nptu_assistant.rag.models import Evidence
 
 
@@ -87,7 +91,7 @@ def tool_definitions() -> list[dict[str, object]]:
         {
             "type": "function",
             "name": "search_documents",
-            "description": "搜尋國立屏東大學校規、申請流程與校務文件。",
+            "description": "搜尋國立屏東大學校規、申請流程、校務文件與官方網站頁面。",
             "strict": True,
             "parameters": {
                 "type": "object",
@@ -142,6 +146,11 @@ class KeywordAnnouncementIngestor(Protocol):
         raise NotImplementedError
 
     def normalize(self, text: str) -> str:
+        raise NotImplementedError
+
+
+class SitePageIngestor(Protocol):
+    def ingest(self, query: str, *, max_items: int) -> SitePageIngestionResult:
         raise NotImplementedError
 
 
@@ -247,11 +256,13 @@ class ToolExecutor:
         refresher: AnnouncementRefresher | None = None,
         keyword_ingestor: KeywordAnnouncementIngestor | None = None,
         unit_resolver: UnitSourceResolver | None = None,
+        site_page_ingestor: SitePageIngestor | None = None,
     ) -> None:
         self._retriever = retriever
         self._refresher = refresher
         self._keyword_ingestor = keyword_ingestor
         self._unit_resolver = unit_resolver
+        self._site_page_ingestor = site_page_ingestor
 
     def _resolve_unit_source(
         self,
@@ -374,6 +385,14 @@ class ToolExecutor:
                 evidence, refresh_warning = self._search_announcements(parsed)
                 content_limit = 2_000
             elif isinstance(parsed, SearchDocumentsArguments):
+                if self._site_page_ingestor is not None:
+                    try:
+                        refresh_warning = self._site_page_ingestor.ingest(
+                            parsed.query,
+                            max_items=parsed.limit,
+                        ).warning
+                    except Exception:
+                        refresh_warning = SITE_SEARCH_FAILURE_WARNING
                 evidence = self._retriever.search_documents(**parsed.model_dump())
                 content_limit = 2_000
             else:

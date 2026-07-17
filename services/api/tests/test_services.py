@@ -92,6 +92,9 @@ def test_wiring_shares_one_openai_client_between_text_and_embeddings(monkeypatch
     assert keyword_ingestor._http is crawler_service._http
     assert keyword_ingestor._repository is crawler_service._repository
     assert keyword_ingestor.normalize("電科系") == "電腦科學與人工智慧學系"
+    assert keyword_ingestor._site_searcher is not None
+    assert keyword_ingestor._site_searcher.config.allowed_hosts == ["nptu.edu.tw"]
+    assert chat_service._tool_executor._site_page_ingestor is not None
 
 
 class MemoryDocumentRepository:

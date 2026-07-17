@@ -8,7 +8,11 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from soupsieve import SelectorSyntaxError, compile as compile_selector
 
-from nptu_assistant.core.security import is_allowed_nptu_url, is_allowed_source_url
+from nptu_assistant.core.security import (
+    canonicalize_nptu_url,
+    is_allowed_nptu_url,
+    is_allowed_source_url,
+)
 
 
 class HtmlListingSelectors(BaseModel):
@@ -158,6 +162,61 @@ class CrawlerSourceConfig(BaseModel):
         return self
 
 
+class SiteSearchConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    enabled: bool = False
+    name: str = "nptu-domain-search"
+    seed_urls: list[str] = Field(default_factory=list)
+    allowed_hosts: list[str] = Field(default_factory=list)
+    max_pages: int = Field(default=40, ge=1, le=200)
+    max_items: int = Field(default=20, ge=1, le=20)
+    unit: str = "國立屏東大學"
+    category: str = "NPTU 網域搜尋"
+
+    @field_validator("name", "unit", "category")
+    @classmethod
+    def validate_required_text(cls, value: str) -> str:
+        if not value:
+            raise ValueError("網站搜尋設定文字不得為空")
+        return value
+
+    @field_validator("allowed_hosts")
+    @classmethod
+    def validate_allowed_hosts(cls, value: list[str]) -> list[str]:
+        normalized = [host.strip().lower().rstrip(".") for host in value]
+        if any(
+            not host
+            or not re.fullmatch(r"[a-z0-9.-]+", host)
+            or not is_allowed_nptu_url(f"https://{host}/")
+            for host in normalized
+        ):
+            raise ValueError("網站搜尋 allowed host 必須是 NPTU 官方網域")
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("網站搜尋 allowed host 不可重複")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_scope(self) -> "SiteSearchConfig":
+        if not self.enabled:
+            return self
+        if not self.seed_urls:
+            raise ValueError("啟用網站搜尋時必須設定至少一個 seed URL")
+        if not self.allowed_hosts:
+            raise ValueError("啟用網站搜尋時必須設定至少一個 allowed host")
+        normalized_urls: list[str] = []
+        for url in self.seed_urls:
+            try:
+                canonical_url = canonicalize_nptu_url(url)
+            except ValueError as exc:
+                raise ValueError("網站搜尋 seed URL 必須是 NPTU 官方 HTTPS 網址") from exc
+            if not is_allowed_source_url(canonical_url, self.allowed_hosts):
+                raise ValueError("網站搜尋 seed URL 不在 allowed host 範圍內")
+            normalized_urls.append(canonical_url)
+        self.seed_urls = list(dict.fromkeys(normalized_urls))
+        return self
+
+
 class KeywordSearchConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
@@ -173,6 +232,7 @@ class KeywordSearchConfig(BaseModel):
     aliases: dict[str, str] = Field(default_factory=dict)
     source_routes: dict[str, str] = Field(default_factory=dict)
     crawl_interval_minutes: int = Field(default=60, ge=1)
+    site_search: SiteSearchConfig | None = None
 
     @field_validator("session_url", "bootstrap_url", "url")
     @classmethod

@@ -22,6 +22,7 @@ from nptu_assistant.rag.prompts import SYSTEM_INSTRUCTIONS
 from nptu_assistant.rag.tools import (
     AnnouncementRefresher,
     KeywordAnnouncementIngestor,
+    SitePageIngestor,
     StructuredRetriever,
     ToolExecutor,
     tool_definitions,
@@ -88,6 +89,7 @@ class ChatService:
         announcement_refresher: AnnouncementRefresher | None = None,
         keyword_announcement_ingestor: KeywordAnnouncementIngestor | None = None,
         unit_source_resolver: UnitSourceResolver | None = None,
+        site_page_ingestor: SitePageIngestor | None = None,
     ) -> None:
         self._llm = llm
         self._conversation_store = conversation_store
@@ -96,6 +98,7 @@ class ChatService:
             announcement_refresher,
             keyword_announcement_ingestor,
             unit_source_resolver,
+            site_page_ingestor,
         )
 
     def delete_conversation(self, conversation_id: str) -> bool:

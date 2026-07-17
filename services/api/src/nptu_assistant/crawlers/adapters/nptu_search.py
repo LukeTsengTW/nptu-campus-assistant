@@ -38,6 +38,8 @@ class AnnouncementSearchResult:
     category: str | None
     published_at: date | None
     body: str
+    source_name: str | None = None
+    source_url: str | None = None
 
 
 class NptuAssociationSearchAdapter:

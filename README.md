@@ -117,6 +117,8 @@ uv run nptu-assistant crawl-announcements
 
 API 啟動後每 60 秒檢查已啟用來源是否到期；`nptu-overview`、資訊學院與獎助學金來源的實際刷新間隔都由各自的 `crawl_interval_minutes` 控制。使用者查詢最新公告時也會先做相同檢查。未到期不會重新請求官網；到期時每個來源最多處理 20 則。需要立即刷新時，可執行上方的 `crawl-announcements` 指令。
 
+關鍵字查詢另會依 `keyword_search.site_search` 從 `https://www.nptu.edu.tw/` 探索 NPTU 根網域及其子網域，單次最多 40 個 HTML 頁面。一般頁面會寫入文件／向量索引；只有能解析發布日期的頁面才會加入公告索引。這是受 allowlist、robots.txt 與頁數上限保護的同網域 crawler，不是 Google 索引，也不會追蹤外部網址或下載檔案。
+
 刷新成功後，系統會在同一資料庫交易中寫入公告與該來源本次的 canonical URL 快照；手動 crawl 也走相同流程。查詢結果只會從這份快照對應的資料庫公告產生。刷新失敗時整批回滾、保留上次成功快照並在回答附上警告。所有回答來源 URL 仍從資料庫產生，模型不能指定任意爬取 URL。
 
 ## 依單位查詢最新公告

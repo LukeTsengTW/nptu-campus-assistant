@@ -67,6 +67,14 @@
 
 列表解析器只讀設定容器內的公告列，清理標題、解析日期、將相對連結轉為 canonical URL、拒絕非來源 host 的連結、依 URL 去重，再以日期由新到舊穩定排序。單一壞列會記錄結構化 warning 並跳過；缺少列表容器、完全沒有公告列或所有列都無效時，整個來源視為失敗，不能用部分結果覆寫成功快照。
 
+## NPTU 網域搜尋
+
+`keyword_search.site_search` 提供受後端設定控制的同網域搜尋，現行設定從 `https://www.nptu.edu.tw/` 開始，允許 `nptu.edu.tw` 根網域及其子網域，單次最多探索 40 個 HTML 頁面。它不是 Google 索引的鏡像，而是依 seed page 可達的連結做有限深度的 breadth-first 探索；每個請求仍會檢查 HTTPS、NPTU host、redirect 與 robots.txt。
+
+- `search_documents`：符合查詢的 HTML 頁面會寫入既有 `documents`／向量索引，無日期頁面以爬取當日作為 `effective_from`，不會冒充公告發布日期。
+- `search_announcements`：只有頁面能解析出發布日期時才會合併到公告搜尋結果；來源名稱、seed URL 與頁面 canonical URL 由後端設定及資料庫保存。
+- 不追蹤外部網址、下載檔案、`javascript:`、`mailto:` 或任意使用者提供的 URL；頁數與結果數上限由 `SiteSearchConfig` 控制。
+
 ## 單位解析與查詢範圍
 
 `UnitSourceResolver` 合併來源設定中的 `unit`／`aliases`、既有關鍵字別名與後端來源路由。別名採最長、非重疊匹配；來源路由目標、URL、host 與 selector 全由設定控制，結果分為：
