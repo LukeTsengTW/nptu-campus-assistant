@@ -12,7 +12,7 @@ export default defineContentScript({
     const ui = await createShadowRootUi(ctx, {
       name: "nptu-campus-assistant",
       position: "overlay",
-      anchor: "body",
+      anchor: () => document.body ?? document.documentElement,
       isolateEvents: true,
       onMount(container) {
         const root = ReactDOM.createRoot(container);
