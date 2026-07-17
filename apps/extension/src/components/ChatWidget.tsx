@@ -23,9 +23,21 @@ type Props = {
 };
 
 const suggestedQuestions = [
-  "查詢近期最新公告",
-  "查詢獎學金公告",
-  "查詢選課公告",
+  {
+    label: "近期公告",
+    description: "查看最新校務消息",
+    prompt: "查詢近期最新公告",
+  },
+  {
+    label: "獎學金資訊",
+    description: "查詢校內外獎助學金",
+    prompt: "查詢獎學金公告",
+  },
+  {
+    label: "選課公告",
+    description: "查看選課與課務通知",
+    prompt: "查詢選課公告",
+  },
 ] as const;
 
 
@@ -135,35 +147,55 @@ export function ChatWidget({
   return (
     <div className="nptu-assistant-root">
       {open && (
-        <section className="assistant-panel" aria-label="NPTU 校務資訊助理聊天視窗">
+        <section
+          className="assistant-panel"
+          aria-label="NPTU 校務資訊助理聊天視窗"
+        >
           <header className="assistant-header">
-            <div>
-              <div className="assistant-eyebrow"><span>非官方</span> NPTU CAMPUS GUIDE</div>
-              <h1>校務資訊助理</h1>
+            <div className="assistant-header-main">
+              <div className="assistant-brand-mark" aria-hidden="true">
+                <span>N</span>
+                <span className="brand-mark-accent" />
+              </div>
+              <div className="assistant-title-group">
+                <h1>校務資訊助理</h1>
+                <p>非官方校務資訊查詢工具</p>
+              </div>
             </div>
             <button className="icon-button" type="button" onClick={toggle} aria-label="關閉聊天視窗">
-              ×
+              <svg viewBox="0 0 20 20" aria-hidden="true">
+                <path d="m5 5 10 10M15 5 5 15" />
+              </svg>
             </button>
           </header>
 
           <div className="assistant-thread" aria-live="polite">
             {messages.length === 0 && !error && (
               <>
-                <div className="welcome-card">
-                  <div className="welcome-mark">查</div>
-                  <h2>從官方資料開始找答案</h2>
-                  <p>可詢問校務辦法、申請資格，或搜尋近期公告與截止日。</p>
+                <div className="welcome-section">
+                  <div className="section-kicker">
+                    <span aria-hidden="true" />
+                    快速查詢
+                  </div>
+                  <h2>查詢屏大校務資訊</h2>
+                  <p>可查詢近期公告、獎學金、選課資訊與校務規定。回答會附上可供核對的官方來源。</p>
                 </div>
-                <div className="suggestion-list" aria-label="建議問題">
+                <div className="suggestion-list" role="group" aria-label="建議問題">
                   {suggestedQuestions.map((suggestion) => (
                     <button
-                      className="suggestion-button"
+                      className="suggestion-item"
                       type="button"
-                      key={suggestion}
-                      onClick={() => void submitQuestion(suggestion)}
+                      key={suggestion.prompt}
+                      onClick={() => void submitQuestion(suggestion.prompt)}
                       disabled={loading}
                     >
-                      {suggestion}
+                      <span className="suggestion-content">
+                        <strong>{suggestion.label}</strong>
+                        <small>{suggestion.description}</small>
+                      </span>
+                      <svg className="suggestion-arrow" viewBox="0 0 16 16" aria-hidden="true">
+                        <path d="m6 3 5 5-5 5" />
+                      </svg>
                     </button>
                   ))}
                 </div>
@@ -175,9 +207,9 @@ export function ChatWidget({
                   <div className="message-bubble user-bubble">{message.text}</div>
                 </div>
               ) : (
-                <article className="answer-card" key={message.id}>
-                  <div className="answer-label">AI 整理說明</div>
-                  <p>{renderAnswer(message.response.answer)}</p>
+                <article className="answer-entry" key={message.id}>
+                  <div className="answer-label">查詢結果</div>
+                  <p className="answer-copy">{renderAnswer(message.response.answer)}</p>
                   {message.response.warning && (
                     <div className="warning-box">{message.response.warning}</div>
                   )}
@@ -186,7 +218,7 @@ export function ChatWidget({
                       <h3>官方來源</h3>
                       {message.response.sources.map((source) => (
                         <a
-                          className="source-card"
+                          className="source-item"
                           href={source.url}
                           key={`${message.id}-${source.url}`}
                           target="_blank"
@@ -194,7 +226,7 @@ export function ChatWidget({
                         >
                           <span className="source-title">{source.title}</span>
                           <span className="source-meta">
-                            {source.unit} · {source.published_at ?? "日期未提供"} · 官方
+                            {source.unit} · {source.published_at ?? "日期未提供"}
                           </span>
                         </a>
                       ))}
@@ -214,7 +246,7 @@ export function ChatWidget({
               value={question}
               onChange={(event) => setQuestion(event.target.value)}
               maxLength={2000}
-              rows={3}
+              rows={2}
               placeholder="例如：最近有哪些獎學金公告？"
             />
             <div className="composer-actions">
@@ -226,22 +258,36 @@ export function ChatWidget({
               >
                 清除對話
               </button>
-              <button className="send-button" type="submit" disabled={!question.trim() || loading}>
-                送出問題 <span aria-hidden="true">↗</span>
+              <button
+                className="send-button"
+                type="submit"
+                aria-label="送出問題"
+                disabled={!question.trim() || loading}
+              >
+                送出
               </button>
             </div>
           </form>
 
           <footer className="assistant-disclaimer">
-            本工具並非國立屏東大學官方系統。重要申請資格、期限與規定請以原始官方公告為準。
+            <span className="disclaimer-dot" aria-hidden="true" />
+            <span>本工具並非國立屏東大學官方系統。重要申請資格、期限與規定請以原始官方公告為準。</span>
           </footer>
         </section>
       )}
 
       {!open && (
-        <button className="assistant-launcher" type="button" onClick={toggle} aria-label="開啟 NPTU 校務資訊助理">
-          <span className="launcher-glyph">問</span>
-          <span className="launcher-copy"><strong>校務助理</strong><small>官方資料查詢</small></span>
+        <button
+          className="assistant-launcher"
+          type="button"
+          onClick={toggle}
+          aria-label="開啟 NPTU 校務資訊助理"
+          title="校務資訊助理"
+        >
+          <svg className="launcher-icon" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M5.25 6.75h13.5A1.75 1.75 0 0 1 20.5 8.5v7A1.75 1.75 0 0 1 18.75 17h-7.2l-3.8 2.75V17h-2.5A1.75 1.75 0 0 1 3.5 15.25v-6a2.5 2.5 0 0 1 1.75-2.5Z" />
+            <path d="M9.25 11.75h.01M12 11.75h.01M14.75 11.75h.01" />
+          </svg>
         </button>
       )}
     </div>

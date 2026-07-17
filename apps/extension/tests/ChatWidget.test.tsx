@@ -31,11 +31,17 @@ describe("ChatWidget", () => {
     const user = userEvent.setup();
     render(<ChatWidget sendQuestion={vi.fn()} initialOpen={false} />);
 
-    expect(screen.getByRole("button", { name: "開啟 NPTU 校務資訊助理" })).toBeVisible();
+    const launcher = screen.getByRole("button", { name: "開啟 NPTU 校務資訊助理" });
+    expect(launcher).toBeVisible();
+    expect(launcher).toHaveAttribute("title", "校務資訊助理");
     await user.click(screen.getByRole("button", { name: "開啟 NPTU 校務資訊助理" }));
 
     expect(screen.getByRole("heading", { name: "校務資訊助理" })).toBeVisible();
+    expect(screen.getByText("非官方校務資訊查詢工具")).toBeVisible();
     expect(screen.getByText(/本工具並非國立屏東大學官方系統/)).toBeVisible();
+
+    await user.click(screen.getByRole("button", { name: "關閉聊天視窗" }));
+    expect(screen.getByRole("button", { name: "開啟 NPTU 校務資訊助理" })).toBeVisible();
   });
 
   it("送出問題、顯示載入狀態、回答與官方來源", async () => {
@@ -63,13 +69,18 @@ describe("ChatWidget", () => {
     const sendQuestion = vi.fn().mockResolvedValue(response);
     render(<ChatWidget sendQuestion={sendQuestion} initialOpen />);
 
-    for (const suggestion of ["查詢近期最新公告", "查詢獎學金公告", "查詢選課公告"]) {
+    expect(screen.getByRole("group", { name: "建議問題" })).toBeVisible();
+    for (const suggestion of [
+      /近期公告.*查看最新校務消息/,
+      /獎學金資訊.*查詢校內外獎助學金/,
+      /選課公告.*查看選課與課務通知/,
+    ]) {
       expect(screen.getByRole("button", { name: suggestion })).toBeVisible();
     }
 
-    await user.click(screen.getByRole("button", { name: "查詢獎學金公告" }));
+    await user.click(screen.getByRole("button", { name: /獎學金資訊/ }));
     await waitFor(() => expect(sendQuestion).toHaveBeenCalledWith("查詢獎學金公告", undefined));
-    expect(screen.queryByRole("button", { name: "查詢近期最新公告" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /近期公告/ })).not.toBeInTheDocument();
   });
 
   it("顯示 API 錯誤並可清除對話", async () => {
