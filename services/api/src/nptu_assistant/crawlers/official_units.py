@@ -343,3 +343,12 @@ def load_official_unit_directory(path: Path) -> OfficialUnitDirectory:
 @lru_cache(maxsize=1)
 def load_default_official_unit_directory() -> OfficialUnitDirectory:
     return load_official_unit_directory(DEFAULT_OFFICIAL_UNITS_PATH)
+
+
+def load_official_unit_directory_for_config(
+    crawler_config_path: Path,
+) -> OfficialUnitDirectory:
+    sibling_path = crawler_config_path.with_name("official_units.yaml")
+    if sibling_path.is_file():
+        return load_official_unit_directory(sibling_path)
+    return load_default_official_unit_directory()

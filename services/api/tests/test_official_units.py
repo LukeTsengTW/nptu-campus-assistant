@@ -18,6 +18,7 @@ from nptu_assistant.crawlers.official_units import (
     OfficialUnitDirectory,
     UnitStatus,
     load_official_unit_directory,
+    load_official_unit_directory_for_config,
 )
 from nptu_assistant.crawlers.resolution import UnitResolutionStatus, UnitSourceResolver
 from nptu_assistant.crawlers.site_models import SearchDeadline, SearchPlan
@@ -38,6 +39,12 @@ UNIT_CONFIG = WORKSPACE_ROOT / "data/sources/official_units.yaml"
 
 def project_directory() -> OfficialUnitDirectory:
     return load_official_unit_directory(UNIT_CONFIG)
+
+
+def test_missing_sibling_directory_uses_project_registry(tmp_path: Path) -> None:
+    directory = load_official_unit_directory_for_config(tmp_path / "announcements.yaml")
+
+    assert directory.get("資訊學院").homepage_url == "https://ccs.nptu.edu.tw/"
 
 
 def project_resolver() -> UnitSourceResolver:
