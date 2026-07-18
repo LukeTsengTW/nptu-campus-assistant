@@ -129,7 +129,13 @@ class FakeEmbeddingProvider:
     def __init__(self, dimensions: int = 1536) -> None:
         self.dimensions = dimensions
 
-    def embed(self, texts: list[str]) -> list[list[float]]:
+    def embed(
+        self,
+        texts: list[str],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> list[list[float]]:
+        del timeout_seconds
         vectors: list[list[float]] = []
         for text in texts:
             digest = hashlib.sha256(text.encode("utf-8")).digest()

@@ -9,7 +9,12 @@ from urllib.parse import unquote, urlsplit
 
 from nptu_assistant.crawlers.adapters.nptu_site import NptuSitePage
 from nptu_assistant.crawlers.config import SiteSearchScoringWeights
-from nptu_assistant.crawlers.site_models import CandidatePage, SearchPlan
+from nptu_assistant.crawlers.site_models import (
+    CandidatePage,
+    SearchDeadline,
+    SearchDeadlineExceeded,
+    SearchPlan,
+)
 from nptu_assistant.providers.protocols import EmbeddingProvider
 
 
@@ -90,6 +95,8 @@ class CandidateScorer(Protocol):
         plan: SearchPlan,
         candidates: Sequence[CandidatePage],
         pages: Sequence[NptuSitePage],
+        *,
+        deadline: SearchDeadline | None = None,
     ) -> list[float]: ...
 
 
@@ -108,7 +115,7 @@ class HybridCandidateScorer:
         self._batch_size = batch_size
 
     def score_candidate(self, plan: SearchPlan, candidate: CandidatePage) -> float:
-        queries = (plan.query, *plan.search_queries)
+        queries = plan.retrieval_queries
         url_text = unquote(urlsplit(candidate.url).path)
         values = {
             "phrase": _phrase_score(queries, f"{candidate.anchor_text} {url_text}"),
@@ -141,11 +148,13 @@ class HybridCandidateScorer:
         plan: SearchPlan,
         candidates: Sequence[CandidatePage],
         pages: Sequence[NptuSitePage],
+        *,
+        deadline: SearchDeadline | None = None,
     ) -> list[float]:
         if len(candidates) != len(pages):
             raise ValueError("候選頁面與已擷取頁面數量不一致")
-        semantic_scores = self._semantic_scores(plan, pages)
-        queries = (plan.query, *plan.search_queries)
+        semantic_scores = self._semantic_scores(plan, pages, deadline=deadline)
+        queries = plan.retrieval_queries
         positive_weight = (
             self._weights.phrase
             + self._weights.title
@@ -211,6 +220,8 @@ class HybridCandidateScorer:
         self,
         plan: SearchPlan,
         pages: Sequence[NptuSitePage],
+        *,
+        deadline: SearchDeadline | None = None,
     ) -> list[float]:
         if not pages:
             return []
@@ -219,10 +230,19 @@ class HybridCandidateScorer:
             for page in pages
         ]
         try:
+            if deadline is not None:
+                deadline.raise_if_expired()
             first_page_count = max(0, self._batch_size - 1)
             first_vectors = self._embedding_provider.embed(
-                [plan.semantic_text, *page_texts[:first_page_count]]
+                [plan.semantic_text, *page_texts[:first_page_count]],
+                timeout_seconds=(
+                    deadline.remaining_seconds() if deadline is not None else None
+                ),
             )
+            if deadline is not None:
+                deadline.raise_if_expired()
+        except SearchDeadlineExceeded:
+            raise
         except Exception:
             return [0.0 for _page in pages]
         if not first_vectors:
@@ -231,11 +251,22 @@ class HybridCandidateScorer:
         page_vectors = list(first_vectors[1:])
         try:
             for start in range(first_page_count, len(page_texts), self._batch_size):
+                if deadline is not None:
+                    deadline.raise_if_expired()
                 page_vectors.extend(
                     self._embedding_provider.embed(
-                        page_texts[start : start + self._batch_size]
+                        page_texts[start : start + self._batch_size],
+                        timeout_seconds=(
+                            deadline.remaining_seconds()
+                            if deadline is not None
+                            else None
+                        ),
                     )
                 )
+                if deadline is not None:
+                    deadline.raise_if_expired()
+        except SearchDeadlineExceeded:
+            raise
         except Exception:
             return [0.0 for _page in pages]
         if len(page_vectors) != len(page_texts):

@@ -14,8 +14,15 @@ from nptu_assistant.crawlers.config import (
 )
 from nptu_assistant.crawlers.refresh import RefreshResult
 from nptu_assistant.crawlers.resolution import UnitSourceResolver
-from nptu_assistant.crawlers.site_models import SearchDiagnostics, SearchPlan
-from nptu_assistant.crawlers.site_search import SitePageIngestionResult
+from nptu_assistant.crawlers.site_models import (
+    SearchDeadline,
+    SearchDiagnostics,
+    SearchPlan,
+)
+from nptu_assistant.crawlers.site_search import (
+    SITE_SEARCH_FAILURE_WARNING,
+    SitePageIngestionResult,
+)
 from nptu_assistant.rag.models import Evidence
 from nptu_assistant.rag.tools import (
     AnnouncementSort,
@@ -53,6 +60,10 @@ class StubRetriever:
 
     def search_documents(self, **kwargs: object) -> list[Evidence]:
         self.calls.append(("search_documents", kwargs))
+        return []
+
+    def search_documents_with_plan(self, **kwargs: object) -> list[Evidence]:
+        self.calls.append(("search_documents_with_plan", kwargs))
         return []
 
     def get_announcement(self, announcement_id: str) -> Evidence | None:
@@ -115,6 +126,10 @@ class DocumentSequenceRetriever(StubRetriever):
         self.calls.append(("search_documents", kwargs))
         return self.responses.pop(0)
 
+    def search_documents_with_plan(self, **kwargs: object) -> list[Evidence]:
+        self.calls.append(("search_documents_with_plan", kwargs))
+        return self.responses.pop(0)
+
 
 class StubSitePageIngestor:
     def __init__(self, *, search_live: bool) -> None:
@@ -132,6 +147,21 @@ class StubSitePageIngestor:
             IngestionSummary(created=1),
             None,
             SearchDiagnostics(relevant_success_count=1),
+        )
+
+
+class TimedOutSitePageIngestor(StubSitePageIngestor):
+    def __init__(self) -> None:
+        super().__init__(search_live=True)
+
+    def ingest(self, plan: SearchPlan, *, max_items: int) -> SitePageIngestionResult:
+        assert max_items == plan.limit
+        self.plans.append(plan)
+        return SitePageIngestionResult(
+            IngestionSummary(),
+            SITE_SEARCH_FAILURE_WARNING,
+            SearchDiagnostics(query_timed_out=True),
+            SearchDeadline(expires_at=0.0, _clock=lambda: 1.0),
         )
 
 
@@ -318,9 +348,13 @@ def test_document_search_uses_reliable_database_results_before_live_discovery() 
 
     assert result.evidence == [cached]
     assert ingestor.plans == []
-    assert retriever.calls == [
-        ("search_documents", {"query": arguments["query"], "limit": 6})
-    ]
+    assert len(retriever.calls) == 1
+    name, kwargs = retriever.calls[0]
+    assert name == "search_documents_with_plan"
+    assert kwargs == {
+        "plan": SearchDocumentsArguments.model_validate(arguments),
+        "limit": 6,
+    }
 
 
 def test_document_search_runs_one_live_plan_then_reranks_database_results() -> None:
@@ -352,9 +386,35 @@ def test_document_search_runs_one_live_plan_then_reranks_database_results() -> N
     assert len(ingestor.plans) == 1
     assert ingestor.plans[0].search_queries == arguments["search_queries"]
     assert [call[0] for call in retriever.calls] == [
-        "search_documents",
-        "search_documents",
+        "search_documents_with_plan",
+        "search_documents_with_plan",
     ]
+    assert all(
+        call[1]["plan"].search_queries == arguments["search_queries"]
+        for call in retriever.calls
+    )
+
+
+def test_document_search_does_not_refresh_database_after_live_deadline() -> None:
+    retriever = DocumentSequenceRetriever([[]])
+    ingestor = TimedOutSitePageIngestor()
+    executor = ToolExecutor(retriever, site_page_ingestor=ingestor)
+    arguments = {
+        "query": "校務資訊完整查詢",
+        "search_queries": ["校務資料", "官方資訊"],
+        "concepts": ["校務", "官方資料"],
+        "limit": 6,
+    }
+
+    result = executor.execute(
+        "search_documents",
+        json.dumps(arguments, ensure_ascii=False),
+    )
+
+    assert result.evidence == []
+    assert len(retriever.calls) == 1
+    assert retriever.calls[0][0] == "search_documents_with_plan"
+    assert json.loads(result.output)["warning"] == SITE_SEARCH_FAILURE_WARNING
 
 
 def test_executor_ingests_keyword_before_database_search_and_normalizes_filters() -> (

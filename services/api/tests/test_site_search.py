@@ -7,6 +7,7 @@ import pytest
 
 from nptu_assistant.crawlers.adapters.nptu_site import NptuSitePageAdapter
 from nptu_assistant.crawlers.config import SiteSearchConfig, load_keyword_search_config
+from nptu_assistant.crawlers.site_models import SearchDeadline
 from nptu_assistant.crawlers.site_search import (
     NptuSiteSearchService,
     SitePageIngestionService,
@@ -82,7 +83,15 @@ class MappingHttpClient:
         self.pages = pages
         self.calls: list[tuple[str, tuple[str, ...]]] = []
 
-    def get(self, url: str, *, allowed_hosts: list[str] | None = None) -> str:
+    def get(
+        self,
+        url: str,
+        *,
+        allowed_hosts: list[str] | None = None,
+        timeout_seconds: float | None = None,
+        deadline: SearchDeadline | None = None,
+    ) -> str:
+        del timeout_seconds, deadline
         self.calls.append((url, tuple(allowed_hosts or ())))
         return self.pages[url]
 

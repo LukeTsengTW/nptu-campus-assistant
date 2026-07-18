@@ -37,6 +37,15 @@ class Responses:
         return self.response
 
 
+class Embeddings:
+    def __init__(self) -> None:
+        self.captured: dict[str, object] = {}
+
+    def create(self, **kwargs: object) -> object:
+        self.captured.update(kwargs)
+        return SimpleNamespace(data=[SimpleNamespace(index=0, embedding=[0.25, 0.75])])
+
+
 def client_with(responses: Responses) -> object:
     return SimpleNamespace(responses=responses, embeddings=SimpleNamespace())
 
@@ -46,6 +55,20 @@ def test_fake_embedding_is_deterministic_and_has_requested_dimensions() -> None:
 
     assert provider.embed(["測試"])[0] == provider.embed(["測試"])[0]
     assert len(provider.embed(["測試"])[0]) == 8
+
+
+def test_openai_embedding_uses_remaining_search_deadline_timeout() -> None:
+    embeddings = Embeddings()
+    provider = OpenAIEmbeddingProvider(
+        SimpleNamespace(embeddings=embeddings),
+        "text-embedding-3-small",
+        dimensions=2,
+    )
+
+    vectors = provider.embed(["校務資訊"], timeout_seconds=2.5)
+
+    assert vectors == [[0.25, 0.75]]
+    assert embeddings.captured["timeout"] == 2.5
 
 
 def test_fake_llm_runs_a_deterministic_tool_then_grounded_answer() -> None:

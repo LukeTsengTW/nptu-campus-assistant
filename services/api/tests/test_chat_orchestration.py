@@ -77,6 +77,17 @@ class StubRetriever:
         self.calls.append(("search_documents", (query, limit)))
         return list(self.by_tool.get("search_documents", []))  # type: ignore[arg-type]
 
+    def search_documents_with_plan(
+        self,
+        *,
+        plan: object,
+        limit: int,
+        deadline: object | None = None,
+    ) -> list[Evidence]:
+        del deadline
+        self.calls.append(("search_documents", (getattr(plan, "query"), limit)))
+        return list(self.by_tool.get("search_documents", []))  # type: ignore[arg-type]
+
     def get_announcement(self, announcement_id: str) -> Evidence | None:
         self.calls.append(("get_announcement", announcement_id))
         value = self.by_tool.get("get_announcement")

@@ -42,8 +42,13 @@ from nptu_assistant.rag.service import ChatService, LlmProvider
 
 
 class UnavailableEmbeddingProvider:
-    def embed(self, texts: list[str]) -> list[list[float]]:
-        del texts
+    def embed(
+        self,
+        texts: list[str],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> list[list[float]]:
+        del texts, timeout_seconds
         raise AppError(
             "embedding_provider_unavailable",
             "目前未設定向量服務。",

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from collections.abc import Collection
+from collections.abc import Callable, Collection
 from dataclasses import dataclass, replace
 from datetime import date
 import heapq
 import time
 from typing import Protocol
 from urllib.parse import urlsplit
+
+from pydantic import HttpUrl
 
 from nptu_assistant.api.schemas import IngestionSummary
 from nptu_assistant.core.security import canonicalize_nptu_url, is_allowed_source_url
@@ -16,6 +18,8 @@ from nptu_assistant.crawlers.config import SiteSearchConfig
 from nptu_assistant.crawlers.site_discovery import SiteDiscovery
 from nptu_assistant.crawlers.site_models import (
     CandidatePage,
+    SearchDeadline,
+    SearchDeadlineExceeded,
     SearchDiagnostics,
     SearchPlan,
 )
@@ -33,7 +37,14 @@ SITE_SEARCH_FAILURE_WARNING = (
 
 
 class SiteSearchHttpClient(Protocol):
-    def get(self, url: str, *, allowed_hosts: Collection[str] | None = None) -> str: ...
+    def get(
+        self,
+        url: str,
+        *,
+        allowed_hosts: Collection[str] | None = None,
+        timeout_seconds: float | None = None,
+        deadline: SearchDeadline | None = None,
+    ) -> str: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,26 +54,25 @@ class SiteSearchResult:
 
     @property
     def visited_count(self) -> int:
-        return (
-            self.diagnostics.fetched_count
-            + self.diagnostics.relevant_failure_count
-            + self.diagnostics.unrelated_failure_count
-        )
+        return self.diagnostics.visited_count
 
     @property
     def failed_count(self) -> int:
-        return (
-            self.diagnostics.relevant_failure_count
-            + self.diagnostics.unrelated_failure_count
-        )
+        return self.diagnostics.failed_count
 
     @property
     def query_relevant_failed_count(self) -> int:
-        return self.diagnostics.relevant_failure_count
+        return self.diagnostics.query_relevant_failed_count
 
 
 class _ZeroEmbeddingProvider:
-    def embed(self, texts: list[str]) -> list[list[float]]:
+    def embed(
+        self,
+        texts: list[str],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> list[list[float]]:
+        del timeout_seconds
         return [[0.0] for _text in texts]
 
 
@@ -74,6 +84,7 @@ class NptuSiteSearchService:
         adapter: NptuSitePageAdapter | None = None,
         scorer: CandidateScorer | None = None,
         discovery: SiteDiscovery | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if not config.enabled:
             raise ValueError("NPTU 網域搜尋設定尚未啟用")
@@ -85,6 +96,7 @@ class NptuSiteSearchService:
             _ZeroEmbeddingProvider(),
         )
         self._discovery = discovery
+        self._clock = clock
         self._result_cache: dict[
             tuple[str, tuple[str, ...], tuple[str, ...], int, bool],
             tuple[float, SiteSearchResult],
@@ -95,13 +107,21 @@ class NptuSiteSearchService:
     def config(self) -> SiteSearchConfig:
         return self._config
 
+    def new_deadline(self) -> SearchDeadline:
+        return SearchDeadline.after(
+            self._config.query_timeout_seconds,
+            clock=self._clock,
+        )
+
     def search(
         self,
         plan: SearchPlan | str,
         *,
         max_items: int | None = None,
         use_discovery: bool = True,
+        deadline: SearchDeadline | None = None,
     ) -> SiteSearchResult:
+        search_deadline = deadline or self.new_deadline()
         requested_limit = self._config.max_items if max_items is None else max_items
         limit = min(requested_limit, self._config.max_items)
         search_plan = (
@@ -109,7 +129,7 @@ class NptuSiteSearchService:
         )
         if search_plan.limit != limit:
             search_plan = search_plan.model_copy(update={"limit": limit})
-        now = time.monotonic()
+        now = self._clock()
         cache_key = (*search_plan.cache_key, use_discovery)
         cached_result = self._result_cache.get(cache_key)
         if (
@@ -126,31 +146,39 @@ class NptuSiteSearchService:
         pages: list[NptuSitePage] = []
         candidates: list[CandidatePage] = []
         preliminary_scores: list[float] = []
-        failed_scores: list[float] = []
+        fetch_failure_scores: list[float] = []
+        timed_out_scores: list[float] = []
+        skipped_candidate_count = 0
+        query_timed_out = False
         pages_per_host: dict[str, int] = {}
         sequence = 0
 
         def enqueue(candidate: CandidatePage) -> None:
-            nonlocal sequence
+            nonlocal sequence, skipped_candidate_count
             try:
                 url = canonicalize_nptu_url(candidate.url)
             except ValueError:
+                skipped_candidate_count += 1
                 return
             if (
                 url in visited
                 or not is_allowed_source_url(url, self._config.allowed_hosts)
                 or not self._adapter.is_crawlable_url(url)
             ):
+                skipped_candidate_count += 1
                 return
             normalized_candidate = replace(candidate, url=url)
             relevance = self._scorer.score_candidate(search_plan, normalized_candidate)
             current_score = queued_scores.get(url)
-            if current_score is not None and current_score >= relevance:
-                return
+            if current_score is not None:
+                skipped_candidate_count += 1
+                if current_score >= relevance:
+                    return
             if (
                 url not in discovered_urls
                 and len(discovered_urls) >= self._config.max_candidate_urls
             ):
+                skipped_candidate_count += 1
                 return
             discovered_urls.add(url)
             queued_scores[url] = relevance
@@ -162,9 +190,11 @@ class NptuSiteSearchService:
 
         if use_discovery and self._discovery is not None:
             try:
+                search_deadline.raise_if_expired()
                 for item in self._discovery.discover(
                     search_plan,
                     max_items=self._config.max_candidate_urls,
+                    deadline=search_deadline,
                 ):
                     enqueue(
                         CandidatePage(
@@ -173,15 +203,17 @@ class NptuSiteSearchService:
                             discovery_relevance=item.relevance,
                         )
                     )
+            except SearchDeadlineExceeded:
+                query_timed_out = True
             except Exception:
                 pass
         for seed_url in self._config.seed_urls:
             enqueue(CandidatePage(seed_url))
 
-        started_at = time.monotonic()
         while queue and len(visited) < self._config.max_pages:
-            if time.monotonic() - started_at >= self._config.query_timeout_seconds:
-                failed_scores.extend(-item[0] for item in queue)
+            if search_deadline.expired():
+                query_timed_out = True
+                timed_out_scores.extend(queued_scores.values())
                 break
             priority, _sequence, candidate = heapq.heappop(queue)
             relevance = -priority
@@ -190,9 +222,11 @@ class NptuSiteSearchService:
                 continue
             queued_scores.pop(url, None)
             if url in visited:
+                skipped_candidate_count += 1
                 continue
             host = urlsplit(url).hostname or ""
             if pages_per_host.get(host, 0) >= self._config.max_pages_per_host:
+                skipped_candidate_count += 1
                 continue
             visited.add(url)
             pages_per_host[host] = pages_per_host.get(host, 0) + 1
@@ -201,22 +235,33 @@ class NptuSiteSearchService:
                 if (
                     cached_page is not None
                     and self._config.cache_ttl_seconds
-                    and time.monotonic() - cached_page[0]
-                    <= self._config.cache_ttl_seconds
+                    and self._clock() - cached_page[0] <= self._config.cache_ttl_seconds
                 ):
                     page = cached_page[1]
                 else:
                     get_html = getattr(self._http, "get_html", self._http.get)
-                    content = get_html(url, allowed_hosts=self._config.allowed_hosts)
+                    content = get_html(
+                        url,
+                        allowed_hosts=self._config.allowed_hosts,
+                        timeout_seconds=search_deadline.remaining_seconds(),
+                        deadline=search_deadline,
+                    )
+                    search_deadline.raise_if_expired()
                     page = self._adapter.parse_page(
                         content,
                         url,
                         allowed_hosts=self._config.allowed_hosts,
                     )
+                    search_deadline.raise_if_expired()
                     if self._config.cache_ttl_seconds:
-                        self._page_cache[url] = (time.monotonic(), page)
+                        self._page_cache[url] = (self._clock(), page)
+            except SearchDeadlineExceeded:
+                query_timed_out = True
+                timed_out_scores.append(relevance)
+                timed_out_scores.extend(queued_scores.values())
+                break
             except Exception:
-                failed_scores.append(relevance)
+                fetch_failure_scores.append(relevance)
                 continue
 
             pages.append(page)
@@ -260,7 +305,20 @@ class NptuSiteSearchService:
             ):
                 break
 
-        scores = self._scorer.score_pages(search_plan, candidates, pages)
+        if queue and not query_timed_out:
+            skipped_candidate_count += len(queued_scores)
+        try:
+            search_deadline.raise_if_expired()
+            scores = self._scorer.score_pages(
+                search_plan,
+                candidates,
+                pages,
+                deadline=search_deadline,
+            )
+            search_deadline.raise_if_expired()
+        except SearchDeadlineExceeded:
+            query_timed_out = True
+            scores = preliminary_scores
         scored_pages = [
             replace(page, score=score)
             for page, score in zip(pages, scores, strict=True)
@@ -280,24 +338,31 @@ class NptuSiteSearchService:
         )
         relevant_failed_scores = [
             score
-            for score in failed_scores
+            for score in fetch_failure_scores
             if score >= self._config.relevance_threshold
         ]
         unrelated_failed_scores = [
-            score for score in failed_scores if score < self._config.relevance_threshold
+            score
+            for score in fetch_failure_scores
+            if score < self._config.relevance_threshold
         ]
+        relevant_success_scores = [page.score for page in relevant_pages]
         diagnostics = SearchDiagnostics(
             discovered_count=len(discovered_urls),
             fetched_count=len(pages),
             relevant_success_count=len(relevant_pages),
-            relevant_failure_count=len(relevant_failed_scores),
-            unrelated_failure_count=len(unrelated_failed_scores),
-            highest_success_score=max(scores, default=None),
-            highest_failed_score=max(relevant_failed_scores, default=None),
+            relevant_fetch_failure_count=len(relevant_failed_scores),
+            unrelated_fetch_failure_count=len(unrelated_failed_scores),
+            timed_out_candidate_count=len(timed_out_scores),
+            skipped_candidate_count=skipped_candidate_count,
+            query_timed_out=query_timed_out,
+            highest_success_score=max(relevant_success_scores, default=None),
+            highest_fetch_failure_score=max(relevant_failed_scores, default=None),
+            highest_unattempted_score=max(timed_out_scores, default=None),
         )
         result = SiteSearchResult(tuple(relevant_pages[:limit]), diagnostics)
-        if self._config.cache_ttl_seconds:
-            self._result_cache[cache_key] = (time.monotonic(), result)
+        if self._config.cache_ttl_seconds and not query_timed_out:
+            self._result_cache[cache_key] = (self._clock(), result)
         return result
 
 
@@ -326,6 +391,7 @@ class SitePageIngestionResult:
     summary: IngestionSummary
     warning: str | None
     diagnostics: SearchDiagnostics = SearchDiagnostics()
+    deadline: SearchDeadline | None = None
 
 
 class SitePageIngestionService:
@@ -356,21 +422,39 @@ class SitePageIngestionService:
         *,
         max_items: int,
     ) -> SitePageIngestionResult:
-        search_result = self._search.search(plan, max_items=max_items)
+        deadline = self._search.new_deadline()
+        search_result = self._search.search(
+            plan,
+            max_items=max_items,
+            deadline=deadline,
+        )
+        diagnostics = search_result.diagnostics
         summary = IngestionSummary()
         prepared: list[tuple[NptuSitePage, str, str, list[TextChunk]]] = []
         for page in search_result.pages:
             try:
+                deadline.raise_if_expired()
                 raw_text = page.body.strip()
                 if not raw_text:
                     summary.skipped += 1
                     continue
                 digest = content_hash(raw_text)
-                if self._repository.has_hash(page.canonical_url, digest):
+                already_stored = self._repository.has_hash(page.canonical_url, digest)
+                deadline.raise_if_expired()
+                if already_stored:
                     summary.skipped += 1
                     continue
                 chunks = chunk_text(raw_text)
+                deadline.raise_if_expired()
                 prepared.append((page, raw_text, digest, chunks))
+            except SearchDeadlineExceeded:
+                diagnostics = replace(diagnostics, query_timed_out=True)
+                return SitePageIngestionResult(
+                    summary,
+                    self._warning_for(diagnostics),
+                    diagnostics,
+                    deadline,
+                )
             except Exception as exc:
                 summary.failed += 1
                 summary.errors.append(f"{page.canonical_url}: {type(exc).__name__}")
@@ -383,12 +467,32 @@ class SitePageIngestionService:
         all_embeddings: list[list[float]] = []
         try:
             for start in range(0, len(chunk_texts), self._config.embedding_batch_size):
+                deadline.raise_if_expired()
                 all_embeddings.extend(
                     self._embedding_provider.embed(
-                        chunk_texts[start : start + self._config.embedding_batch_size]
+                        chunk_texts[start : start + self._config.embedding_batch_size],
+                        timeout_seconds=deadline.remaining_seconds(),
                     )
                 )
+                deadline.raise_if_expired()
+            deadline.raise_if_expired()
+        except SearchDeadlineExceeded:
+            diagnostics = replace(diagnostics, query_timed_out=True)
+            return SitePageIngestionResult(
+                summary,
+                self._warning_for(diagnostics),
+                diagnostics,
+                deadline,
+            )
         except Exception as exc:
+            if deadline.expired():
+                diagnostics = replace(diagnostics, query_timed_out=True)
+                return SitePageIngestionResult(
+                    summary,
+                    self._warning_for(diagnostics),
+                    diagnostics,
+                    deadline,
+                )
             summary.failed += len(prepared)
             summary.errors.extend(
                 f"{page.canonical_url}: {type(exc).__name__}"
@@ -397,12 +501,14 @@ class SitePageIngestionService:
             return SitePageIngestionResult(
                 summary,
                 SITE_SEARCH_FAILURE_WARNING,
-                search_result.diagnostics,
+                diagnostics,
+                deadline,
             )
 
         embedding_offset = 0
         for page, raw_text, digest, chunks in prepared:
             try:
+                deadline.raise_if_expired()
                 embeddings = all_embeddings[
                     embedding_offset : embedding_offset + len(chunks)
                 ]
@@ -411,7 +517,7 @@ class SitePageIngestionService:
                     raise ValueError("頁面分塊與 embedding 數量不一致")
                 metadata = DocumentMetadata(
                     title=page.title,
-                    source_url=page.canonical_url,
+                    source_url=HttpUrl(page.canonical_url),
                     unit=self._config.unit,
                     published_at=page.published_at,
                     effective_from=page.published_at or date.today(),
@@ -420,11 +526,14 @@ class SitePageIngestionService:
                 )
                 self._repository.save(metadata, raw_text, chunks, embeddings)
                 summary.created += 1
+                deadline.raise_if_expired()
+            except SearchDeadlineExceeded:
+                diagnostics = replace(diagnostics, query_timed_out=True)
+                break
             except Exception as exc:
                 summary.failed += 1
                 summary.errors.append(f"{page.canonical_url}: {type(exc).__name__}")
 
-        diagnostics = search_result.diagnostics
         warning = self._warning_for(diagnostics)
         if summary.failed:
             warning = (
@@ -432,20 +541,35 @@ class SitePageIngestionService:
                 if summary.created == 0 and summary.skipped == 0
                 else SITE_SEARCH_PARTIAL_WARNING
             )
-        return SitePageIngestionResult(summary, warning, diagnostics)
+        return SitePageIngestionResult(summary, warning, diagnostics, deadline)
 
     def _warning_for(self, diagnostics: SearchDiagnostics) -> str | None:
         if diagnostics.relevant_success_count == 0:
             return (
                 SITE_SEARCH_FAILURE_WARNING
-                if diagnostics.relevant_failure_count
+                if diagnostics.relevant_fetch_failure_count
+                or diagnostics.query_timed_out
                 else None
             )
         highest_success = diagnostics.highest_success_score or 0.0
-        highest_failed = diagnostics.highest_failed_score
+        success_is_sufficient = (
+            diagnostics.relevant_success_count >= self._config.early_stop_min_results
+            and highest_success >= self._config.high_confidence_score
+        )
+        if success_is_sufficient:
+            return None
+        highest_failed = diagnostics.highest_fetch_failure_score
         if (
             highest_failed is not None
             and highest_failed > highest_success + self._config.failure_warning_margin
+        ):
+            return SITE_SEARCH_PARTIAL_WARNING
+        highest_unattempted = diagnostics.highest_unattempted_score
+        if (
+            diagnostics.query_timed_out
+            and highest_unattempted is not None
+            and highest_unattempted
+            > highest_success + self._config.failure_warning_margin
         ):
             return SITE_SEARCH_PARTIAL_WARNING
         return None

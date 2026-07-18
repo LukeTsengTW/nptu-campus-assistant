@@ -8,6 +8,10 @@ import pytest
 from nptu_assistant.crawlers.http import CrawlHttpClient
 from nptu_assistant.crawlers.models import AnnouncementCandidate
 from nptu_assistant.crawlers.service import CrawlerService
+from nptu_assistant.crawlers.site_models import (
+    SearchDeadline,
+    SearchDeadlineExceeded,
+)
 from nptu_assistant.ingestion.cleaning import content_hash
 from nptu_assistant.ingestion.service import DocumentIngestionService
 from nptu_assistant.providers.fake import FakeEmbeddingProvider
@@ -304,6 +308,56 @@ def test_http_client_checks_robots_and_retries_twice() -> None:
         client.close()
 
     assert attempts["listing"] == 3
+
+
+def test_http_client_caps_request_retry_and_backoff_by_remaining_deadline() -> None:
+    class FakeClock:
+        def __init__(self) -> None:
+            self.value = 0.0
+            self.sleeps: list[float] = []
+
+        def __call__(self) -> float:
+            return self.value
+
+        def advance(self, seconds: float) -> None:
+            self.value += seconds
+
+        def sleep(self, seconds: float) -> None:
+            self.sleeps.append(seconds)
+            self.advance(seconds)
+
+    clock = FakeClock()
+    attempts = {"listing": 0}
+    request_timeouts: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/robots.txt":
+            return httpx.Response(200, text="User-agent: *\nAllow: /", request=request)
+        attempts["listing"] += 1
+        request_timeouts.append(request.extensions["timeout"]["read"])
+        clock.advance(0.75)
+        return httpx.Response(503, text="retry", request=request)
+
+    client = CrawlHttpClient(
+        "NPTU-Test/1.0",
+        timeout_seconds=15,
+        interval_seconds=0,
+        sleep=clock.sleep,
+        clock=clock,
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        with pytest.raises(SearchDeadlineExceeded):
+            client.get(
+                "https://www.nptu.edu.tw/list",
+                deadline=SearchDeadline.after(1.0, clock=clock),
+            )
+    finally:
+        client.close()
+
+    assert attempts["listing"] == 1
+    assert request_timeouts == [pytest.approx(1.0)]
+    assert clock.sleeps == [pytest.approx(0.25)]
 
 
 @pytest.mark.parametrize(

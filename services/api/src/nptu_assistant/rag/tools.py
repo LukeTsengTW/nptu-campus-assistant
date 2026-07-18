@@ -21,7 +21,11 @@ from nptu_assistant.crawlers.site_search import (
     ScoredEvidence,
     SitePageIngestionResult,
 )
-from nptu_assistant.crawlers.site_models import SearchPlan
+from nptu_assistant.crawlers.site_models import (
+    SearchDeadline,
+    SearchDeadlineExceeded,
+    SearchPlan,
+)
 from nptu_assistant.rag.models import Evidence
 
 
@@ -158,6 +162,14 @@ class StructuredRetriever(Protocol):
     ) -> list[Evidence]: ...
 
     def search_documents(self, *, query: str, limit: int) -> list[Evidence]: ...
+
+    def search_documents_with_plan(
+        self,
+        *,
+        plan: SearchPlan,
+        limit: int,
+        deadline: SearchDeadline | None = None,
+    ) -> list[Evidence]: ...
 
     def get_announcement(self, announcement_id: str) -> Evidence | None: ...
 
@@ -409,8 +421,8 @@ class ToolExecutor:
         self,
         parsed: SearchDocumentsArguments,
     ) -> tuple[list[Evidence], str | None]:
-        cached = self._retriever.search_documents(
-            query=parsed.query,
+        cached = self._retriever.search_documents_with_plan(
+            plan=parsed,
             limit=parsed.limit,
         )
         if (
@@ -425,10 +437,19 @@ class ToolExecutor:
             )
         except Exception:
             return cached, SITE_SEARCH_FAILURE_WARNING
-        refreshed = self._retriever.search_documents(
-            query=parsed.query,
-            limit=parsed.limit,
-        )
+        if ingestion.deadline is not None and ingestion.deadline.expired():
+            warning = ingestion.warning
+            if not cached and warning is None:
+                warning = SITE_SEARCH_FAILURE_WARNING
+            return cached, warning
+        try:
+            refreshed = self._retriever.search_documents_with_plan(
+                plan=parsed,
+                limit=parsed.limit,
+                deadline=ingestion.deadline,
+            )
+        except SearchDeadlineExceeded:
+            return cached, ingestion.warning or SITE_SEARCH_FAILURE_WARNING
         return refreshed or cached, ingestion.warning
 
     def execute(self, name: str, arguments: str) -> ToolExecutionResult:

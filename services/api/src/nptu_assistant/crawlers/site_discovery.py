@@ -9,18 +9,41 @@ from nptu_assistant.crawlers.adapters.nptu_search import (
     SearchForm,
 )
 from nptu_assistant.crawlers.config import KeywordSearchConfig, SiteSearchConfig
-from nptu_assistant.crawlers.site_models import DiscoveredPage, SearchPlan
+from nptu_assistant.crawlers.site_models import (
+    DiscoveredPage,
+    SearchDeadline,
+    SearchDeadlineExceeded,
+    SearchPlan,
+)
 
 
 class DiscoveryHttpClient(Protocol):
-    def get(self, url: str) -> str: ...
+    def get(
+        self,
+        url: str,
+        *,
+        timeout_seconds: float | None = None,
+        deadline: SearchDeadline | None = None,
+    ) -> str: ...
 
-    def submit_form(self, method: str, url: str, fields: Mapping[str, str]) -> str: ...
+    def submit_form(
+        self,
+        method: str,
+        url: str,
+        fields: Mapping[str, str],
+        *,
+        timeout_seconds: float | None = None,
+        deadline: SearchDeadline | None = None,
+    ) -> str: ...
 
 
 class SiteDiscovery(Protocol):
     def discover(
-        self, plan: SearchPlan, *, max_items: int
+        self,
+        plan: SearchPlan,
+        *,
+        max_items: int,
+        deadline: SearchDeadline,
     ) -> tuple[DiscoveredPage, ...]: ...
 
 
@@ -40,23 +63,35 @@ class NptuOfficialSearchDiscovery:
         self._adapter = adapter or NptuAssociationSearchAdapter()
 
     def discover(
-        self, plan: SearchPlan, *, max_items: int
+        self,
+        plan: SearchPlan,
+        *,
+        max_items: int,
+        deadline: SearchDeadline,
     ) -> tuple[DiscoveredPage, ...]:
+        deadline.raise_if_expired()
         limit = min(max_items, self._site_config.max_candidate_urls)
-        form: SearchForm | None = self._load_form()
+        form: SearchForm | None = self._load_form(deadline)
         discovered: dict[str, DiscoveredPage] = {}
-        for search_query in plan.search_queries:
+        for search_query in plan.retrieval_queries:
             for search_type in self._search_config.search_types:
+                deadline.raise_if_expired()
                 last_error: Exception | None = None
                 for _attempt in range(2):
+                    deadline.raise_if_expired()
                     try:
                         if form is None:
-                            form = self._load_form()
+                            form = self._load_form(deadline)
                         fields = dict(form.hidden_fields)
                         fields.update({"SchKey": search_query, "SchType": search_type})
                         content = self._http.submit_form(
-                            form.method, form.action_url, fields
+                            form.method,
+                            form.action_url,
+                            fields,
+                            timeout_seconds=deadline.remaining_seconds(),
+                            deadline=deadline,
                         )
+                        deadline.raise_if_expired()
                         results = self._adapter.parse_results(content, form.action_url)
                         form = self._adapter.parse_form(
                             content, self._search_config.url
@@ -85,6 +120,8 @@ class NptuOfficialSearchDiscovery:
                             if len(discovered) >= limit:
                                 return tuple(discovered.values())
                         break
+                    except SearchDeadlineExceeded:
+                        raise
                     except Exception as exc:
                         last_error = exc
                         form = None
@@ -92,13 +129,22 @@ class NptuOfficialSearchDiscovery:
                     continue
         return tuple(discovered.values())
 
-    def _load_form(self) -> SearchForm:
-        self._http.get(self._search_config.session_url)
+    def _load_form(self, deadline: SearchDeadline) -> SearchForm:
+        deadline.raise_if_expired()
+        self._http.get(
+            self._search_config.session_url,
+            timeout_seconds=deadline.remaining_seconds(),
+            deadline=deadline,
+        )
+        deadline.raise_if_expired()
         content = self._http.submit_form(
             self._search_config.bootstrap_method,
             self._search_config.bootstrap_url,
             {},
+            timeout_seconds=deadline.remaining_seconds(),
+            deadline=deadline,
         )
+        deadline.raise_if_expired()
         bootstrap = self._adapter.parse_bootstrap_form(
             content,
             self._search_config.bootstrap_url,

@@ -45,16 +45,30 @@ class OpenAIEmbeddingProvider:
         self._model = model
         self._dimensions = dimensions
 
-    def embed(self, texts: list[str]) -> list[list[float]]:
+    def embed(
+        self,
+        texts: list[str],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> list[list[float]]:
         if not texts:
             return []
+        effective_timeout = (
+            30.0 if timeout_seconds is None else min(30.0, timeout_seconds)
+        )
+        if effective_timeout <= 0:
+            raise AppError(
+                "embedding_provider_timeout",
+                "向量服務查詢時間已耗盡。",
+                status_code=504,
+            )
         try:
             response = self._client.embeddings.create(
                 model=self._model,
                 input=texts,
                 dimensions=self._dimensions,
                 encoding_format="float",
-                timeout=30.0,
+                timeout=effective_timeout,
             )
         except Exception as exc:
             raise AppError(
@@ -62,7 +76,10 @@ class OpenAIEmbeddingProvider:
                 "向量服務暫時無法使用。",
                 status_code=503,
             ) from exc
-        return [list(item.embedding) for item in sorted(response.data, key=lambda item: item.index)]
+        return [
+            list(item.embedding)
+            for item in sorted(response.data, key=lambda item: item.index)
+        ]
 
 
 class OpenAILlmProvider:

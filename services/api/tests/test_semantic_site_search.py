@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from datetime import date
+from collections.abc import Sequence
 
 import pytest
 
@@ -12,10 +13,17 @@ from nptu_assistant.crawlers.adapters.nptu_search import (
     BootstrapForm,
     SearchForm,
 )
+from nptu_assistant.crawlers.adapters.nptu_site import NptuSitePage
 from nptu_assistant.crawlers.site_discovery import NptuOfficialSearchDiscovery
-from nptu_assistant.crawlers.site_models import DiscoveredPage, SearchPlan
+from nptu_assistant.crawlers.site_models import (
+    CandidatePage,
+    DiscoveredPage,
+    SearchDeadline,
+    SearchPlan,
+)
 from nptu_assistant.crawlers.site_scoring import HybridCandidateScorer
 from nptu_assistant.crawlers.site_search import (
+    SITE_SEARCH_FAILURE_WARNING,
     SITE_SEARCH_PARTIAL_WARNING,
     NptuSiteSearchService,
     SitePageIngestionService,
@@ -40,7 +48,13 @@ class FixtureEmbeddingProvider:
             ("招生", "招生專區", "入學服務"),
         )
 
-    def embed(self, texts: list[str]) -> list[list[float]]:
+    def embed(
+        self,
+        texts: list[str],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> list[list[float]]:
+        del timeout_seconds
         self.calls.append(list(texts))
         return [
             [
@@ -51,12 +65,38 @@ class FixtureEmbeddingProvider:
         ]
 
 
+class ExpiringEmbeddingProvider(FixtureEmbeddingProvider):
+    def __init__(self, clock: "FakeClock", duration: float) -> None:
+        super().__init__()
+        self._clock = clock
+        self._duration = duration
+        self.timeouts: list[float | None] = []
+
+    def embed(
+        self,
+        texts: list[str],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> list[list[float]]:
+        self.timeouts.append(timeout_seconds)
+        self._clock.advance(self._duration)
+        return super().embed(texts, timeout_seconds=timeout_seconds)
+
+
 class MappingHttpClient:
     def __init__(self, pages: dict[str, str]) -> None:
         self.pages = pages
         self.calls: list[str] = []
 
-    def get(self, url: str, *, allowed_hosts: list[str] | None = None) -> str:
+    def get(
+        self,
+        url: str,
+        *,
+        allowed_hosts: list[str] | None = None,
+        timeout_seconds: float | None = None,
+        deadline: SearchDeadline | None = None,
+    ) -> str:
+        del timeout_seconds, deadline
         assert allowed_hosts == ["nptu.edu.tw"]
         self.calls.append(url)
         return self.pages[url]
@@ -68,22 +108,112 @@ class RecordingDiscovery:
         self.plans: list[SearchPlan] = []
 
     def discover(
-        self, plan: SearchPlan, *, max_items: int
+        self,
+        plan: SearchPlan,
+        *,
+        max_items: int,
+        deadline: SearchDeadline,
     ) -> tuple[DiscoveredPage, ...]:
+        deadline.raise_if_expired()
         self.plans.append(plan)
         return self.pages[:max_items]
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.value = 0.0
+
+    def __call__(self) -> float:
+        return self.value
+
+    def advance(self, seconds: float) -> None:
+        self.value += seconds
+
+    def sleep(self, seconds: float) -> None:
+        self.advance(seconds)
+
+
+class TimeoutDiscovery:
+    def __init__(self, clock: FakeClock, duration: float) -> None:
+        self._clock = clock
+        self._duration = duration
+
+    def discover(
+        self,
+        plan: SearchPlan,
+        *,
+        max_items: int,
+        deadline: SearchDeadline,
+    ) -> tuple[DiscoveredPage, ...]:
+        del plan, max_items
+        self._clock.advance(self._duration)
+        deadline.raise_if_expired()
+        return ()
+
+
+class DeterministicScorer:
+    def __init__(
+        self,
+        scores: dict[str, float],
+        *,
+        clock: FakeClock | None = None,
+        expire_after_page: str | None = None,
+        advance_seconds: float = 0.0,
+    ) -> None:
+        self._scores = scores
+        self._clock = clock
+        self._expire_after_page = expire_after_page
+        self._advance_seconds = advance_seconds
+        self._advanced = False
+
+    def score_candidate(self, plan: SearchPlan, candidate: CandidatePage) -> float:
+        del plan
+        if (
+            not self._advanced
+            and self._clock is not None
+            and candidate.url == self._expire_after_page
+            and "已取得頁面" in candidate.anchor_text
+        ):
+            self._clock.advance(self._advance_seconds)
+            self._advanced = True
+        return self._scores.get(candidate.url, 0.0)
+
+    def score_pages(
+        self,
+        plan: SearchPlan,
+        candidates: Sequence[CandidatePage],
+        pages: Sequence[NptuSitePage],
+        *,
+        deadline: SearchDeadline | None = None,
+    ) -> list[float]:
+        del plan, pages, deadline
+        return [self._scores.get(candidate.url, 0.0) for candidate in candidates]
 
 
 class DiscoveryHttpClient:
     def __init__(self) -> None:
         self.search_fields: list[dict[str, str]] = []
 
-    def get(self, url: str) -> str:
-        del url
+    def get(
+        self,
+        url: str,
+        *,
+        timeout_seconds: float | None = None,
+        deadline: SearchDeadline | None = None,
+    ) -> str:
+        del url, timeout_seconds, deadline
         return "session"
 
-    def submit_form(self, method: str, url: str, fields: dict[str, str]) -> str:
-        del method, url
+    def submit_form(
+        self,
+        method: str,
+        url: str,
+        fields: dict[str, str],
+        *,
+        timeout_seconds: float | None = None,
+        deadline: SearchDeadline | None = None,
+    ) -> str:
+        del method, url, timeout_seconds, deadline
         if fields:
             self.search_fields.append(fields)
             return "results"
@@ -277,12 +407,82 @@ def test_official_discovery_submits_plan_variants_and_filters_external_urls() ->
         concepts=["申請入學", "新生"],
     )
 
-    results = discovery.discover(search_plan, max_items=10)
+    results = discovery.discover(
+        search_plan,
+        max_items=10,
+        deadline=SearchDeadline.after(25),
+    )
 
     assert [item.url for item in results] == ["https://admission.nptu.edu.tw/apply"]
     assert {fields["SchKey"] for fields in http.search_fields} == set(
-        search_plan.search_queries
+        search_plan.retrieval_queries
     )
+
+
+def test_official_discovery_always_includes_standalone_query() -> None:
+    keyword_config = load_keyword_search_config(
+        WORKSPACE_ROOT / "data/sources/announcements.yaml"
+    )
+    assert keyword_config.site_search is not None
+    http = DiscoveryHttpClient()
+    discovery = NptuOfficialSearchDiscovery(
+        keyword_config,
+        keyword_config.site_search,
+        http,
+        adapter=DiscoveryAdapter(),  # type: ignore[arg-type]
+    )
+    search_plan = plan(
+        "個人申請新生入學與報到資訊",
+        variants=["大學申請入學", "新生報到"],
+        concepts=["個人申請", "申請入學", "新生", "報到"],
+    )
+
+    discovery.discover(
+        search_plan,
+        max_items=10,
+        deadline=SearchDeadline.after(25),
+    )
+
+    assert {fields["SchKey"] for fields in http.search_fields} == {
+        "個人申請新生入學與報到資訊",
+        "大學申請入學",
+        "新生報到",
+    }
+
+
+def test_official_discovery_normalizes_and_deduplicates_queries() -> None:
+    keyword_config = load_keyword_search_config(
+        WORKSPACE_ROOT / "data/sources/announcements.yaml"
+    )
+    assert keyword_config.site_search is not None
+    http = DiscoveryHttpClient()
+    discovery = NptuOfficialSearchDiscovery(
+        keyword_config,
+        keyword_config.site_search,
+        http,
+        adapter=DiscoveryAdapter(),  # type: ignore[arg-type]
+    )
+    search_plan = plan(
+        "個人申請 新生入學",
+        variants=[
+            "個人申請 新生入學",
+            "個人申請  新生入學",
+            "個人申請新生入學",
+        ],
+        concepts=["個人申請", "新生"],
+    )
+
+    discovery.discover(
+        search_plan,
+        max_items=10,
+        deadline=SearchDeadline.after(25),
+    )
+
+    submitted = [fields["SchKey"] for fields in http.search_fields]
+    assert search_plan.retrieval_queries == ("個人申請 新生入學",)
+    assert submitted == [
+        "個人申請 新生入學" for _search_type in keyword_config.search_types
+    ]
 
 
 def test_parent_relevance_reaches_target_through_keyword_free_navigation_page() -> None:
@@ -307,6 +507,161 @@ def test_parent_relevance_reaches_target_through_keyword_free_navigation_page() 
         page.canonical_url for page in result.pages
     ]
     assert "https://www.nptu.edu.tw/portal" in http.calls
+
+
+def test_discovery_deadline_stops_before_any_page_fetch() -> None:
+    clock = FakeClock()
+    current_config = config(query_timeout_seconds=1.0)
+    http = MappingHttpClient({ROOT_URL: "<main><h1>首頁</h1></main>"})
+    search = NptuSiteSearchService(
+        current_config,
+        http,
+        scorer=DeterministicScorer({ROOT_URL: 0.5}),
+        discovery=TimeoutDiscovery(clock, 1.1),
+        clock=clock,
+    )
+
+    result = SitePageIngestionService(
+        search,
+        MemoryDocumentRepository(),
+        FixtureEmbeddingProvider(),
+        current_config,
+    ).ingest(SearchPlan.from_query("校務資訊"), max_items=6)
+
+    assert http.calls == []
+    assert result.diagnostics.query_timed_out is True
+    assert result.diagnostics.timed_out_candidate_count == 1
+    assert result.diagnostics.relevant_fetch_failure_count == 0
+    assert result.warning == SITE_SEARCH_FAILURE_WARNING
+
+
+def test_timeout_queue_is_not_fetch_failure_after_high_confidence_success() -> None:
+    clock = FakeClock()
+    success_url = "https://www.nptu.edu.tw/success"
+    pending_url = "https://www.nptu.edu.tw/pending"
+    current_config = config(
+        query_timeout_seconds=1.0,
+        relevance_threshold=0.2,
+        high_confidence_score=0.8,
+        early_stop_min_results=1,
+    )
+    discovery = RecordingDiscovery(
+        (
+            DiscoveredPage(success_url, "高相關成功頁", 0.9),
+            DiscoveredPage(pending_url, "高相關待處理頁", 0.8),
+        )
+    )
+    http = MappingHttpClient(
+        {
+            success_url: (
+                "<main><h1>高可信校務資訊</h1><p>已取得頁面完整內容。</p></main>"
+            )
+        }
+    )
+    search = NptuSiteSearchService(
+        current_config,
+        http,
+        scorer=DeterministicScorer(
+            {success_url: 0.9, pending_url: 0.8, ROOT_URL: 0.1},
+            clock=clock,
+            expire_after_page=success_url,
+            advance_seconds=1.0,
+        ),
+        discovery=discovery,
+        clock=clock,
+    )
+
+    result = SitePageIngestionService(
+        search,
+        MemoryDocumentRepository(),
+        FixtureEmbeddingProvider(),
+        current_config,
+    ).ingest(SearchPlan.from_query("高可信校務資訊"), max_items=6)
+
+    assert http.calls == [success_url]
+    assert result.diagnostics.relevant_success_count == 1
+    assert result.diagnostics.timed_out_candidate_count >= 1
+    assert result.diagnostics.relevant_fetch_failure_count == 0
+    assert result.diagnostics.unrelated_fetch_failure_count == 0
+    assert result.warning is None
+
+
+def test_ingestion_embedding_batch_uses_same_live_search_deadline() -> None:
+    clock = FakeClock()
+    target_url = "https://www.nptu.edu.tw/target"
+    current_config = config(
+        query_timeout_seconds=1.0,
+        relevance_threshold=0.2,
+        high_confidence_score=0.8,
+        early_stop_min_results=1,
+    )
+    embedding = ExpiringEmbeddingProvider(clock, duration=1.1)
+    search = NptuSiteSearchService(
+        current_config,
+        MappingHttpClient(
+            {
+                target_url: (
+                    "<main><h1>校務資訊</h1><p>足以建立文件切片的完整官方內容。</p></main>"
+                )
+            }
+        ),
+        scorer=DeterministicScorer({target_url: 0.9, ROOT_URL: 0.0}),
+        discovery=RecordingDiscovery((DiscoveredPage(target_url, "校務資訊", 0.9),)),
+        clock=clock,
+    )
+    repository = MemoryDocumentRepository()
+
+    result = SitePageIngestionService(
+        search,
+        repository,
+        embedding,
+        current_config,
+    ).ingest(SearchPlan.from_query("校務資訊"), max_items=6)
+
+    assert result.summary.created == 0
+    assert result.diagnostics.query_timed_out is True
+    assert embedding.timeouts == [pytest.approx(1.0)]
+    assert repository.saved == []
+
+
+def test_actual_high_relevance_fetch_failure_emits_partial_warning() -> None:
+    failed_url = "https://www.nptu.edu.tw/high-failure"
+    weak_url = "https://www.nptu.edu.tw/weak-success"
+    current_config = config(
+        relevance_threshold=0.2,
+        high_confidence_score=0.8,
+        early_stop_min_results=2,
+    )
+    discovery = RecordingDiscovery(
+        (
+            DiscoveredPage(failed_url, "高相關候選", 0.9),
+            DiscoveredPage(weak_url, "較弱替代頁", 0.4),
+        )
+    )
+    http = MappingHttpClient(
+        {
+            weak_url: "<main><h1>替代資訊</h1><p>較弱但可用的官方內容。</p></main>",
+        }
+    )
+    search = NptuSiteSearchService(
+        current_config,
+        http,
+        scorer=DeterministicScorer({failed_url: 0.9, weak_url: 0.4, ROOT_URL: 0.0}),
+        discovery=discovery,
+    )
+
+    result = SitePageIngestionService(
+        search,
+        MemoryDocumentRepository(),
+        FixtureEmbeddingProvider(),
+        current_config,
+    ).ingest(SearchPlan.from_query("官方替代資訊"), max_items=6)
+
+    assert failed_url in http.calls
+    assert result.diagnostics.relevant_success_count == 1
+    assert result.diagnostics.relevant_fetch_failure_count == 1
+    assert result.diagnostics.timed_out_candidate_count == 0
+    assert result.warning == SITE_SEARCH_PARTIAL_WARNING
 
 
 def test_unrelated_failure_does_not_emit_partial_warning() -> None:
@@ -406,7 +761,8 @@ def test_successful_zero_result_is_not_reported_as_network_failure() -> None:
     assert result.summary.created == 0
     assert result.warning is None
     assert result.diagnostics.relevant_success_count == 0
-    assert result.diagnostics.relevant_failure_count == 0
+    assert result.diagnostics.relevant_fetch_failure_count == 0
+    assert result.diagnostics.query_timed_out is False
 
 
 def test_external_resources_and_fragment_duplicates_are_never_crawled() -> None:

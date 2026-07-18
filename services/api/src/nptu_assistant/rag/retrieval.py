@@ -3,11 +3,18 @@ from __future__ import annotations
 import uuid
 from collections import defaultdict
 from datetime import date
+from typing import cast
 
 from sqlalchemy import case, desc, func, literal, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from nptu_assistant.api.schemas import AnswerType
+from nptu_assistant.crawlers.site_models import (
+    SearchDeadline,
+    SearchDeadlineExceeded,
+    SearchPlan,
+    search_query_key,
+)
 from nptu_assistant.db.models import Announcement, Document, DocumentChunk, Source
 from nptu_assistant.providers.protocols import EmbeddingProvider
 from nptu_assistant.rag.models import Evidence
@@ -15,6 +22,12 @@ from nptu_assistant.rag.tools import AnnouncementSort
 
 
 FAILED_SEARCH_MIN_SIMILARITY = 0.1
+DOCUMENT_QUERY_CANDIDATE_LIMIT = 20
+DOCUMENT_RRF_K = 60
+DOCUMENT_RAW_SCORE_WEIGHT = 0.72
+DOCUMENT_RRF_SCORE_WEIGHT = 0.20
+DOCUMENT_CONCEPT_COVERAGE_WEIGHT = 0.06
+DOCUMENT_EXACT_TITLE_WEIGHT = 0.02
 
 
 def _public_announcement_source_filter() -> object:
@@ -39,70 +52,175 @@ class SqlRetriever:
         query = query.strip()
         if not query:
             raise ValueError("文件 query 不得為空")
+        return self.search_documents_with_plan(
+            plan=SearchPlan.from_query(query, limit=limit),
+            limit=limit,
+        )
+
+    def search_documents_with_plan(
+        self,
+        *,
+        plan: SearchPlan,
+        limit: int = 6,
+        deadline: SearchDeadline | None = None,
+    ) -> list[Evidence]:
         _validate_limit(limit)
-        vector = self._embedding_provider.embed([query])[0]
-        vector_score = (1 - DocumentChunk.embedding.cosine_distance(vector)).label("score")
-        keyword_score = func.greatest(
-            func.similarity(DocumentChunk.content, query),
-            func.similarity(Document.title, query),
-        ).label("score")
+        if deadline is not None:
+            deadline.raise_if_expired()
+        queries = plan.retrieval_queries
+        try:
+            vectors = self._embedding_provider.embed(
+                list(queries),
+                timeout_seconds=(deadline.remaining_seconds() if deadline else None),
+            )
+        except Exception as exc:
+            if deadline is not None and deadline.expired():
+                raise SearchDeadlineExceeded(
+                    "文件檢索 embedding 已耗盡網站搜尋時間額度"
+                ) from exc
+            raise
+        if deadline is not None:
+            deadline.raise_if_expired()
+        if len(vectors) != len(queries):
+            raise ValueError("文件查詢與 embedding 數量不一致")
         base_columns = (DocumentChunk, Document, Source)
+        ranked_rows: list[list[object]] = []
         with self._factory() as session:
-            vector_rows = session.execute(
-                select(*base_columns, vector_score)
-                .join(Document, Document.id == DocumentChunk.document_id)
-                .join(Source, Source.id == Document.source_id)
-                .where(Document.is_current.is_(True))
-                .order_by(desc("score"))
-                .limit(20)
-            ).all()
-            keyword_rows = session.execute(
-                select(*base_columns, keyword_score)
-                .join(Document, Document.id == DocumentChunk.document_id)
-                .join(Source, Source.id == Document.source_id)
-                .where(Document.is_current.is_(True))
-                .order_by(desc("score"))
-                .limit(20)
-            ).all()
-        return self._rrf_merge(vector_rows, keyword_rows, limit=limit)
+            for query, vector in zip(queries, vectors, strict=True):
+                if deadline is not None:
+                    deadline.raise_if_expired()
+                vector_score = (
+                    1 - DocumentChunk.embedding.cosine_distance(vector)
+                ).label("score")
+                keyword_score = func.greatest(
+                    func.similarity(DocumentChunk.content, query),
+                    func.similarity(Document.title, query),
+                ).label("score")
+                ranked_rows.append(
+                    list(
+                        session.execute(
+                            select(*base_columns, vector_score)
+                            .join(Document, Document.id == DocumentChunk.document_id)
+                            .join(Source, Source.id == Document.source_id)
+                            .where(Document.is_current.is_(True))
+                            .order_by(desc("score"))
+                            .limit(DOCUMENT_QUERY_CANDIDATE_LIMIT)
+                        ).all()
+                    )
+                )
+                if deadline is not None:
+                    deadline.raise_if_expired()
+                ranked_rows.append(
+                    list(
+                        session.execute(
+                            select(*base_columns, keyword_score)
+                            .join(Document, Document.id == DocumentChunk.document_id)
+                            .join(Source, Source.id == Document.source_id)
+                            .where(Document.is_current.is_(True))
+                            .order_by(desc("score"))
+                            .limit(DOCUMENT_QUERY_CANDIDATE_LIMIT)
+                        ).all()
+                    )
+                )
+                if deadline is not None:
+                    deadline.raise_if_expired()
+        return self._rrf_merge(
+            ranked_rows,
+            queries=queries,
+            concepts=tuple(plan.concepts),
+            limit=limit,
+        )
 
     @staticmethod
     def _rrf_merge(
-        vector_rows: list[object],
-        keyword_rows: list[object],
+        ranked_rows: list[list[object]],
         *,
+        queries: tuple[str, ...] = (),
+        concepts: tuple[str, ...] = (),
         limit: int = 6,
     ) -> list[Evidence]:
         ranks: dict[str, float] = defaultdict(float)
         raw_scores: dict[str, float] = defaultdict(float)
         records: dict[str, tuple[DocumentChunk, Document, Source]] = {}
-        for rows in (vector_rows, keyword_rows):
+        for rows in ranked_rows:
             for rank, row in enumerate(rows, start=1):
-                chunk, document, source, raw_score = row
+                chunk, document, source, raw_score = cast(
+                    tuple[DocumentChunk, Document, Source, float],
+                    row,
+                )
                 key = str(chunk.id)
                 records[key] = (chunk, document, source)
-                ranks[key] += 1.0 / (60 + rank)
+                ranks[key] += 1.0 / (DOCUMENT_RRF_K + rank)
                 raw_scores[key] = max(
                     raw_scores[key],
                     max(0.0, min(1.0, float(raw_score or 0.0))),
                 )
-        evidence = []
+        scored_records: list[tuple[float, str, Evidence]] = []
+        list_count = max(1, len(ranked_rows))
         for key, (chunk, document, source) in records.items():
-            rrf_component = min(1.0, ranks[key] * 30.0)
-            score = (raw_scores[key] * 0.8) + (rrf_component * 0.2)
-            evidence.append(
-                Evidence(
-                    id=key,
-                    kind=AnswerType.OFFICIAL_DOCUMENT,
-                    title=document.title,
-                    url=document.canonical_url,
-                    unit=source.unit,
-                    published_at=document.published_at,
-                    content=chunk.content,
-                    score=score,
+            rrf_component = min(
+                1.0,
+                ranks[key] * (DOCUMENT_RRF_K + 1) / list_count,
+            )
+            searchable = " ".join((document.title, chunk.content, source.unit or ""))
+            normalized_searchable = search_query_key(searchable)
+            concept_keys = [
+                value for concept in concepts if (value := search_query_key(concept))
+            ]
+            concept_coverage = (
+                sum(value in normalized_searchable for value in concept_keys)
+                / len(concept_keys)
+                if concept_keys
+                else 0.0
+            )
+            normalized_title = search_query_key(document.title)
+            exact_title = float(
+                any(
+                    (query_key := search_query_key(query))
+                    and (query_key in normalized_title or normalized_title in query_key)
+                    for query in queries
                 )
             )
-        return sorted(evidence, key=lambda item: item.score, reverse=True)[:limit]
+            score = max(
+                0.0,
+                min(
+                    1.0,
+                    raw_scores[key] * DOCUMENT_RAW_SCORE_WEIGHT
+                    + rrf_component * DOCUMENT_RRF_SCORE_WEIGHT
+                    + concept_coverage * DOCUMENT_CONCEPT_COVERAGE_WEIGHT
+                    + exact_title * DOCUMENT_EXACT_TITLE_WEIGHT,
+                ),
+            )
+            scored_records.append(
+                (
+                    score,
+                    str(document.id),
+                    Evidence(
+                        id=key,
+                        kind=AnswerType.OFFICIAL_DOCUMENT,
+                        title=document.title,
+                        url=document.canonical_url,
+                        unit=source.unit,
+                        published_at=document.published_at,
+                        content=chunk.content,
+                        score=score,
+                    ),
+                )
+            )
+        evidence: list[Evidence] = []
+        used_documents: set[str] = set()
+        for _score, document_id, item in sorted(
+            scored_records,
+            key=lambda value: value[0],
+            reverse=True,
+        ):
+            if document_id in used_documents:
+                continue
+            evidence.append(item)
+            used_documents.add(document_id)
+            if len(evidence) >= limit:
+                break
+        return evidence
 
     def search_announcements(
         self,
@@ -133,7 +251,9 @@ class SqlRetriever:
                 func.similarity(func.coalesce(Announcement.unit, ""), query),
             )
             score_expression = raw_score_expression.label("score")
-            fallback_relevance_filter = raw_score_expression >= FAILED_SEARCH_MIN_SIMILARITY
+            fallback_relevance_filter = (
+                raw_score_expression >= FAILED_SEARCH_MIN_SIMILARITY
+            )
         else:
             score_expression = literal(0.65).label("score")
         filters = (
@@ -164,7 +284,11 @@ class SqlRetriever:
             if canonical_urls is not None
             else None
         )
-        effective_sort = sort if query or sort is not AnnouncementSort.RELEVANCE else AnnouncementSort.NEWEST
+        effective_sort = (
+            sort
+            if query or sort is not AnnouncementSort.RELEVANCE
+            else AnnouncementSort.NEWEST
+        )
         if effective_sort is AnnouncementSort.RELEVANCE:
             order = [desc("score"), Announcement.published_at.desc()]
         elif effective_sort is AnnouncementSort.OLDEST:

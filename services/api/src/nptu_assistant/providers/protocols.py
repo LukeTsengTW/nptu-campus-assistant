@@ -6,7 +6,12 @@ from nptu_assistant.rag.models import ModelTurn
 
 
 class EmbeddingProvider(Protocol):
-    def embed(self, texts: list[str]) -> list[list[float]]: ...
+    def embed(
+        self,
+        texts: list[str],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> list[list[float]]: ...
 
 
 class LlmProvider(Protocol):
