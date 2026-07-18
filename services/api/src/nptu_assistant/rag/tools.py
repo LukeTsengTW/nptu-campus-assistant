@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
+import uuid
 from collections.abc import Collection
 from dataclasses import dataclass, replace
 from datetime import date
@@ -10,8 +12,18 @@ from typing import Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from nptu_assistant.api.schemas import AnswerType
+from nptu_assistant.crawlers.adapters.nptu_search import AnnouncementSearchResult
+from nptu_assistant.crawlers.official_units import (
+    DocumentSearchScope,
+    ResolvedOfficialUnit,
+)
 from nptu_assistant.crawlers.refresh import REFRESH_FAILURE_WARNING, RefreshResult
-from nptu_assistant.crawlers.resolution import UnitResolutionStatus, UnitSourceResolver
+from nptu_assistant.crawlers.resolution import (
+    UnitResolution,
+    UnitResolutionStatus,
+    UnitSourceResolver,
+)
 from nptu_assistant.crawlers.search import (
     FULL_SEARCH_FAILURE_WARNING,
     KeywordIngestionResult,
@@ -27,7 +39,15 @@ from nptu_assistant.crawlers.site_models import (
     SearchDeadlineExceeded,
     SearchPlan,
 )
+from nptu_assistant.crawlers.unit_intents import (
+    UnitQueryIntent,
+    classify_unit_query,
+    extract_announcement_topic,
+)
 from nptu_assistant.rag.models import Evidence
+
+
+logger = logging.getLogger(__name__)
 
 
 class AnnouncementSort(StrEnum):
@@ -170,6 +190,7 @@ class StructuredRetriever(Protocol):
         plan: SearchPlan,
         limit: int,
         deadline: SearchDeadline | None = None,
+        scope: DocumentSearchScope | None = None,
     ) -> list[Evidence]: ...
 
     def get_announcement(self, announcement_id: str) -> Evidence | None: ...
@@ -201,7 +222,18 @@ class SitePageIngestor(Protocol):
         *,
         max_items: int,
         deadline: SearchDeadline,
+        scope: DocumentSearchScope | None = None,
     ) -> SitePageIngestionResult:
+        raise NotImplementedError
+
+    def search_unit_announcements(
+        self,
+        plan: SearchPlan,
+        *,
+        scope: DocumentSearchScope,
+        max_items: int,
+        deadline: SearchDeadline,
+    ) -> tuple[tuple[AnnouncementSearchResult, ...], str | None]:
         raise NotImplementedError
 
 
@@ -323,10 +355,10 @@ class ToolExecutor:
         self._unit_resolver = unit_resolver
         self._site_page_ingestor = site_page_ingestor
 
-    def _resolve_unit_source(
+    def _resolve_unit(
         self,
         parsed: SearchAnnouncementsArguments,
-    ) -> tuple[str, str] | None:
+    ) -> UnitResolution | None:
         if self._unit_resolver is None:
             return None
         resolution = self._unit_resolver.resolve(parsed.unit, parsed.query)
@@ -343,17 +375,23 @@ class ToolExecutor:
                 "ambiguous_unit",
                 f"單位名稱可能對應多個單位（{candidates}），請指定完整名稱。",
             )
-        if resolution.status is UnitResolutionStatus.UNSUPPORTED:
+        if resolution.status is UnitResolutionStatus.KNOWN_WITHOUT_VERIFIED_SITE:
+            reason = (
+                resolution.official_unit.unsupported_reason
+                if resolution.official_unit is not None
+                else None
+            )
             raise UnitResolutionError(
                 "unsupported_unit_source",
-                f"目前尚未設定「{resolution.canonical_unit}」的官方公告來源。",
+                f"目前尚未設定「{resolution.canonical_unit}」可驗證的官方公告來源。"
+                + (f"原因：{reason}" if reason else ""),
             )
-        if resolution.source is None or resolution.canonical_unit is None:
+        if resolution.canonical_unit is None:
             raise UnitResolutionError(
                 "unknown_unit",
                 "無法確認單位的官方公告來源，請提供完整單位名稱。",
             )
-        return resolution.canonical_unit, resolution.source.name
+        return resolution
 
     def _refresh_overview(
         self, parsed: SearchAnnouncementsArguments
@@ -374,26 +412,123 @@ class ToolExecutor:
         self,
         parsed: SearchAnnouncementsArguments,
     ) -> tuple[list[Evidence], str | None]:
+        resolution = self._resolve_unit(parsed)
+        generic_latest = False
+        directory = (
+            self._unit_resolver.official_units
+            if self._unit_resolver is not None
+            else None
+        )
+        if (
+            parsed.query
+            and directory is not None
+            and (resolution is None or resolution.official_unit is not None)
+        ):
+            topic = (
+                extract_announcement_topic(parsed.query, directory)
+                if classify_unit_query(parsed.query) is UnitQueryIntent.ANNOUNCEMENT
+                else parsed.query
+            )
+            if topic != parsed.query:
+                parsed = parsed.model_copy(update={"query": topic})
+                generic_latest = topic is None
         if _is_generic_announcement_query(parsed.query):
-            updates: dict[str, object] = {"query": None}
+            parsed = parsed.model_copy(update={"query": None})
+            generic_latest = True
+        if generic_latest or resolution is not None:
             if parsed.sort is AnnouncementSort.RELEVANCE:
-                updates["sort"] = AnnouncementSort.NEWEST
-            parsed = parsed.model_copy(update=updates)
+                parsed = parsed.model_copy(update={"sort": AnnouncementSort.NEWEST})
         arguments = parsed.model_dump()
         arguments["canonical_urls"] = None
         warning: str | None = None
-        resolved_source = self._resolve_unit_source(parsed)
-        if resolved_source is not None:
-            canonical_unit, source_name = resolved_source
+        if resolution is not None:
+            canonical_unit = resolution.canonical_unit or ""
             arguments["unit"] = canonical_unit
-            if parsed.sort is AnnouncementSort.RELEVANCE:
-                arguments["sort"] = AnnouncementSort.NEWEST
+            if resolution.status is UnitResolutionStatus.KNOWN_WITH_SCOPED_SEARCH:
+                official_unit = resolution.official_unit
+                if official_unit is None or directory is None:
+                    raise UnitResolutionError(
+                        "unsupported_unit_source",
+                        f"目前無法查詢「{canonical_unit}」的官方公告來源。",
+                    )
+                scope = directory.scope_for(official_unit)
+                live_results: tuple[AnnouncementSearchResult, ...] = ()
+                live_warning: str | None = None
+                scoped_search_completed = False
+                if self._site_page_ingestor is not None:
+                    deadline = self._site_page_ingestor.new_deadline()
+                    search_text = " ".join(
+                        value
+                        for value in (
+                            canonical_unit,
+                            parsed.query,
+                            "最新 公告 消息",
+                        )
+                        if value
+                    )
+                    try:
+                        live_results, live_warning = (
+                            self._site_page_ingestor.search_unit_announcements(
+                                SearchPlan.from_query(search_text, limit=parsed.limit),
+                                scope=scope,
+                                max_items=parsed.limit,
+                                deadline=deadline,
+                            )
+                        )
+                        scoped_search_completed = True
+                    except Exception:
+                        logger.exception(
+                            "單位 scoped 公告搜尋失敗",
+                            extra={"unit": canonical_unit},
+                        )
+                        live_warning = SITE_SEARCH_FAILURE_WARNING
+                if live_results:
+                    evidence = [
+                        Evidence(
+                            id=str(
+                                uuid.uuid5(
+                                    uuid.NAMESPACE_URL,
+                                    item.canonical_url,
+                                )
+                            ),
+                            kind=AnswerType.ANNOUNCEMENT,
+                            title=item.title,
+                            url=item.canonical_url,
+                            unit=canonical_unit,
+                            published_at=item.published_at,
+                            content=item.body,
+                            score=max(0.65, 1.0 - index * 0.02),
+                        )
+                        for index, item in enumerate(live_results)
+                    ]
+                    return evidence, live_warning
+                cached = self._retriever.search_announcements(**arguments)
+                cached = [
+                    replace(item, unit=canonical_unit)
+                    for item in cached
+                    if item.unit == canonical_unit
+                ]
+                return cached, (
+                    SITE_SEARCH_PARTIAL_WARNING
+                    if cached
+                    else live_warning
+                    or (
+                        None if scoped_search_completed else SITE_SEARCH_FAILURE_WARNING
+                    )
+                )
+
+            source = resolution.source
+            if source is None:
+                raise UnitResolutionError(
+                    "unsupported_unit_source",
+                    f"目前無法查詢「{canonical_unit}」的官方公告來源。",
+                )
             arguments["canonical_urls"] = ()
             if self._refresher is None:
                 warning = REFRESH_FAILURE_WARNING
             else:
                 try:
-                    refresh = self._refresher.ensure_fresh(source_name)
+                    refresh = self._refresher.ensure_fresh(source.name)
                     arguments["canonical_urls"] = (
                         () if refresh.canonical_urls is None else refresh.canonical_urls
                     )
@@ -423,29 +558,88 @@ class ToolExecutor:
                 )
                 warning = overview_refresh.warning
         evidence = self._retriever.search_announcements(**arguments)
-        if resolved_source is not None:
-            evidence = [replace(item, unit=resolved_source[0]) for item in evidence]
+        if resolution is not None:
+            evidence = [
+                replace(item, unit=resolution.canonical_unit or item.unit)
+                for item in evidence
+            ]
         return evidence, warning
 
     def _search_documents(
         self,
         parsed: SearchDocumentsArguments,
     ) -> tuple[list[Evidence], str | None]:
-        if self._site_page_ingestor is None:
+        scope: DocumentSearchScope | None = None
+        official_unit: ResolvedOfficialUnit | None = None
+        if self._unit_resolver is not None:
+            resolution = self._unit_resolver.resolve(None, parsed.query)
+            if resolution.status is UnitResolutionStatus.AMBIGUOUS:
+                candidates = "、".join(resolution.candidates)
+                raise UnitResolutionError(
+                    "ambiguous_unit",
+                    f"單位名稱可能對應多個單位（{candidates}），請指定完整名稱。",
+                )
+            official_unit = resolution.official_unit
+            directory = self._unit_resolver.official_units
+            if official_unit is not None and directory is not None:
+                scope = directory.scope_for(official_unit)
+        if (
+            official_unit is not None
+            and official_unit.homepage_url is not None
+            and classify_unit_query(parsed.query) is UnitQueryIntent.HOMEPAGE
+        ):
+            homepage_url = official_unit.homepage_url
             return (
-                self._retriever.search_documents_with_plan(
+                [
+                    Evidence(
+                        id=str(
+                            uuid.uuid5(
+                                uuid.NAMESPACE_URL,
+                                f"nptu-official-unit:{official_unit.canonical_name}:{homepage_url}",
+                            )
+                        ),
+                        kind=AnswerType.OFFICIAL_DOCUMENT,
+                        title=f"國立屏東大學{official_unit.canonical_name}官方網站",
+                        url=homepage_url,
+                        unit=official_unit.canonical_name,
+                        published_at=None,
+                        content=f"{official_unit.canonical_name}官方網站首頁。",
+                        score=1.0,
+                    )
+                ],
+                None,
+            )
+        if self._site_page_ingestor is None:
+            if scope is None:
+                evidence = self._retriever.search_documents_with_plan(
                     plan=parsed,
                     limit=parsed.limit,
-                ),
+                )
+            else:
+                evidence = self._retriever.search_documents_with_plan(
+                    plan=parsed,
+                    limit=parsed.limit,
+                    scope=scope,
+                )
+            return (
+                evidence,
                 None,
             )
         deadline = self._site_page_ingestor.new_deadline()
         try:
-            cached = self._retriever.search_documents_with_plan(
-                plan=parsed,
-                limit=parsed.limit,
-                deadline=deadline,
-            )
+            if scope is None:
+                cached = self._retriever.search_documents_with_plan(
+                    plan=parsed,
+                    limit=parsed.limit,
+                    deadline=deadline,
+                )
+            else:
+                cached = self._retriever.search_documents_with_plan(
+                    plan=parsed,
+                    limit=parsed.limit,
+                    deadline=deadline,
+                    scope=scope,
+                )
         except SearchDeadlineExceeded:
             return [], SITE_SEARCH_FAILURE_WARNING
         if not self._site_page_ingestor.should_search_live(cached):
@@ -457,6 +651,7 @@ class ToolExecutor:
                 parsed,
                 max_items=parsed.limit,
                 deadline=deadline,
+                scope=scope,
             )
         except Exception:
             return cached, self._document_search_fallback_warning(cached)
@@ -468,17 +663,26 @@ class ToolExecutor:
                 refreshed_completed=False,
             )
         try:
-            refreshed = self._retriever.search_documents_with_plan(
-                plan=parsed,
-                limit=parsed.limit,
-                deadline=deadline,
-            )
+            if scope is None:
+                refreshed = self._retriever.search_documents_with_plan(
+                    plan=parsed,
+                    limit=parsed.limit,
+                    deadline=deadline,
+                )
+            else:
+                refreshed = self._retriever.search_documents_with_plan(
+                    plan=parsed,
+                    limit=parsed.limit,
+                    deadline=deadline,
+                    scope=scope,
+                )
         except Exception:
             return cached, self._document_search_warning(
                 cached=cached,
                 final_evidence=cached,
                 ingestion=ingestion,
                 refreshed_completed=False,
+                used_cached_fallback_after_refresh=False,
             )
         final_evidence = refreshed or cached
         return final_evidence, self._document_search_warning(
@@ -486,6 +690,7 @@ class ToolExecutor:
             final_evidence=final_evidence,
             ingestion=ingestion,
             refreshed_completed=True,
+            used_cached_fallback_after_refresh=not refreshed and bool(cached),
         )
 
     @staticmethod
@@ -502,6 +707,7 @@ class ToolExecutor:
         final_evidence: Collection[Evidence],
         ingestion: SitePageIngestionResult,
         refreshed_completed: bool,
+        used_cached_fallback_after_refresh: bool = False,
     ) -> str | None:
         ingestion_incomplete = (
             ingestion.ingestion_timed_out
@@ -510,6 +716,8 @@ class ToolExecutor:
         )
         if ingestion_incomplete:
             return cls._document_search_fallback_warning(final_evidence)
+        if used_cached_fallback_after_refresh:
+            return SITE_SEARCH_PARTIAL_WARNING
         if not refreshed_completed and ingestion.relevant_pages_found:
             return cls._document_search_fallback_warning(cached)
         if ingestion.relevant_pages_found and not final_evidence:
@@ -541,10 +749,12 @@ class ToolExecutor:
             elif isinstance(parsed, SearchDocumentsArguments):
                 evidence, refresh_warning = self._search_documents(parsed)
                 content_limit = 2_000
-            else:
+            elif isinstance(parsed, GetAnnouncementArguments):
                 item = self._retriever.get_announcement(parsed.announcement_id)
                 evidence = [item] if item else []
                 content_limit = 8_000
+            else:
+                return _error("invalid_tool_arguments", "工具參數格式或範圍不正確。")
         except UnitResolutionError as exc:
             return _error(exc.code, exc.message)
         except ValueError:

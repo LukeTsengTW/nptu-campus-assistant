@@ -1,5 +1,20 @@
 # 官方資料來源
 
+## Official Unit Directory
+
+`data/sources/official_units.yaml` 是學術單位正式名稱、alias、狀態、homepage、allowed host、site-search seeds 與公告能力的唯一設定來源。資料以 NPTU 官方學術單位頁為基準，2026-07-18 驗證：66 筆總資料、64 個 active、2 個 discontinued；66 筆皆保留官方 homepage。active 公告策略為 1 個 `configured_listing`、63 個 `scoped_site_search`，沒有未記錄原因的 active unsupported 單位。
+
+每筆設定由 `OfficialUnitConfig` 驗證：canonical name 與 alias 全域唯一、active 必須有 homepage 或 unsupported reason、homepage／seed／listing 必須是 NPTU HTTPS 且位於單位 allowlist、homepage host 必須列入 allowed hosts、configured source 必須存在。停招單位保留歷史辨識，但 `enabled: false`，不參與一般最新公告。
+
+資訊學院的 `configured_listing` URL 與 typed selectors 已由 `announcements.yaml` 遷入此目錄；`load_source_configs` 會從目錄生成 crawler source。`announcements.yaml` 只保留全校／主題公告來源、行政 alias、固定 `source_routes` 與共用 site-search limits。
+
+離線驗證：
+
+```powershell
+services/api/.venv/Scripts/python.exe scripts/audit_official_units.py
+services/api/.venv/Scripts/python.exe scripts/audit_official_units.py --format json
+```
+
 ## 已啟用公告來源
 
 ### NPTU 官方總覽
@@ -79,12 +94,13 @@
 
 ## 單位解析與查詢範圍
 
-`UnitSourceResolver` 合併來源設定中的 `unit`／`aliases`、既有關鍵字別名與後端來源路由。別名採最長、非重疊匹配；來源路由目標、URL、host 與 selector 全由設定控制，結果分為：
+`UnitSourceResolver` 合併 official unit directory、行政 alias 與後端主題來源路由。別名採最長、非重疊 matching；來源路由目標、URL、host 與 selector 全由設定控制，結果分為：
 
-- `resolved`：唯一對應已啟用來源，只刷新與查詢該來源。
-- `unknown`：文字看似單位但設定無法辨識，要求使用者提供正式名稱。
-- `ambiguous`：同時出現多個單位或別名對應多個來源，列出穩定排序的候選單位。
-- `unsupported`：能正規化為已知單位，但尚未設定已啟用的官方公告來源。
+- `known_unit_with_listing`：唯一對應已啟用 configured listing。
+- `known_unit_with_scoped_search`：已知 homepage／host／seed，沒有 dedicated listing，使用單位 scoped search。
+- `known_unit_without_verified_site`：已知單位，但沒有任何可驗證來源能力，必須附原因。
+- `unknown_unit`：文字看似單位但設定無法辨識，要求使用者提供正式名稱。
+- `ambiguous_unit`：同時出現多個單位或 alias 對應衝突，列出穩定排序候選。
 - `none`：沒有單位意圖，保留既有全校公告／關鍵字搜尋流程。
 
 成功 crawl 會在同一交易中 upsert 公告、把本次 URL 全量寫入 `Source.canonical_urls`，並更新 `last_successful_crawl_at`；內容全部 unchanged 與手動 crawl 也遵循同一流程。成功空結果保存為空陣列；任一資料列或快照寫入失敗時整批回滾。單位查詢只檢索該快照中的 URL，限制與排序完成後才回傳最多 20 筆。

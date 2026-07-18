@@ -18,6 +18,7 @@ from nptu_assistant.crawlers.refresh import (
     AnnouncementRefreshCoordinator,
     AnnouncementRefreshScheduler,
 )
+from nptu_assistant.crawlers.official_units import load_official_unit_directory
 from nptu_assistant.crawlers.resolution import UnitSourceResolver
 from nptu_assistant.crawlers.service import CrawlerService
 from nptu_assistant.crawlers.search import KeywordAnnouncementSearchService
@@ -61,6 +62,9 @@ def build_services(settings: Settings) -> dict[str, object]:
     crawler_config_path = resolve_workspace_path(settings.crawler_config_path)
     source_configs = load_source_configs(crawler_config_path)
     keyword_search_config = load_keyword_search_config(crawler_config_path)
+    official_units = load_official_unit_directory(
+        crawler_config_path.with_name("official_units.yaml")
+    )
     openai_api_key = settings.openai_api_key
     openai_client = (
         OpenAI(api_key=openai_api_key.get_secret_value())
@@ -83,7 +87,7 @@ def build_services(settings: Settings) -> dict[str, object]:
         embedding = UnavailableEmbeddingProvider()
     llm: LlmProvider | None
     if settings.llm_provider == "fake":
-        llm = FakeLlmProvider()
+        llm = FakeLlmProvider(official_units)
     elif openai_client is not None:
         llm = OpenAILlmProvider(
             openai_client,
@@ -162,6 +166,7 @@ def build_services(settings: Settings) -> dict[str, object]:
                     source_configs,
                     keyword_search_config.aliases,
                     keyword_search_config.source_routes,
+                    official_units,
                 ),
                 site_page_ingestor,
             )

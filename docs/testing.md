@@ -59,4 +59,22 @@ cd services/api
 uv run pytest tests/test_live_unit_announcement_source.py -q
 ```
 
-此測試只讀取 `data/sources/announcements.yaml`、檢查 robots、下載資訊學院列表並驗證目前 selectors 與 canonical URL host；不建立 repository，也不寫入資料庫。未設定環境變數時明確顯示 skipped，CI 不依賴外部網站可用性。
+此測試讀取 `data/sources/announcements.yaml` 與 `data/sources/official_units.yaml`、檢查 robots、下載設定列表並驗證 selectors 與 canonical URL host；不建立 repository，也不寫入資料庫。未設定環境變數時明確顯示 skipped，CI 不依賴外部網站可用性。
+
+## Official unit directory
+
+`tests/test_official_units.py` 離線覆蓋完整 registry validation、全 alias deterministic resolution、跨學院 representative matrix、homepage evidence、generic latest、topic announcement、document intent、unit-host scope 與 cross-unit contamination。`tests/test_site_search.py` 驗證 unit scope 會取代全校 seed 與 allowlist。audit 可獨立執行：
+
+```powershell
+services/api/.venv/Scripts/python.exe scripts/audit_official_units.py --format json
+```
+
+全校代表 live smoke 為 opt-in：
+
+```powershell
+$env:RUN_NPTU_LIVE_SMOKE="1"
+cd services/api
+uv run pytest tests/test_live_official_units.py -q
+```
+
+抽樣資訊、管理、教育、人文社會、理學院單位；驗證 homepage HTML、allowlist，以及 configured listing 或 scoped search。未設定環境變數時 skipped，不是 deterministic CI 必要條件。

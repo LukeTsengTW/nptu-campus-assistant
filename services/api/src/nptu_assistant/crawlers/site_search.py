@@ -15,6 +15,7 @@ from nptu_assistant.core.security import canonicalize_nptu_url, is_allowed_sourc
 from nptu_assistant.crawlers.adapters.nptu_site import NptuSitePage, NptuSitePageAdapter
 from nptu_assistant.crawlers.adapters.nptu_search import AnnouncementSearchResult
 from nptu_assistant.crawlers.config import SiteSearchConfig
+from nptu_assistant.crawlers.official_units import DocumentSearchScope
 from nptu_assistant.crawlers.site_discovery import SiteDiscovery
 from nptu_assistant.crawlers.site_models import (
     CandidatePage,
@@ -98,7 +99,7 @@ class NptuSiteSearchService:
         self._discovery = discovery
         self._clock = clock
         self._result_cache: dict[
-            tuple[str, tuple[str, ...], tuple[str, ...], int, bool],
+            tuple[object, ...],
             tuple[float, SiteSearchResult],
         ] = {}
         self._page_cache: dict[str, tuple[float, NptuSitePage]] = {}
@@ -120,6 +121,7 @@ class NptuSiteSearchService:
         max_items: int | None = None,
         use_discovery: bool = True,
         deadline: SearchDeadline | None = None,
+        scope: DocumentSearchScope | None = None,
     ) -> SiteSearchResult:
         search_deadline = deadline or self.new_deadline()
         requested_limit = self._config.max_items if max_items is None else max_items
@@ -130,7 +132,17 @@ class NptuSiteSearchService:
         if search_plan.limit != limit:
             search_plan = search_plan.model_copy(update={"limit": limit})
         now = self._clock()
-        cache_key = (*search_plan.cache_key, use_discovery)
+        allowed_hosts = (
+            scope.allowed_hosts if scope is not None else self._config.allowed_hosts
+        )
+        seed_urls = scope.seed_urls if scope is not None else self._config.seed_urls
+        effective_discovery = use_discovery and scope is None
+        cache_key = (
+            *search_plan.cache_key,
+            effective_discovery,
+            tuple(allowed_hosts),
+            tuple(seed_urls),
+        )
         cached_result = self._result_cache.get(cache_key)
         if (
             cached_result is not None
@@ -162,7 +174,7 @@ class NptuSiteSearchService:
                 return
             if (
                 url in visited
-                or not is_allowed_source_url(url, self._config.allowed_hosts)
+                or not is_allowed_source_url(url, allowed_hosts)
                 or not self._adapter.is_crawlable_url(url)
             ):
                 skipped_candidate_count += 1
@@ -188,7 +200,7 @@ class NptuSiteSearchService:
             )
             sequence += 1
 
-        if use_discovery and self._discovery is not None:
+        if effective_discovery and self._discovery is not None:
             try:
                 search_deadline.raise_if_expired()
                 for item in self._discovery.discover(
@@ -207,7 +219,7 @@ class NptuSiteSearchService:
                 query_timed_out = True
             except Exception:
                 pass
-        for seed_url in self._config.seed_urls:
+        for seed_url in seed_urls:
             enqueue(CandidatePage(seed_url))
 
         while queue and len(visited) < self._config.max_pages:
@@ -242,7 +254,7 @@ class NptuSiteSearchService:
                     get_html = getattr(self._http, "get_html", self._http.get)
                     content = get_html(
                         url,
-                        allowed_hosts=self._config.allowed_hosts,
+                        allowed_hosts=allowed_hosts,
                         timeout_seconds=search_deadline.remaining_seconds(),
                         deadline=search_deadline,
                     )
@@ -250,7 +262,7 @@ class NptuSiteSearchService:
                     page = self._adapter.parse_page(
                         content,
                         url,
-                        allowed_hosts=self._config.allowed_hosts,
+                        allowed_hosts=allowed_hosts,
                     )
                     search_deadline.raise_if_expired()
                     if self._config.cache_ttl_seconds:
@@ -319,10 +331,13 @@ class NptuSiteSearchService:
         except SearchDeadlineExceeded:
             query_timed_out = True
             scores = preliminary_scores
-        scored_pages = [
-            replace(page, score=score)
-            for page, score in zip(pages, scores, strict=True)
-        ]
+        scored_pages = []
+        for page, score in zip(pages, scores, strict=True):
+            if scope is not None:
+                host = (urlsplit(page.canonical_url).hostname or "").lower()
+                if host in scope.preferred_hosts:
+                    score = min(1.0, score + 0.14)
+            scored_pages.append(replace(page, score=score))
         relevant_pages = [
             page
             for page in scored_pages
@@ -429,12 +444,14 @@ class SitePageIngestionService:
         *,
         max_items: int,
         deadline: SearchDeadline | None = None,
+        scope: DocumentSearchScope | None = None,
     ) -> SitePageIngestionResult:
         deadline = deadline or self.new_deadline()
         search_result = self._search.search(
             plan,
             max_items=max_items,
             deadline=deadline,
+            scope=scope,
         )
         diagnostics = search_result.diagnostics
         summary = IngestionSummary()
@@ -538,7 +555,11 @@ class SitePageIngestionService:
                 metadata = DocumentMetadata(
                     title=page.title,
                     source_url=HttpUrl(page.canonical_url),
-                    unit=self._config.unit,
+                    unit=(
+                        scope.canonical_unit
+                        if scope is not None and scope.canonical_unit is not None
+                        else self._config.unit
+                    ),
                     published_at=page.published_at,
                     effective_from=page.published_at or date.today(),
                     document_type="official_web_page",
@@ -563,6 +584,58 @@ class SitePageIngestionService:
                 else SITE_SEARCH_PARTIAL_WARNING
             )
         return result(warning, timed_out=diagnostics.query_timed_out)
+
+    def search_unit_announcements(
+        self,
+        plan: SearchPlan,
+        *,
+        scope: DocumentSearchScope,
+        max_items: int,
+        deadline: SearchDeadline,
+    ) -> tuple[tuple[AnnouncementSearchResult, ...], str | None]:
+        result = self._search.search(
+            plan,
+            max_items=max_items,
+            use_discovery=False,
+            deadline=deadline,
+            scope=scope,
+        )
+        markers = (
+            "公告",
+            "消息",
+            "訊息",
+            "通知",
+            "news",
+            "/p/403-",
+            "/p/404-",
+            "/p/406-",
+        )
+        pages = tuple(
+            page
+            for page in result.pages
+            if any(
+                marker.casefold()
+                in " ".join((page.title, *page.headings, page.canonical_url)).casefold()
+                for marker in markers
+            )
+        )
+        source_url = (
+            scope.seed_urls[0] if scope.seed_urls else (scope.homepage_url or "")
+        )
+        announcements = tuple(
+            AnnouncementSearchResult(
+                title=page.title,
+                canonical_url=page.canonical_url,
+                unit=scope.canonical_unit or self._config.unit,
+                category="單位公告",
+                published_at=page.published_at,
+                body=page.body,
+                source_name=f"unit-scoped:{scope.canonical_unit or self._config.unit}",
+                source_url=source_url,
+            )
+            for page in pages[:max_items]
+        )
+        return announcements, self._warning_for(result.diagnostics)
 
     def _warning_for(self, diagnostics: SearchDiagnostics) -> str | None:
         if diagnostics.relevant_success_count == 0:

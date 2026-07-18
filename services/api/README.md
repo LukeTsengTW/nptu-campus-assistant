@@ -2,7 +2,7 @@
 
 此 Python 3.12 package 包含 FastAPI、資料庫、文件匯入、公告爬蟲與 RAG 服務。完整啟動方式請參閱 repository 根目錄的 `README.md`。
 
-公告來源設定位於 `../../data/sources/announcements.yaml`。單位公告由 `UnitSourceResolver` 將正式名稱或別名解析到已啟用來源；獎學金等主題則由後端 `source_routes` 固定路由到指定來源；共通 HTML 列表由 `nptu_html_list` 依 typed selectors 解析。`keyword_search.site_search` 會從設定的 seed URL 探索 allowlist 內 NPTU 頁面，將一般頁面寫入既有文件／向量索引，並把可解析日期的頁面合併到公告搜尋。模型不能傳入 URL、host、selector 或內部來源名稱。
+全校學術單位目錄位於 `../../data/sources/official_units.yaml`，集中正式名稱、alias、狀態、homepage、allowed host、site-search seeds 與公告策略。全校／主題公告與共用搜尋限制位於 `../../data/sources/announcements.yaml`。`UnitSourceResolver` 分開處理「已知單位」與「是否有 configured listing」；沒有固定 listing、但有可信 homepage 的單位使用 host-scoped search。模型不能傳入 URL、host、selector 或內部來源名稱。
 
 手動執行所有已啟用來源：
 

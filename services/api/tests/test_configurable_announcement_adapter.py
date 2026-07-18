@@ -20,7 +20,9 @@ from nptu_assistant.crawlers.service import CrawlerService
 WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
 CONFIG_PATH = WORKSPACE_ROOT / "data/sources/announcements.yaml"
 FIXTURE_PATH = WORKSPACE_ROOT / "data/fixtures/announcements/nptu-ccs/listing.html"
-OVERVIEW_FIXTURE_PATH = WORKSPACE_ROOT / "data/fixtures/announcements/nptu-overview/listing.html"
+OVERVIEW_FIXTURE_PATH = (
+    WORKSPACE_ROOT / "data/fixtures/announcements/nptu-overview/listing.html"
+)
 SCHOLARSHIP_FIXTURE_PATH = (
     WORKSPACE_ROOT / "data/fixtures/announcements/nptu-scholarship/listing.html"
 )
@@ -28,12 +30,18 @@ SCHOLARSHIP_FIXTURE_PATH = (
 
 def information_college_config() -> CrawlerSourceConfig:
     return next(
-        item for item in load_source_configs(CONFIG_PATH) if item.name == "information-college-html"
+        item
+        for item in load_source_configs(CONFIG_PATH)
+        if item.name == "information-college-html"
     )
 
 
 def nptu_overview_config() -> CrawlerSourceConfig:
-    return next(item for item in load_source_configs(CONFIG_PATH) if item.name == "nptu-overview")
+    return next(
+        item
+        for item in load_source_configs(CONFIG_PATH)
+        if item.name == "nptu-overview"
+    )
 
 
 def scholarship_source_config(name: str) -> CrawlerSourceConfig:
@@ -48,7 +56,10 @@ def test_nptu_overview_uses_official_html_listing_and_sorts_by_date() -> None:
 
     assert config.url == "https://www.nptu.edu.tw/p/422-1000-1044.php?Lang=zh-tw"
     assert config.adapter == "nptu_html_list"
-    assert [item.published_at for item in items] == [date(2026, 7, 15), date(2026, 7, 14)]
+    assert [item.published_at for item in items] == [
+        date(2026, 7, 15),
+        date(2026, 7, 14),
+    ]
     assert [item.title for item in items] == ["總覽最新公告", "總覽前一日公告"]
     assert all(item.unit == "國立屏東大學" for item in items)
 
@@ -66,7 +77,9 @@ def test_information_college_fixture_parses_six_sorted_announcements() -> None:
         date(2026, 7, 6),
         date(2026, 7, 2),
     ]
-    assert [item.title for item in items] == [f"資訊學院測試公告{value}" for value in "一二三四五六"]
+    assert [item.title for item in items] == [
+        f"資訊學院測試公告{value}" for value in "一二三四五六"
+    ]
     assert [item.canonical_url for item in items] == [
         "https://ccs.nptu.edu.tw/p/406-1025-197412,r1019.php?Lang=zh-tw",
         "https://ccs.nptu.edu.tw/p/406-1025-197411,r1019.php?Lang=zh-tw",
@@ -109,7 +122,10 @@ def test_scholarship_fixture_parses_only_configured_tab(
     assert config.selectors.listing == listing
     assert all(item.unit == "生活輔導組" for item in items)
     assert all(item.category == config.category for item in items)
-    assert all(item.canonical_url.startswith("https://staf-life.nptu.edu.tw/") for item in items)
+    assert all(
+        item.canonical_url.startswith("https://staf-life.nptu.edu.tw/")
+        for item in items
+    )
     assert all("得獎名單" not in item.title for item in items)
 
 
@@ -142,7 +158,16 @@ def test_parser_skips_malformed_and_duplicate_items_without_leaving_listing_scop
     assert [(item.title, item.canonical_url) for item in items] == [
         ("有效 公告", "https://ccs.nptu.edu.tw/valid")
     ]
-    assert len([record for record in caplog.records if record.message == "html_announcement_item_skipped"]) == 5
+    assert (
+        len(
+            [
+                record
+                for record in caplog.records
+                if record.message == "html_announcement_item_skipped"
+            ]
+        )
+        == 5
+    )
 
 
 @pytest.mark.parametrize(
@@ -260,7 +285,9 @@ class ListingHttpClient:
         return None
 
     def get(self, url: str, *, allowed_hosts: list[str] | None = None) -> str:
-        self.calls.append((url, tuple(allowed_hosts) if allowed_hosts is not None else None))
+        self.calls.append(
+            (url, tuple(allowed_hosts) if allowed_hosts is not None else None)
+        )
         return self.content
 
     def submit_form(
@@ -273,25 +300,35 @@ class ListingHttpClient:
     ) -> str:
         assert method == "post"
         assert fields == {}
-        self.calls.append((url, tuple(allowed_hosts) if allowed_hosts is not None else None))
+        self.calls.append(
+            (url, tuple(allowed_hosts) if allowed_hosts is not None else None)
+        )
         return self.content
 
 
-def test_crawler_uses_html_adapter_host_scope_limit_and_disabled_detail(tmp_path: Path) -> None:
-    payload = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
-    source = next(item for item in payload["sources"] if item["name"] == "information-college-html")
+def test_crawler_uses_html_adapter_host_scope_limit_and_disabled_detail(
+    tmp_path: Path,
+) -> None:
+    source = information_college_config().model_dump(mode="json", exclude_none=True)
     source["max_items"] = 2
     config_path = tmp_path / "sources.yaml"
-    config_path.write_text(yaml.safe_dump({"sources": [source]}, allow_unicode=True), encoding="utf-8")
+    config_path.write_text(
+        yaml.safe_dump({"sources": [source]}, allow_unicode=True), encoding="utf-8"
+    )
     repository = RecordingRepository()
     client = ListingHttpClient(FIXTURE_PATH.read_text(encoding="utf-8"))
-    service = CrawlerService(config_path, repository, client, workspace_root=WORKSPACE_ROOT)  # type: ignore[arg-type]
+    service = CrawlerService(
+        config_path, repository, client, workspace_root=WORKSPACE_ROOT
+    )  # type: ignore[arg-type]
 
     result = service.run_with_urls()
     summary = result.summary
 
     assert summary.created == 2
-    assert [item.title for item in repository.candidates] == ["資訊學院測試公告一", "資訊學院測試公告二"]
+    assert [item.title for item in repository.candidates] == [
+        "資訊學院測試公告一",
+        "資訊學院測試公告二",
+    ]
     assert client.calls == [
         (
             "https://ccs.nptu.edu.tw/p/403-1025-1019-1.php?Lang=zh-tw",
@@ -306,13 +343,19 @@ def test_crawler_uses_html_adapter_host_scope_limit_and_disabled_detail(tmp_path
     }
 
 
-def test_crawler_refreshes_only_scholarship_tab_and_keeps_host_allowlist(tmp_path: Path) -> None:
+def test_crawler_refreshes_only_scholarship_tab_and_keeps_host_allowlist(
+    tmp_path: Path,
+) -> None:
     payload = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
     source = next(
-        item for item in payload["sources"] if item["name"] == "student-scholarship-external-html"
+        item
+        for item in payload["sources"]
+        if item["name"] == "student-scholarship-external-html"
     )
     config_path = tmp_path / "sources.yaml"
-    config_path.write_text(yaml.safe_dump({"sources": [source]}, allow_unicode=True), encoding="utf-8")
+    config_path.write_text(
+        yaml.safe_dump({"sources": [source]}, allow_unicode=True), encoding="utf-8"
+    )
     repository = RecordingRepository()
     fixture = BeautifulSoup(
         SCHOLARSHIP_FIXTURE_PATH.read_text(encoding="utf-8"),
@@ -321,7 +364,9 @@ def test_crawler_refreshes_only_scholarship_tab_and_keeps_host_allowlist(tmp_pat
     external_tab = fixture.select_one("#cmb_1373_0")
     assert external_tab is not None
     client = ListingHttpClient(external_tab.decode_contents())
-    service = CrawlerService(config_path, repository, client, workspace_root=WORKSPACE_ROOT)  # type: ignore[arg-type]
+    service = CrawlerService(
+        config_path, repository, client, workspace_root=WORKSPACE_ROOT
+    )  # type: ignore[arg-type]
 
     result = service.run_with_urls()
 
@@ -342,9 +387,10 @@ def test_crawler_refreshes_only_scholarship_tab_and_keeps_host_allowlist(tmp_pat
     )
 
 
-def test_crawler_commits_one_source_with_repository_bulk_transaction(tmp_path: Path) -> None:
-    payload = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
-    source = next(item for item in payload["sources"] if item["name"] == "information-college-html")
+def test_crawler_commits_one_source_with_repository_bulk_transaction(
+    tmp_path: Path,
+) -> None:
+    source = information_college_config().model_dump(mode="json", exclude_none=True)
     source["max_items"] = 2
     config_path = tmp_path / "sources.yaml"
     config_path.write_text(
@@ -372,8 +418,7 @@ def test_crawler_commits_one_source_with_repository_bulk_transaction(tmp_path: P
 def test_crawler_commits_announcements_and_source_snapshot_through_one_repository_call(
     tmp_path: Path,
 ) -> None:
-    payload = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
-    source = next(item for item in payload["sources"] if item["name"] == "information-college-html")
+    source = information_college_config().model_dump(mode="json", exclude_none=True)
     source["max_items"] = 2
     config_path = tmp_path / "sources.yaml"
     config_path.write_text(
@@ -395,6 +440,7 @@ def test_crawler_commits_announcements_and_source_snapshot_through_one_repositor
     assert result.persisted_source_snapshots == frozenset({"information-college-html"})
     assert len(repository.commit_calls) == 1
     assert repository.commit_calls[0]["source_name"] == "information-college-html"
-    assert tuple(item.canonical_url for item in repository.candidates) == result.canonical_urls[
-        "information-college-html"
-    ]
+    assert (
+        tuple(item.canonical_url for item in repository.candidates)
+        == result.canonical_urls["information-college-html"]
+    )

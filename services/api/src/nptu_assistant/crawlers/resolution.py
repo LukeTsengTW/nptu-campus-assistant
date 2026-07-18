@@ -8,6 +8,11 @@ from enum import StrEnum
 
 from nptu_assistant.crawlers.aliases import AliasNormalizer
 from nptu_assistant.crawlers.config import CrawlerSourceConfig
+from nptu_assistant.crawlers.official_units import (
+    AnnouncementStrategy,
+    OfficialUnitDirectory,
+    ResolvedOfficialUnit,
+)
 
 
 _ANNOUNCEMENT_TERMS = ("公告", "最新", "消息", "訊息", "通知")
@@ -21,10 +26,13 @@ _UNKNOWN_PREFIX = re.compile(
 
 class UnitResolutionStatus(StrEnum):
     NONE = "none"
-    RESOLVED = "resolved"
+    KNOWN_WITH_LISTING = "known_unit_with_listing"
+    RESOLVED = "known_unit_with_listing"
+    KNOWN_WITH_SCOPED_SEARCH = "known_unit_with_scoped_search"
+    KNOWN_WITHOUT_VERIFIED_SITE = "known_unit_without_verified_site"
+    UNSUPPORTED = "known_unit_without_verified_site"
     UNKNOWN = "unknown"
     AMBIGUOUS = "ambiguous"
-    UNSUPPORTED = "unsupported"
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,6 +42,7 @@ class UnitResolution:
     canonical_unit: str | None = None
     candidates: tuple[str, ...] = ()
     source: CrawlerSourceConfig | None = None
+    official_unit: ResolvedOfficialUnit | None = None
 
 
 class UnitSourceResolver:
@@ -44,6 +53,7 @@ class UnitSourceResolver:
         sources: Sequence[CrawlerSourceConfig],
         known_aliases: Mapping[str, str],
         source_routes: Mapping[str, str] | None = None,
+        official_units: OfficialUnitDirectory | None = None,
     ) -> None:
         alias_to_units: dict[str, set[str]] = defaultdict(set)
         unit_to_sources: dict[str, list[CrawlerSourceConfig]] = defaultdict(list)
@@ -55,7 +65,17 @@ class UnitSourceResolver:
                 "公告來源路由指向未設定的來源：" + "、".join(unknown_routes)
             )
 
-        for alias, canonical in known_aliases.items():
+        combined_aliases = dict(known_aliases)
+        if official_units is not None:
+            for alias, canonical in official_units.aliases.items():
+                existing = combined_aliases.get(alias)
+                if existing is not None and existing != canonical:
+                    raise ValueError(
+                        f"單位 alias 對應衝突：{alias}={existing}/{canonical}"
+                    )
+                combined_aliases[alias] = canonical
+
+        for alias, canonical in combined_aliases.items():
             alias = alias.strip()
             canonical = canonical.strip()
             if alias and canonical:
@@ -83,6 +103,11 @@ class UnitSourceResolver:
         self._unit_to_sources = {
             unit: tuple(configs) for unit, configs in unit_to_sources.items()
         }
+        self._official_units = official_units
+
+    @property
+    def official_units(self) -> OfficialUnitDirectory | None:
+        return self._official_units
 
     def _mentioned_units(self, text: str | None) -> set[str]:
         if not text:
@@ -103,7 +128,9 @@ class UnitSourceResolver:
             and not any(term in text for term in _ANNOUNCEMENT_TERMS)
         ):
             return set()
-        known_spans = [(match.start, match.end) for match in self._matcher.matches(text)]
+        known_spans = [
+            (match.start, match.end) for match in self._matcher.matches(text)
+        ]
         unknown: set[str] = set()
         for match in _UNIT_LIKE_PATTERN.finditer(text):
             if any(
@@ -116,7 +143,9 @@ class UnitSourceResolver:
                 unknown.add(candidate)
         return unknown
 
-    def _mentioned_source_routes(self, text: str | None) -> tuple[CrawlerSourceConfig, ...]:
+    def _mentioned_source_routes(
+        self, text: str | None
+    ) -> tuple[CrawlerSourceConfig, ...]:
         if not text:
             return ()
         matches = self._source_route_matcher.matches(text)
@@ -130,10 +159,7 @@ class UnitSourceResolver:
             )
             if internal_matches:
                 return internal_matches
-        return tuple(
-            self._source_route_targets[match.alias]
-            for match in matches
-        )
+        return tuple(self._source_route_targets[match.alias] for match in matches)
 
     def resolve(self, unit: str | None, query: str | None = None) -> UnitResolution:
         requested_unit = unit.strip() if unit and unit.strip() else ""
@@ -212,11 +238,57 @@ class UnitSourceResolver:
             return UnitResolution(UnitResolutionStatus.NONE, requested)
 
         canonical = next(iter(units))
+        official_unit = (
+            self._official_units.get(canonical)
+            if self._official_units is not None
+            else None
+        )
         enabled_sources = tuple(
             source
             for source in self._unit_to_sources.get(canonical, ())
             if source.enabled
         )
+        if official_unit is not None:
+            if (
+                not official_unit.enabled
+                or official_unit.announcement_strategy
+                is AnnouncementStrategy.UNSUPPORTED
+            ):
+                return UnitResolution(
+                    UnitResolutionStatus.KNOWN_WITHOUT_VERIFIED_SITE,
+                    requested,
+                    canonical_unit=canonical,
+                    official_unit=official_unit,
+                )
+            if (
+                official_unit.announcement_strategy
+                is AnnouncementStrategy.SCOPED_SITE_SEARCH
+            ):
+                return UnitResolution(
+                    UnitResolutionStatus.KNOWN_WITH_SCOPED_SEARCH,
+                    requested,
+                    canonical_unit=canonical,
+                    official_unit=official_unit,
+                )
+            matching_sources = tuple(
+                source
+                for source in enabled_sources
+                if source.name == official_unit.announcement_source_name
+            )
+            if len(matching_sources) == 1:
+                return UnitResolution(
+                    UnitResolutionStatus.KNOWN_WITH_LISTING,
+                    requested,
+                    canonical_unit=canonical,
+                    source=matching_sources[0],
+                    official_unit=official_unit,
+                )
+            return UnitResolution(
+                UnitResolutionStatus.KNOWN_WITHOUT_VERIFIED_SITE,
+                requested,
+                canonical_unit=canonical,
+                official_unit=official_unit,
+            )
         if not enabled_sources:
             return UnitResolution(
                 UnitResolutionStatus.UNSUPPORTED,

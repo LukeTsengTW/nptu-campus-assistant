@@ -4,10 +4,12 @@ import uuid
 from collections import defaultdict
 from datetime import date
 import math
-from typing import cast
+from typing import Any, cast
+from urllib.parse import urlsplit
 
 from sqlalchemy import case, desc, func, literal, select, text
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.sql.elements import ColumnElement
 
 from nptu_assistant.api.schemas import AnswerType
 from nptu_assistant.crawlers.site_models import (
@@ -16,6 +18,7 @@ from nptu_assistant.crawlers.site_models import (
     SearchPlan,
     search_query_key,
 )
+from nptu_assistant.crawlers.official_units import DocumentSearchScope
 from nptu_assistant.db.models import Announcement, Document, DocumentChunk, Source
 from nptu_assistant.providers.protocols import EmbeddingProvider
 from nptu_assistant.rag.models import Evidence
@@ -31,7 +34,7 @@ DOCUMENT_CONCEPT_COVERAGE_WEIGHT = 0.06
 DOCUMENT_EXACT_TITLE_WEIGHT = 0.02
 
 
-def _public_announcement_source_filter() -> object:
+def _public_announcement_source_filter() -> ColumnElement[bool]:
     return Source.name.not_ilike("%fixture%")
 
 
@@ -87,6 +90,7 @@ class SqlRetriever:
         plan: SearchPlan,
         limit: int = 6,
         deadline: SearchDeadline | None = None,
+        scope: DocumentSearchScope | None = None,
     ) -> list[Evidence]:
         _validate_limit(limit)
         if deadline is not None:
@@ -168,6 +172,7 @@ class SqlRetriever:
             queries=queries,
             concepts=tuple(plan.concepts),
             limit=limit,
+            scope=scope,
         )
 
     @staticmethod
@@ -177,6 +182,7 @@ class SqlRetriever:
         queries: tuple[str, ...] = (),
         concepts: tuple[str, ...] = (),
         limit: int = 6,
+        scope: DocumentSearchScope | None = None,
     ) -> list[Evidence]:
         ranks: dict[str, float] = defaultdict(float)
         raw_scores: dict[str, float] = defaultdict(float)
@@ -230,6 +236,20 @@ class SqlRetriever:
                     + exact_title * DOCUMENT_EXACT_TITLE_WEIGHT,
                 ),
             )
+            if scope is not None:
+                document_host = (
+                    urlsplit(document.canonical_url).hostname or ""
+                ).lower()
+                if scope.homepage_url and document.canonical_url.rstrip(
+                    "/"
+                ) == scope.homepage_url.rstrip("/"):
+                    score = max(score, 0.99)
+                elif source.unit == scope.canonical_unit:
+                    score = min(1.0, score + 0.18)
+                elif document_host in scope.preferred_hosts:
+                    score = min(1.0, score + 0.14)
+                elif source.unit not in {"國立屏東大學", scope.canonical_unit}:
+                    score *= 0.72
             scored_records.append(
                 (
                     score,
@@ -282,7 +302,7 @@ class SqlRetriever:
 
         query = query.strip() if query else ""
         unit = unit.strip() if unit else None
-        fallback_relevance_filter: object | None = None
+        fallback_relevance_filter: ColumnElement[bool] | None = None
         if query:
             raw_score_expression = func.greatest(
                 func.similarity(Announcement.title, query),
@@ -329,7 +349,10 @@ class SqlRetriever:
             else AnnouncementSort.NEWEST
         )
         if effective_sort is AnnouncementSort.RELEVANCE:
-            order = [desc("score"), Announcement.published_at.desc()]
+            order: list[ColumnElement[Any]] = [
+                desc("score"),
+                Announcement.published_at.desc(),
+            ]
         elif effective_sort is AnnouncementSort.OLDEST:
             order = [Announcement.published_at.asc()]
         else:

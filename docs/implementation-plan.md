@@ -208,6 +208,15 @@ tests/integration/             PostgreSQL/pgvector 端到端情境
 
 ## 已知風險與限制
 
+### 2026-07-18 全校學術單位通用查詢
+
+- 建立 typed `official_units.yaml`：66 筆、64 active、2 discontinued；64 active homepage 由 NPTU 官方學術單位頁連結建立。
+- alias、homepage、host、seed、公告策略集中管理；configured listing 由目錄生成 crawler source。
+- `UnitSourceResolver` 分離單位辨識與來源能力；支援 configured listing、unit-scoped search、同單位 cache、明確 insufficient。
+- homepage query 使用 config-backed evidence；document／announcement live flow 使用 unit allowlist 與 seed，不得跨單位補結果。
+- 共用 intent classifier 處理 generic latest 與 topic；Fake Provider、production prompt、deterministic tests 使用同一 registry／詞彙。
+- 新增全 registry audit、代表單位矩陣、scope／污染／warning tests、`RUN_NPTU_LIVE_SMOKE=1` opt-in smoke。
+
 - 本機已使用 bundled pnpm 11.7、Python 3.12、uv 與 Docker Desktop 4.81.0 完成可執行驗證。
 - NPTU feed 與 detail HTML 可能改版；2026-07-10 live smoke test 成功不保證未來結構不變。
 - MVP rate limiter 為單程序記憶體實作，不適用多副本正式部署。

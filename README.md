@@ -113,7 +113,7 @@ cd services/api
 uv run nptu-assistant crawl-announcements
 ```
 
-新增相同版型的 HTML 公告來源時，先更新 `data/sources/announcements.yaml` 的單位別名、host allowlist 與 CSS selectors，再新增真實結構 fixture 及 parser tests；只有版型無法由通用 `nptu_html_list` 表達時才新增 adapter。不得傳入任意 URL。
+學術單位正式名稱、alias、homepage、host、site-search seeds 與公告策略集中於 `data/sources/official_units.yaml`；全校／主題公告來源與共用搜尋限制位於 `data/sources/announcements.yaml`。新增 configured listing 時，先更新 official unit directory，再新增真實結構 fixture 與 parser tests；只有版型無法由通用 `nptu_html_list` 表達時才新增 adapter。不得傳入任意 URL。
 
 API 啟動後每 60 秒檢查已啟用來源是否到期；`nptu-overview`、資訊學院與獎助學金來源的實際刷新間隔都由各自的 `crawl_interval_minutes` 控制。使用者查詢最新公告時也會先做相同檢查。未到期不會重新請求官網；到期時每個來源最多處理 20 則。需要立即刷新時，可執行上方的 `crawl-announcements` 指令。
 

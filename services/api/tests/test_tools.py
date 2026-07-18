@@ -198,7 +198,9 @@ class StubSitePageIngestor:
         *,
         max_items: int,
         deadline: SearchDeadline,
+        scope: object | None = None,
     ) -> SitePageIngestionResult:
+        del scope
         assert max_items == plan.limit
         self.plans.append(plan)
         self.deadlines.append(deadline)
@@ -689,6 +691,37 @@ def test_document_search_complete_ingestion_has_no_warning() -> None:
 
     assert result.evidence == [refreshed]
     assert result.warning is None
+
+
+def test_document_search_empty_refresh_then_cached_fallback_is_partial() -> None:
+    weak = Evidence(
+        id="cached-weak-after-refresh",
+        kind=AnswerType.OFFICIAL_DOCUMENT,
+        title="舊版單位資料",
+        url="https://www.nptu.edu.tw/cached-after-refresh",
+        unit="國立屏東大學",
+        published_at=None,
+        content="舊資料。",
+        score=0.3,
+    )
+    retriever = DocumentSequenceRetriever([[weak], []])
+    ingestor = StubSitePageIngestor(search_live=True)
+
+    result = ToolExecutor(retriever, site_page_ingestor=ingestor).execute(
+        "search_documents",
+        json.dumps(
+            {
+                "query": "單位完整資料",
+                "search_queries": ["單位資料"],
+                "concepts": ["單位"],
+                "limit": 6,
+            },
+            ensure_ascii=False,
+        ),
+    )
+
+    assert result.evidence == [weak]
+    assert result.warning == SITE_SEARCH_PARTIAL_WARNING
 
 
 def test_document_search_normal_zero_result_has_no_warning() -> None:

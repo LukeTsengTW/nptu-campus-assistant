@@ -4,6 +4,15 @@ import hashlib
 import json
 import re
 
+from nptu_assistant.crawlers.official_units import (
+    OfficialUnitDirectory,
+    load_default_official_unit_directory,
+)
+from nptu_assistant.crawlers.unit_intents import (
+    UnitQueryIntent,
+    classify_unit_query,
+    extract_announcement_topic,
+)
 from nptu_assistant.rag.models import (
     GeneratedAnswer,
     ModelTurn,
@@ -149,6 +158,9 @@ class FakeEmbeddingProvider:
 
 
 class FakeLlmProvider:
+    def __init__(self, official_units: OfficialUnitDirectory | None = None) -> None:
+        self._official_units = official_units or load_default_official_unit_directory()
+
     def create_turn(
         self,
         *,
@@ -169,10 +181,7 @@ class FakeLlmProvider:
         count_limit_notice = (
             "單次查詢上限為 20 則，已依上限查詢。"
             if count_was_limited
-            and any(
-                term in question
-                for term in ("公告", "最新消息", "最近消息", "消息", "通知")
-            )
+            and classify_unit_query(question) is UnitQueryIntent.ANNOUNCEMENT
             else None
         )
         outputs = [
@@ -257,10 +266,8 @@ class FakeLlmProvider:
                 generated=generated,
             )
 
-        announcement_intent = any(
-            term in question
-            for term in ("公告", "最新消息", "最近消息", "消息", "通知")
-        )
+        classified_intent = classify_unit_query(question)
+        announcement_intent = classified_intent is UnitQueryIntent.ANNOUNCEMENT
         document_intent = any(
             term in question
             for term in (
@@ -289,41 +296,38 @@ class FakeLlmProvider:
                 announcement_intent = False
             else:
                 document_intent = False
-        unit_text = re.sub(
-            r"(?:請問|麻煩|幫我|幫忙|我想|想要|請)?(?:查詢|查|看|找|知道)?",
-            "",
-            question,
-            count=1,
+        matching_aliases = [
+            alias
+            for alias in sorted(
+                self._official_units.aliases,
+                key=lambda value: (-len(value), value),
+            )
+            if alias in question
+        ]
+        unit = matching_aliases[0] if matching_aliases else None
+        if unit is None:
+            unit_text = re.sub(
+                r"(?:請問|麻煩|幫我|幫忙|我想|想要|請)?(?:查詢|查|看|找|知道)?",
+                "",
+                question,
+                count=1,
+            )
+            unit_match = re.search(
+                r"[\u4e00-\u9fff]{2,12}?(?:學院|學系|學程|中心|處|組|室|系)",
+                unit_text,
+            )
+            unit = unit_match.group(0) if unit_match else None
+        announcement_query = (
+            extract_announcement_topic(question, self._official_units)
+            if announcement_intent
+            else None
         )
-        unit_match = re.search(
-            r"[\u4e00-\u9fff]{2,12}?(?:學院|學系|學程|中心|處|組|室|系)",
-            unit_text,
-        )
-        unit = unit_match.group(0) if unit_match else None
-        residual = question
-        if unit:
-            residual = residual.replace(unit, "", 1)
-        residual = ANNOUNCEMENT_COUNT_PATTERN.sub("", residual)
-        for phrase in (
-            "最近",
-            "最新",
-            "一般",
-            "公告",
-            "消息",
-            "通知",
-            "幫我",
-            "請問",
-            "麻煩",
-            "查詢",
-            "列出",
-            "查",
-            "看",
-            "找",
-            "的",
+        if (
+            announcement_intent
+            and unit is None
+            and any(term in question for term in ("獎學金", "獎助學金"))
         ):
-            residual = residual.replace(phrase, "")
-        residual = re.sub(r"[\s，。！？、]", "", residual)
-        announcement_query = question if residual else None
+            announcement_query = question
         announcement_limit, _ = _announcement_limit(question)
         announcement_arguments = json.dumps(
             {

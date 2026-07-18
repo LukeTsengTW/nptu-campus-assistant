@@ -7,6 +7,7 @@ import pytest
 
 from nptu_assistant.crawlers.adapters.nptu_site import NptuSitePageAdapter
 from nptu_assistant.crawlers.config import SiteSearchConfig, load_keyword_search_config
+from nptu_assistant.crawlers.official_units import DocumentSearchScope
 from nptu_assistant.crawlers.site_models import SearchDeadline
 from nptu_assistant.crawlers.site_search import (
     NptuSiteSearchService,
@@ -117,6 +118,45 @@ def test_site_search_follows_only_allowlisted_links_and_matches_pages() -> None:
     assert result.visited_count == 2
     assert result.failed_count == 0
     assert all(hosts == ("nptu.edu.tw",) for _, hosts in http.calls)
+
+
+def test_unit_scope_replaces_global_seed_and_rejects_cross_unit_links() -> None:
+    pages = {
+        "https://csie.nptu.edu.tw/": """
+        <main><h1>資訊工程學系</h1>
+        <a href="/news.php">最新公告</a>
+        <a href="https://mis.nptu.edu.tw/news.php">其他單位公告</a></main>
+        """,
+        "https://csie.nptu.edu.tw/news.php": """
+        <main><h1>資訊工程學系最新公告</h1>
+        <time datetime="2026-07-18">2026-07-18</time><p>人工智慧演講。</p></main>
+        """,
+    }
+    http = MappingHttpClient(pages)
+    scope = DocumentSearchScope(
+        canonical_unit="資訊工程學系",
+        homepage_url="https://csie.nptu.edu.tw/",
+        preferred_hosts=("csie.nptu.edu.tw",),
+        allowed_hosts=("csie.nptu.edu.tw",),
+        seed_urls=("https://csie.nptu.edu.tw/",),
+    )
+
+    result = NptuSiteSearchService(site_config(), http).search(
+        "資訊工程學系 人工智慧 最新公告",
+        use_discovery=False,
+        scope=scope,
+    )
+
+    assert result.pages[0].canonical_url == "https://csie.nptu.edu.tw/news.php"
+    assert all(
+        page.canonical_url.startswith("https://csie.nptu.edu.tw/")
+        for page in result.pages
+    )
+    assert [url for url, _hosts in http.calls] == [
+        "https://csie.nptu.edu.tw/",
+        "https://csie.nptu.edu.tw/news.php",
+    ]
+    assert all(hosts == ("csie.nptu.edu.tw",) for _, hosts in http.calls)
 
 
 def test_site_search_prioritizes_query_relevant_links_before_unrelated_pages() -> None:

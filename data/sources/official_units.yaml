@@ -1,0 +1,546 @@
+source_url: https://www.nptu.edu.tw/p/412-1000-2972.php?Lang=zh-tw
+verified_at: "2026-07-18"
+units:
+  - canonical_name: 管理學院
+    aliases: [管院]
+    unit_type: college
+    homepage_url: https://ccm.nptu.edu.tw/
+    allowed_hosts: [ccm.nptu.edu.tw]
+    site_search: {seed_urls: [https://ccm.nptu.edu.tw/], preferred_hosts: [ccm.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 商業大數據學系
+    aliases: [商大數系]
+    unit_type: department
+    parent_unit: 管理學院
+    homepage_url: https://data.nptu.edu.tw/
+    allowed_hosts: [data.nptu.edu.tw]
+    site_search: {seed_urls: [https://data.nptu.edu.tw/], preferred_hosts: [data.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 行銷與流通管理學系
+    aliases: [行流系]
+    unit_type: department
+    parent_unit: 管理學院
+    homepage_url: https://mdm.nptu.edu.tw/
+    allowed_hosts: [mdm.nptu.edu.tw]
+    site_search: {seed_urls: [https://mdm.nptu.edu.tw/], preferred_hosts: [mdm.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 休閒事業經營學系
+    aliases: [休閒系]
+    unit_type: department
+    parent_unit: 管理學院
+    homepage_url: https://leisure.nptu.edu.tw/
+    allowed_hosts: [leisure.nptu.edu.tw]
+    site_search: {seed_urls: [https://leisure.nptu.edu.tw/], preferred_hosts: [leisure.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 不動產經營學系
+    aliases: [不動系, 不動產系]
+    unit_type: department
+    parent_unit: 管理學院
+    homepage_url: https://rem.nptu.edu.tw/
+    allowed_hosts: [rem.nptu.edu.tw]
+    site_search: {seed_urls: [https://rem.nptu.edu.tw/], preferred_hosts: [rem.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 企業管理學系
+    aliases: [企管系]
+    unit_type: department
+    parent_unit: 管理學院
+    homepage_url: https://mba.nptu.edu.tw/
+    allowed_hosts: [mba.nptu.edu.tw]
+    site_search: {seed_urls: [https://mba.nptu.edu.tw/], preferred_hosts: [mba.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 國際經營與貿易學系
+    aliases: [國貿系]
+    unit_type: department
+    parent_unit: 管理學院
+    homepage_url: https://business.nptu.edu.tw/
+    allowed_hosts: [business.nptu.edu.tw]
+    site_search: {seed_urls: [https://business.nptu.edu.tw/], preferred_hosts: [business.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 財務金融學系
+    aliases: [財金系]
+    unit_type: department
+    parent_unit: 管理學院
+    homepage_url: https://finance.nptu.edu.tw/
+    allowed_hosts: [finance.nptu.edu.tw]
+    site_search: {seed_urls: [https://finance.nptu.edu.tw/], preferred_hosts: [finance.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 會計學系
+    aliases: [會計系]
+    unit_type: department
+    parent_unit: 管理學院
+    homepage_url: https://accd.nptu.edu.tw/
+    allowed_hosts: [accd.nptu.edu.tw]
+    site_search: {seed_urls: [https://accd.nptu.edu.tw/], preferred_hosts: [accd.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 高階經營管理碩士在職專班
+    aliases: [EMBA]
+    unit_type: degree_program
+    parent_unit: 管理學院
+    homepage_url: https://emba.nptu.edu.tw/
+    allowed_hosts: [emba.nptu.edu.tw]
+    site_search: {seed_urls: [https://emba.nptu.edu.tw/], preferred_hosts: [emba.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 大數據商務應用學士學位學程
+    aliases: []
+    unit_type: degree_program
+    parent_unit: 管理學院
+    enabled: false
+    status: discontinued
+    homepage_url: https://bigdata.nptu.edu.tw/
+    allowed_hosts: [bigdata.nptu.edu.tw]
+    site_search: {seed_urls: [], preferred_hosts: []}
+    announcements: {strategy: unsupported}
+    unsupported_reason: 113 學年停招，不作為最新公告來源。
+
+  - canonical_name: 資訊學院
+    aliases: [資院]
+    unit_type: college
+    homepage_url: https://ccs.nptu.edu.tw/
+    allowed_hosts: [ccs.nptu.edu.tw]
+    site_search: {seed_urls: [https://ccs.nptu.edu.tw/], preferred_hosts: [ccs.nptu.edu.tw]}
+    announcements:
+      strategy: configured_listing
+      source_name: information-college-html
+      listing_url: https://ccs.nptu.edu.tw/p/403-1025-1019-1.php?Lang=zh-tw
+      adapter: nptu_html_list
+      selectors:
+        listing: section.mb
+        item: .row.listBS
+        date: i.mdate
+        title_link: .mtitle > a[href]
+        link_attribute: href
+  - canonical_name: 電腦與通訊學系
+    aliases: [電通系]
+    unit_type: department
+    parent_unit: 資訊學院
+    homepage_url: https://com.nptu.edu.tw/
+    allowed_hosts: [com.nptu.edu.tw]
+    site_search: {seed_urls: [https://com.nptu.edu.tw/], preferred_hosts: [com.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 資訊工程學系
+    aliases: [資工系]
+    unit_type: department
+    parent_unit: 資訊學院
+    homepage_url: https://csie.nptu.edu.tw/
+    allowed_hosts: [csie.nptu.edu.tw]
+    site_search: {seed_urls: [https://csie.nptu.edu.tw/], preferred_hosts: [csie.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 電腦科學與人工智慧學系
+    aliases: [電科系]
+    unit_type: department
+    parent_unit: 資訊學院
+    homepage_url: https://cs.nptu.edu.tw/
+    allowed_hosts: [cs.nptu.edu.tw]
+    site_search: {seed_urls: [https://cs.nptu.edu.tw/], preferred_hosts: [cs.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 資訊管理學系
+    aliases: [資管系]
+    unit_type: department
+    parent_unit: 資訊學院
+    homepage_url: https://mis.nptu.edu.tw/
+    allowed_hosts: [mis.nptu.edu.tw]
+    site_search: {seed_urls: [https://mis.nptu.edu.tw/], preferred_hosts: [mis.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 智慧機器人學系
+    aliases: [機器人系, 智機系]
+    unit_type: department
+    parent_unit: 資訊學院
+    homepage_url: https://intersci.nptu.edu.tw/
+    allowed_hosts: [intersci.nptu.edu.tw]
+    site_search: {seed_urls: [https://intersci.nptu.edu.tw/], preferred_hosts: [intersci.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 國際資訊科技與應用碩士學位學程
+    aliases: [國際資訊碩士學程]
+    unit_type: degree_program
+    parent_unit: 資訊學院
+    homepage_url: https://iita.nptu.edu.tw/
+    allowed_hosts: [iita.nptu.edu.tw]
+    site_search: {seed_urls: [https://iita.nptu.edu.tw/], preferred_hosts: [iita.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+
+  - canonical_name: 教育學院
+    aliases: []
+    unit_type: college
+    homepage_url: https://cedu.nptu.edu.tw/
+    allowed_hosts: [cedu.nptu.edu.tw]
+    site_search: {seed_urls: [https://cedu.nptu.edu.tw/], preferred_hosts: [cedu.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 教育行政研究所
+    aliases: [教行所]
+    unit_type: institute
+    parent_unit: 教育學院
+    homepage_url: https://giea.nptu.edu.tw/
+    allowed_hosts: [giea.nptu.edu.tw]
+    site_search: {seed_urls: [https://giea.nptu.edu.tw/], preferred_hosts: [giea.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 教育心理與輔導學系
+    aliases: [教心輔系]
+    unit_type: department
+    parent_unit: 教育學院
+    homepage_url: https://epc.nptu.edu.tw/
+    allowed_hosts: [epc.nptu.edu.tw]
+    site_search: {seed_urls: [https://epc.nptu.edu.tw/], preferred_hosts: [epc.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 教育學系
+    aliases: [教育系]
+    unit_type: department
+    parent_unit: 教育學院
+    homepage_url: https://edu.nptu.edu.tw/
+    allowed_hosts: [edu.nptu.edu.tw]
+    site_search: {seed_urls: [https://edu.nptu.edu.tw/], preferred_hosts: [edu.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 特殊教育學系
+    aliases: [特教系]
+    unit_type: department
+    parent_unit: 教育學院
+    homepage_url: https://special.nptu.edu.tw/
+    allowed_hosts: [special.nptu.edu.tw]
+    site_search: {seed_urls: [https://special.nptu.edu.tw/], preferred_hosts: [special.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 幼兒教育學系
+    aliases: [幼教系]
+    unit_type: department
+    parent_unit: 教育學院
+    homepage_url: https://ec.nptu.edu.tw/
+    allowed_hosts: [ec.nptu.edu.tw]
+    site_search: {seed_urls: [https://ec.nptu.edu.tw/], preferred_hosts: [ec.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: STEM教育國際碩士學位學程
+    aliases: [STEM學程]
+    unit_type: degree_program
+    parent_unit: 教育學院
+    homepage_url: https://stem.nptu.edu.tw/
+    allowed_hosts: [stem.nptu.edu.tw]
+    site_search: {seed_urls: [https://stem.nptu.edu.tw/], preferred_hosts: [stem.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 特殊教育中心
+    aliases: [特教中心]
+    unit_type: academic_center
+    parent_unit: 教育學院
+    homepage_url: https://spec.nptu.edu.tw/
+    allowed_hosts: [spec.nptu.edu.tw]
+    site_search: {seed_urls: [https://spec.nptu.edu.tw/], preferred_hosts: [spec.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 社區諮商中心
+    aliases: []
+    unit_type: academic_center
+    parent_unit: 教育學院
+    homepage_url: https://counsel-c.nptu.edu.tw/
+    allowed_hosts: [counsel-c.nptu.edu.tw]
+    site_search: {seed_urls: [https://counsel-c.nptu.edu.tw/], preferred_hosts: [counsel-c.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 文教事業經營碩士在職學位學程
+    aliases: []
+    unit_type: degree_program
+    parent_unit: 教育學院
+    enabled: false
+    status: discontinued
+    homepage_url: https://mmec.nptu.edu.tw/
+    allowed_hosts: [mmec.nptu.edu.tw]
+    site_search: {seed_urls: [], preferred_hosts: []}
+    announcements: {strategy: unsupported}
+    unsupported_reason: 110 學年停招，不作為最新公告來源。
+
+  - canonical_name: 人文社會學院
+    aliases: [人社院]
+    unit_type: college
+    homepage_url: https://lsod.nptu.edu.tw/
+    allowed_hosts: [lsod.nptu.edu.tw]
+    site_search: {seed_urls: [https://lsod.nptu.edu.tw/], preferred_hosts: [lsod.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 視覺藝術學系
+    aliases: [視藝系]
+    unit_type: department
+    parent_unit: 人文社會學院
+    homepage_url: https://vart.nptu.edu.tw/
+    allowed_hosts: [vart.nptu.edu.tw]
+    site_search: {seed_urls: [https://vart.nptu.edu.tw/], preferred_hosts: [vart.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 音樂學系
+    aliases: [音樂系]
+    unit_type: department
+    parent_unit: 人文社會學院
+    homepage_url: https://music.nptu.edu.tw/
+    allowed_hosts: [music.nptu.edu.tw]
+    site_search: {seed_urls: [https://music.nptu.edu.tw/], preferred_hosts: [music.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 文化創意產業學系
+    aliases: [文創系]
+    unit_type: department
+    parent_unit: 人文社會學院
+    homepage_url: https://cci.nptu.edu.tw/
+    allowed_hosts: [cci.nptu.edu.tw]
+    site_search: {seed_urls: [https://cci.nptu.edu.tw/], preferred_hosts: [cci.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 社會發展學系
+    aliases: [社發系]
+    unit_type: department
+    parent_unit: 人文社會學院
+    homepage_url: https://social.nptu.edu.tw/
+    allowed_hosts: [social.nptu.edu.tw]
+    site_search: {seed_urls: [https://social.nptu.edu.tw/], preferred_hosts: [social.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 中國語文學系
+    aliases: [中文系]
+    unit_type: department
+    parent_unit: 人文社會學院
+    homepage_url: https://cll.nptu.edu.tw/
+    allowed_hosts: [cll.nptu.edu.tw]
+    site_search: {seed_urls: [https://cll.nptu.edu.tw/], preferred_hosts: [cll.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 應用日語學系
+    aliases: [應日系]
+    unit_type: department
+    parent_unit: 人文社會學院
+    homepage_url: https://daj.nptu.edu.tw/
+    allowed_hosts: [daj.nptu.edu.tw]
+    site_search: {seed_urls: [https://daj.nptu.edu.tw/], preferred_hosts: [daj.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 應用英語學系
+    aliases: [應英系]
+    unit_type: department
+    parent_unit: 人文社會學院
+    homepage_url: https://dae.nptu.edu.tw/
+    allowed_hosts: [dae.nptu.edu.tw]
+    site_search: {seed_urls: [https://dae.nptu.edu.tw/], preferred_hosts: [dae.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 英語學系
+    aliases: [英語系, 英文系]
+    unit_type: department
+    parent_unit: 人文社會學院
+    homepage_url: https://english.nptu.edu.tw/
+    allowed_hosts: [english.nptu.edu.tw]
+    site_search: {seed_urls: [https://english.nptu.edu.tw/], preferred_hosts: [english.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 文化發展學士學位學程原住民專班
+    aliases: [原民專班]
+    unit_type: degree_program
+    parent_unit: 人文社會學院
+    homepage_url: https://indigenous.nptu.edu.tw/
+    allowed_hosts: [indigenous.nptu.edu.tw]
+    site_search: {seed_urls: [https://indigenous.nptu.edu.tw/], preferred_hosts: [indigenous.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 文化事業發展碩士學位學程原住民專班
+    aliases: []
+    unit_type: degree_program
+    parent_unit: 人文社會學院
+    homepage_url: https://indigenous.nptu.edu.tw/
+    allowed_hosts: [indigenous.nptu.edu.tw]
+    site_search: {seed_urls: [https://indigenous.nptu.edu.tw/], preferred_hosts: [indigenous.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 客家文化產業碩士學位學程
+    aliases: [客家碩士學程]
+    unit_type: degree_program
+    parent_unit: 人文社會學院
+    homepage_url: https://hakkam.nptu.edu.tw/
+    allowed_hosts: [hakkam.nptu.edu.tw]
+    site_search: {seed_urls: [https://hakkam.nptu.edu.tw/], preferred_hosts: [hakkam.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 客家研究中心
+    aliases: []
+    unit_type: academic_center
+    parent_unit: 人文社會學院
+    homepage_url: https://hakka.nptu.edu.tw/
+    allowed_hosts: [hakka.nptu.edu.tw]
+    site_search: {seed_urls: [https://hakka.nptu.edu.tw/], preferred_hosts: [hakka.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 原住民族教育研究中心
+    aliases: [原教中心]
+    unit_type: academic_center
+    parent_unit: 人文社會學院
+    homepage_url: https://ierc.nptu.edu.tw/
+    allowed_hosts: [ierc.nptu.edu.tw]
+    site_search: {seed_urls: [https://ierc.nptu.edu.tw/], preferred_hosts: [ierc.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 藝文中心
+    aliases: []
+    unit_type: academic_center
+    parent_unit: 人文社會學院
+    homepage_url: https://artscenter.nptu.edu.tw/
+    allowed_hosts: [artscenter.nptu.edu.tw]
+    site_search: {seed_urls: [https://artscenter.nptu.edu.tw/], preferred_hosts: [artscenter.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+
+  - canonical_name: 理學院
+    aliases: []
+    unit_type: college
+    homepage_url: https://science.nptu.edu.tw/
+    allowed_hosts: [science.nptu.edu.tw]
+    site_search: {seed_urls: [https://science.nptu.edu.tw/], preferred_hosts: [science.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 科學傳播學系
+    aliases: [科傳系]
+    unit_type: department
+    parent_unit: 理學院
+    homepage_url: https://dsc.nptu.edu.tw/
+    allowed_hosts: [dsc.nptu.edu.tw]
+    site_search: {seed_urls: [https://dsc.nptu.edu.tw/], preferred_hosts: [dsc.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 應用化學系
+    aliases: [應化系, 化學系]
+    unit_type: department
+    parent_unit: 理學院
+    homepage_url: https://ac.nptu.edu.tw/
+    allowed_hosts: [ac.nptu.edu.tw]
+    site_search: {seed_urls: [https://ac.nptu.edu.tw/], preferred_hosts: [ac.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 應用數學系
+    aliases: [應數系, 數學系]
+    unit_type: department
+    parent_unit: 理學院
+    homepage_url: https://math.nptu.edu.tw/
+    allowed_hosts: [math.nptu.edu.tw]
+    site_search: {seed_urls: [https://math.nptu.edu.tw/], preferred_hosts: [math.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 應用物理系
+    aliases: [應物系, 物理系]
+    unit_type: department
+    parent_unit: 理學院
+    homepage_url: https://physics.nptu.edu.tw/
+    allowed_hosts: [physics.nptu.edu.tw]
+    site_search: {seed_urls: [https://physics.nptu.edu.tw/], preferred_hosts: [physics.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 體育學系
+    aliases: [體育系]
+    unit_type: department
+    parent_unit: 理學院
+    homepage_url: https://phy.nptu.edu.tw/
+    allowed_hosts: [phy.nptu.edu.tw]
+    site_search: {seed_urls: [https://phy.nptu.edu.tw/], preferred_hosts: [phy.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 理學院應用科學國際碩士班
+    aliases: [應科國際碩士班]
+    unit_type: degree_program
+    parent_unit: 理學院
+    homepage_url: https://asims.nptu.edu.tw/
+    allowed_hosts: [asims.nptu.edu.tw]
+    site_search: {seed_urls: [https://asims.nptu.edu.tw/], preferred_hosts: [asims.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 理學院應用科學國際博士班
+    aliases: [應科國際博士班]
+    unit_type: degree_program
+    parent_unit: 理學院
+    homepage_url: https://asiphd.nptu.edu.tw/
+    allowed_hosts: [asiphd.nptu.edu.tw]
+    site_search: {seed_urls: [https://asiphd.nptu.edu.tw/], preferred_hosts: [asiphd.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 理學院半導體材料科學碩士班
+    aliases: [半導體碩士班]
+    unit_type: degree_program
+    parent_unit: 理學院
+    homepage_url: https://semims.nptu.edu.tw/
+    allowed_hosts: [semims.nptu.edu.tw]
+    site_search: {seed_urls: [https://semims.nptu.edu.tw/], preferred_hosts: [semims.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+
+  - canonical_name: 國際學院
+    aliases: []
+    unit_type: college
+    homepage_url: https://iicollege.nptu.edu.tw/
+    allowed_hosts: [iicollege.nptu.edu.tw]
+    site_search: {seed_urls: [https://iicollege.nptu.edu.tw/], preferred_hosts: [iicollege.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 東南亞發展中心
+    aliases: [東南亞中心]
+    unit_type: academic_center
+    parent_unit: 國際學院
+    homepage_url: https://sadc.nptu.edu.tw/
+    allowed_hosts: [sadc.nptu.edu.tw]
+    site_search: {seed_urls: [https://sadc.nptu.edu.tw/], preferred_hosts: [sadc.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 華語教學中心
+    aliases: [華語中心]
+    unit_type: academic_center
+    parent_unit: 國際學院
+    homepage_url: https://clc.nptu.edu.tw/
+    allowed_hosts: [clc.nptu.edu.tw]
+    site_search: {seed_urls: [https://clc.nptu.edu.tw/], preferred_hosts: [clc.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+
+  - canonical_name: 大武山學院
+    aliases: []
+    unit_type: college
+    homepage_url: https://dawu.nptu.edu.tw/
+    allowed_hosts: [dawu.nptu.edu.tw]
+    site_search: {seed_urls: [https://dawu.nptu.edu.tw/], preferred_hosts: [dawu.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 共同教育中心
+    aliases: [共教中心]
+    unit_type: academic_center
+    parent_unit: 大武山學院
+    homepage_url: https://geccce.nptu.edu.tw/
+    allowed_hosts: [geccce.nptu.edu.tw]
+    site_search: {seed_urls: [https://geccce.nptu.edu.tw/], preferred_hosts: [geccce.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 博雅教育中心
+    aliases: [博雅中心]
+    unit_type: academic_center
+    parent_unit: 大武山學院
+    homepage_url: https://gec.nptu.edu.tw/
+    allowed_hosts: [gec.nptu.edu.tw]
+    site_search: {seed_urls: [https://gec.nptu.edu.tw/], preferred_hosts: [gec.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 跨領域學程中心
+    aliases: [跨領域中心]
+    unit_type: academic_center
+    parent_unit: 大武山學院
+    homepage_url: https://cis.nptu.edu.tw/
+    allowed_hosts: [cis.nptu.edu.tw]
+    site_search: {seed_urls: [https://cis.nptu.edu.tw/], preferred_hosts: [cis.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: EMI發展中心
+    aliases: [EMI中心]
+    unit_type: academic_center
+    parent_unit: 大武山學院
+    homepage_url: https://emi.nptu.edu.tw/
+    allowed_hosts: [emi.nptu.edu.tw]
+    site_search: {seed_urls: [https://emi.nptu.edu.tw/], preferred_hosts: [emi.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 大武山社會實踐暨永續發展中心
+    aliases: [USR中心]
+    unit_type: academic_center
+    parent_unit: 大武山學院
+    homepage_url: https://usr.nptu.edu.tw/
+    allowed_hosts: [usr.nptu.edu.tw]
+    site_search: {seed_urls: [https://usr.nptu.edu.tw/], preferred_hosts: [usr.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 新媒體創意應用碩士學位學程
+    aliases: [新媒體碩士學程]
+    unit_type: degree_program
+    parent_unit: 大武山學院
+    homepage_url: https://nm.nptu.edu.tw/
+    allowed_hosts: [nm.nptu.edu.tw]
+    site_search: {seed_urls: [https://nm.nptu.edu.tw/], preferred_hosts: [nm.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 大武山跨領域學士學位學程
+    aliases: [大武山跨域學程]
+    unit_type: degree_program
+    parent_unit: 大武山學院
+    homepage_url: https://mdis.nptu.edu.tw/
+    allowed_hosts: [mdis.nptu.edu.tw]
+    site_search: {seed_urls: [https://mdis.nptu.edu.tw/], preferred_hosts: [mdis.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+
+  - canonical_name: 師資培育中心
+    aliases: [師培中心]
+    unit_type: academic_center
+    homepage_url: https://cte.nptu.edu.tw/
+    allowed_hosts: [cte.nptu.edu.tw]
+    site_search: {seed_urls: [https://cte.nptu.edu.tw/], preferred_hosts: [cte.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 教育學程組
+    aliases: []
+    unit_type: group
+    parent_unit: 師資培育中心
+    homepage_url: https://cte.nptu.edu.tw/
+    allowed_hosts: [cte.nptu.edu.tw]
+    site_search: {seed_urls: [https://cte.nptu.edu.tw/], preferred_hosts: [cte.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}
+  - canonical_name: 實習及輔導組
+    aliases: []
+    unit_type: group
+    parent_unit: 師資培育中心
+    homepage_url: https://cte.nptu.edu.tw/
+    allowed_hosts: [cte.nptu.edu.tw]
+    site_search: {seed_urls: [https://cte.nptu.edu.tw/], preferred_hosts: [cte.nptu.edu.tw]}
+    announcements: {strategy: scoped_site_search}

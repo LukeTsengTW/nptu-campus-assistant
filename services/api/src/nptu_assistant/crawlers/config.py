@@ -320,12 +320,40 @@ def _load_payload(path: Path) -> dict[str, object]:
     return payload
 
 
-def load_source_configs(path: Path) -> list[CrawlerSourceConfig]:
+def load_source_configs(
+    path: Path,
+    official_units_path: Path | None = None,
+) -> list[CrawlerSourceConfig]:
     payload = _load_payload(path)
     sources = payload.get("sources")
     if not isinstance(sources, list):
         raise ValueError("crawler 設定必須包含 sources list")
     configs = [CrawlerSourceConfig.model_validate(item) for item in sources]
+    directory_path = official_units_path or path.with_name("official_units.yaml")
+    if directory_path.exists():
+        from nptu_assistant.crawlers.official_units import (
+            load_official_unit_directory,
+        )
+
+        directory = load_official_unit_directory(directory_path)
+        for unit in directory.configured_listing_configs():
+            announcement = unit.announcements
+            configs.append(
+                CrawlerSourceConfig(
+                    name=announcement.source_name or "",
+                    adapter=announcement.adapter or "",
+                    url=announcement.listing_url or "",
+                    unit=unit.canonical_name,
+                    aliases=[unit.canonical_name],
+                    category="學術單位公告",
+                    enabled=unit.enabled,
+                    crawl_interval_minutes=announcement.crawl_interval_minutes,
+                    max_items=announcement.max_items,
+                    allowed_hosts=unit.allowed_hosts,
+                    selectors=announcement.selectors,
+                    detail=DetailPageConfig(enabled=announcement.detail_enabled),
+                )
+            )
     if len({item.name for item in configs}) != len(configs):
         raise ValueError("crawler source name 不可重複")
     return configs
@@ -335,4 +363,19 @@ def load_keyword_search_config(path: Path) -> KeywordSearchConfig:
     payload = _load_payload(path)
     if not isinstance(payload.get("keyword_search"), dict):
         raise ValueError("crawler 設定必須包含 keyword_search mapping")
-    return KeywordSearchConfig.model_validate(payload["keyword_search"])
+    config = KeywordSearchConfig.model_validate(payload["keyword_search"])
+    directory_path = path.with_name("official_units.yaml")
+    if directory_path.exists():
+        from nptu_assistant.crawlers.official_units import (
+            load_official_unit_directory,
+        )
+
+        directory = load_official_unit_directory(directory_path)
+        merged_aliases = dict(directory.aliases)
+        for alias, canonical in config.aliases.items():
+            existing = merged_aliases.get(alias)
+            if existing is not None and existing != canonical:
+                raise ValueError(f"單位 alias 對應衝突：{alias}={existing}/{canonical}")
+            merged_aliases[alias] = canonical
+        config.aliases = merged_aliases
+    return config
