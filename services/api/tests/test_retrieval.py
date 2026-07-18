@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.sql.elements import TextClause
 
 from nptu_assistant.api.schemas import AnswerType
 from nptu_assistant.crawlers.config import SiteSearchConfig
@@ -87,6 +88,21 @@ class FakeFactory:
 
     def __call__(self) -> FakeSession:
         return self.session
+
+
+class PostgresDeadlineSession(FakeSession):
+    def __init__(self, clock: object | None = None) -> None:
+        super().__init__()
+        self.clock = clock
+
+    def get_bind(self) -> object:
+        return SimpleNamespace(dialect=postgresql.dialect())
+
+    def execute(self, statement: object) -> FakeResult:
+        self.statements.append(statement)
+        if not isinstance(statement, TextClause) and self.clock is not None:
+            self.clock.value += 1.1
+        return FakeResult()
 
 
 def sql(statement: object) -> str:
@@ -444,3 +460,27 @@ def test_document_multi_query_embedding_uses_remaining_live_deadline() -> None:
         )
 
     assert embedding.timeouts == [pytest.approx(1.0)]
+
+
+def test_document_sql_uses_statement_timeout_and_checks_deadline_after_query() -> None:
+    class FakeClock:
+        def __init__(self) -> None:
+            self.value = 0.0
+
+        def __call__(self) -> float:
+            return self.value
+
+    clock = FakeClock()
+    session = PostgresDeadlineSession(clock)
+    deadline = SearchDeadline.after(1.0, clock=clock)
+
+    with pytest.raises(SearchDeadlineExceeded):
+        make_retriever(session).search_documents_with_plan(
+            plan=SearchPlan.from_query("校務資訊"),
+            limit=6,
+            deadline=deadline,
+        )
+
+    assert len(session.statements) == 2
+    assert str(session.statements[0]).startswith("SET LOCAL statement_timeout = 1000")
+    assert not isinstance(session.statements[1], TextClause)

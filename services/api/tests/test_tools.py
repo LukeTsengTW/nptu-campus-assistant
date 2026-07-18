@@ -1,19 +1,21 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import date
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
 from nptu_assistant.api.schemas import AnswerType, CrawlSummary, IngestionSummary
-from nptu_assistant.crawlers.search import KeywordIngestionResult
 from nptu_assistant.crawlers.config import (
     load_keyword_search_config,
     load_source_configs,
 )
 from nptu_assistant.crawlers.refresh import RefreshResult
 from nptu_assistant.crawlers.resolution import UnitSourceResolver
+from nptu_assistant.crawlers.search import KeywordIngestionResult
 from nptu_assistant.crawlers.site_models import (
     SearchDeadline,
     SearchDiagnostics,
@@ -21,6 +23,7 @@ from nptu_assistant.crawlers.site_models import (
 )
 from nptu_assistant.crawlers.site_search import (
     SITE_SEARCH_FAILURE_WARNING,
+    SITE_SEARCH_PARTIAL_WARNING,
     SitePageIngestionResult,
 )
 from nptu_assistant.rag.models import Evidence
@@ -32,7 +35,6 @@ from nptu_assistant.rag.tools import (
     ToolExecutor,
     tool_definitions,
 )
-from pathlib import Path
 
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
@@ -117,10 +119,31 @@ class StubRefresher:
         )
 
 
+class FakeClock:
+    def __init__(self) -> None:
+        self.value = 0.0
+
+    def __call__(self) -> float:
+        return self.value
+
+    def advance(self, seconds: float) -> None:
+        self.value += seconds
+
+
 class DocumentSequenceRetriever(StubRetriever):
-    def __init__(self, responses: list[list[Evidence]]) -> None:
+    def __init__(
+        self,
+        responses: list[list[Evidence]],
+        *,
+        clock: FakeClock | None = None,
+        advances: list[float] | None = None,
+    ) -> None:
         super().__init__()
         self.responses = responses
+        self.clock = clock
+        self.advances = list(advances or [])
+        self.deadlines: list[SearchDeadline | None] = []
+        self.remaining_seconds: list[float | None] = []
 
     def search_documents(self, **kwargs: object) -> list[Evidence]:
         self.calls.append(("search_documents", kwargs))
@@ -128,40 +151,89 @@ class DocumentSequenceRetriever(StubRetriever):
 
     def search_documents_with_plan(self, **kwargs: object) -> list[Evidence]:
         self.calls.append(("search_documents_with_plan", kwargs))
+        deadline = kwargs.get("deadline")
+        typed_deadline = deadline if isinstance(deadline, SearchDeadline) else None
+        self.deadlines.append(typed_deadline)
+        self.remaining_seconds.append(
+            typed_deadline.remaining_seconds() if typed_deadline else None
+        )
+        if self.clock is not None and self.advances:
+            self.clock.advance(self.advances.pop(0))
+        if typed_deadline is not None:
+            typed_deadline.raise_if_expired()
         return self.responses.pop(0)
 
 
 class StubSitePageIngestor:
-    def __init__(self, *, search_live: bool) -> None:
+    def __init__(
+        self,
+        *,
+        search_live: bool,
+        clock: FakeClock | None = None,
+        timeout_seconds: float = 10.0,
+        advance_seconds: float = 0.0,
+        ingestion_result: SitePageIngestionResult | None = None,
+    ) -> None:
         self.search_live = search_live
         self.plans: list[SearchPlan] = []
+        self.clock = clock or FakeClock()
+        self.deadline = SearchDeadline.after(timeout_seconds, clock=self.clock)
+        self.advance_seconds = advance_seconds
+        self.ingestion_result = ingestion_result
+        self.new_deadline_calls = 0
+        self.deadlines: list[SearchDeadline] = []
+        self.remaining_seconds: list[float] = []
+
+    def new_deadline(self) -> SearchDeadline:
+        self.new_deadline_calls += 1
+        return self.deadline
 
     def should_search_live(self, evidence: list[Evidence]) -> bool:
         del evidence
         return self.search_live
 
-    def ingest(self, plan: SearchPlan, *, max_items: int) -> SitePageIngestionResult:
+    def ingest(
+        self,
+        plan: SearchPlan,
+        *,
+        max_items: int,
+        deadline: SearchDeadline,
+    ) -> SitePageIngestionResult:
         assert max_items == plan.limit
         self.plans.append(plan)
+        self.deadlines.append(deadline)
+        self.remaining_seconds.append(deadline.remaining_seconds())
+        self.clock.advance(self.advance_seconds)
+        if self.ingestion_result is not None:
+            return replace(self.ingestion_result, deadline=deadline)
         return SitePageIngestionResult(
             IngestionSummary(created=1),
             None,
             SearchDiagnostics(relevant_success_count=1),
+            deadline,
+            relevant_pages_found=1,
+            relevant_pages_persisted=1,
         )
 
 
 class TimedOutSitePageIngestor(StubSitePageIngestor):
     def __init__(self) -> None:
-        super().__init__(search_live=True)
-
-    def ingest(self, plan: SearchPlan, *, max_items: int) -> SitePageIngestionResult:
-        assert max_items == plan.limit
-        self.plans.append(plan)
-        return SitePageIngestionResult(
-            IngestionSummary(),
-            SITE_SEARCH_FAILURE_WARNING,
-            SearchDiagnostics(query_timed_out=True),
-            SearchDeadline(expires_at=0.0, _clock=lambda: 1.0),
+        super().__init__(
+            search_live=True,
+            timeout_seconds=1.0,
+            advance_seconds=1.1,
+            ingestion_result=SitePageIngestionResult(
+                IngestionSummary(),
+                None,
+                SearchDiagnostics(
+                    relevant_success_count=1,
+                    query_timed_out=True,
+                ),
+                relevant_pages_found=1,
+                relevant_pages_persisted=0,
+                ingestion_timed_out=True,
+                ingestion_complete=False,
+            ),
         )
 
 
@@ -354,7 +426,10 @@ def test_document_search_uses_reliable_database_results_before_live_discovery() 
     assert kwargs == {
         "plan": SearchDocumentsArguments.model_validate(arguments),
         "limit": 6,
+        "deadline": ingestor.deadline,
     }
+    assert retriever.deadlines == [ingestor.deadline]
+    assert ingestor.new_deadline_calls == 1
 
 
 def test_document_search_runs_one_live_plan_then_reranks_database_results() -> None:
@@ -393,6 +468,258 @@ def test_document_search_runs_one_live_plan_then_reranks_database_results() -> N
         call[1]["plan"].search_queries == arguments["search_queries"]
         for call in retriever.calls
     )
+    assert retriever.deadlines == [ingestor.deadline, ingestor.deadline]
+    assert ingestor.deadlines == [ingestor.deadline]
+    assert retriever.deadlines[0] is ingestor.deadlines[0]
+    assert ingestor.deadlines[0] is retriever.deadlines[1]
+
+
+def test_document_search_initial_retrieval_timeout_stops_live_search() -> None:
+    clock = FakeClock()
+    retriever = DocumentSequenceRetriever([[]], clock=clock, advances=[10.1])
+    ingestor = StubSitePageIngestor(
+        search_live=True,
+        clock=clock,
+        timeout_seconds=10.0,
+    )
+    executor = ToolExecutor(retriever, site_page_ingestor=ingestor)
+
+    result = executor.execute(
+        "search_documents",
+        json.dumps(
+            {
+                "query": "校務資訊完整查詢",
+                "search_queries": ["校務資料", "官方資訊"],
+                "concepts": ["校務", "官方資料"],
+                "limit": 6,
+            },
+            ensure_ascii=False,
+        ),
+    )
+    payload = json.loads(result.output)
+
+    assert result.evidence == []
+    assert payload["warning"] == SITE_SEARCH_FAILURE_WARNING
+    assert "SearchDeadlineExceeded" not in result.output
+    assert "tool_execution_error" not in result.output
+    assert len(retriever.calls) == 1
+    assert ingestor.plans == []
+
+
+def test_document_search_live_ingestion_receives_remaining_initial_deadline() -> None:
+    clock = FakeClock()
+    retriever = DocumentSequenceRetriever(
+        [[], []],
+        clock=clock,
+        advances=[4.0, 0.0],
+    )
+    ingestor = StubSitePageIngestor(
+        search_live=True,
+        clock=clock,
+        timeout_seconds=10.0,
+    )
+    executor = ToolExecutor(retriever, site_page_ingestor=ingestor)
+
+    executor.execute(
+        "search_documents",
+        json.dumps(
+            {
+                "query": "校務資訊完整查詢",
+                "search_queries": ["校務資料", "官方資訊"],
+                "concepts": ["校務", "官方資料"],
+                "limit": 6,
+            },
+            ensure_ascii=False,
+        ),
+    )
+
+    assert ingestor.remaining_seconds == pytest.approx([6.0])
+    assert retriever.deadlines[0] is ingestor.deadlines[0]
+
+
+def test_document_search_refreshed_retrieval_uses_remaining_deadline() -> None:
+    clock = FakeClock()
+    retriever = DocumentSequenceRetriever(
+        [[], []],
+        clock=clock,
+        advances=[2.0, 0.0],
+    )
+    ingestor = StubSitePageIngestor(
+        search_live=True,
+        clock=clock,
+        timeout_seconds=10.0,
+        advance_seconds=5.0,
+    )
+    executor = ToolExecutor(retriever, site_page_ingestor=ingestor)
+
+    executor.execute(
+        "search_documents",
+        json.dumps(
+            {
+                "query": "校務資訊完整查詢",
+                "search_queries": ["校務資料", "官方資訊"],
+                "concepts": ["校務", "官方資料"],
+                "limit": 6,
+            },
+            ensure_ascii=False,
+        ),
+    )
+
+    assert retriever.remaining_seconds == pytest.approx([10.0, 3.0])
+    assert retriever.deadlines[0] is retriever.deadlines[1]
+
+
+def test_document_search_weak_cache_and_ingestion_timeout_is_partial() -> None:
+    weak = Evidence(
+        id="cached-weak",
+        kind=AnswerType.OFFICIAL_DOCUMENT,
+        title="舊版校務說明",
+        url="https://www.nptu.edu.tw/cached-weak",
+        unit="教務處",
+        published_at=None,
+        content="僅提供概略資訊。",
+        score=0.31,
+    )
+    clock = FakeClock()
+    retriever = DocumentSequenceRetriever([[weak]], clock=clock)
+    ingestor = StubSitePageIngestor(
+        search_live=True,
+        clock=clock,
+        timeout_seconds=1.0,
+        advance_seconds=1.1,
+        ingestion_result=SitePageIngestionResult(
+            IngestionSummary(),
+            None,
+            SearchDiagnostics(relevant_success_count=1, query_timed_out=True),
+            relevant_pages_found=1,
+            relevant_pages_persisted=0,
+            ingestion_timed_out=True,
+            ingestion_complete=False,
+        ),
+    )
+    executor = ToolExecutor(retriever, site_page_ingestor=ingestor)
+
+    result = executor.execute(
+        "search_documents",
+        json.dumps(
+            {
+                "query": "校務資訊完整查詢",
+                "search_queries": ["校務資料", "官方資訊"],
+                "concepts": ["校務", "官方資料"],
+                "limit": 6,
+            },
+            ensure_ascii=False,
+        ),
+    )
+
+    assert result.evidence == [weak]
+    assert result.warning == SITE_SEARCH_PARTIAL_WARNING
+    assert json.loads(result.output)["warning"] == SITE_SEARCH_PARTIAL_WARNING
+
+
+def test_document_search_partial_persist_returns_refreshed_partial_result() -> None:
+    refreshed = Evidence(
+        id="persisted-page",
+        kind=AnswerType.OFFICIAL_DOCUMENT,
+        title="已寫入的相關頁面",
+        url="https://www.nptu.edu.tw/persisted-page",
+        unit="國立屏東大學",
+        published_at=None,
+        content="第一頁已成功寫入。",
+        score=0.79,
+    )
+    retriever = DocumentSequenceRetriever([[], [refreshed]])
+    ingestor = StubSitePageIngestor(
+        search_live=True,
+        ingestion_result=SitePageIngestionResult(
+            IngestionSummary(created=1),
+            None,
+            SearchDiagnostics(relevant_success_count=2),
+            relevant_pages_found=2,
+            relevant_pages_persisted=1,
+            ingestion_complete=False,
+        ),
+    )
+    executor = ToolExecutor(retriever, site_page_ingestor=ingestor)
+
+    result = executor.execute(
+        "search_documents",
+        json.dumps(
+            {
+                "query": "校務資訊完整查詢",
+                "search_queries": ["校務資料", "官方資訊"],
+                "concepts": ["校務", "官方資料"],
+                "limit": 6,
+            },
+            ensure_ascii=False,
+        ),
+    )
+
+    assert result.evidence == [refreshed]
+    assert result.warning == SITE_SEARCH_PARTIAL_WARNING
+
+
+def test_document_search_complete_ingestion_has_no_warning() -> None:
+    refreshed = Evidence(
+        id="fresh-page",
+        kind=AnswerType.OFFICIAL_DOCUMENT,
+        title="完整新資料",
+        url="https://www.nptu.edu.tw/fresh-page",
+        unit="國立屏東大學",
+        published_at=None,
+        content="相關頁面已完整寫入並重新檢索。",
+        score=0.84,
+    )
+    retriever = DocumentSequenceRetriever([[], [refreshed]])
+    ingestor = StubSitePageIngestor(search_live=True)
+    executor = ToolExecutor(retriever, site_page_ingestor=ingestor)
+
+    result = executor.execute(
+        "search_documents",
+        json.dumps(
+            {
+                "query": "校務資訊完整查詢",
+                "search_queries": ["校務資料", "官方資訊"],
+                "concepts": ["校務", "官方資料"],
+                "limit": 6,
+            },
+            ensure_ascii=False,
+        ),
+    )
+
+    assert result.evidence == [refreshed]
+    assert result.warning is None
+
+
+def test_document_search_normal_zero_result_has_no_warning() -> None:
+    retriever = DocumentSequenceRetriever([[], []])
+    ingestor = StubSitePageIngestor(
+        search_live=True,
+        ingestion_result=SitePageIngestionResult(
+            IngestionSummary(),
+            None,
+            SearchDiagnostics(),
+            relevant_pages_found=0,
+            relevant_pages_persisted=0,
+        ),
+    )
+    executor = ToolExecutor(retriever, site_page_ingestor=ingestor)
+
+    result = executor.execute(
+        "search_documents",
+        json.dumps(
+            {
+                "query": "不存在的校務主題",
+                "search_queries": ["無結果主題"],
+                "concepts": ["無結果"],
+                "limit": 6,
+            },
+            ensure_ascii=False,
+        ),
+    )
+
+    assert result.evidence == []
+    assert result.warning is None
 
 
 def test_document_search_does_not_refresh_database_after_live_deadline() -> None:
@@ -414,6 +741,7 @@ def test_document_search_does_not_refresh_database_after_live_deadline() -> None
     assert result.evidence == []
     assert len(retriever.calls) == 1
     assert retriever.calls[0][0] == "search_documents_with_plan"
+    assert result.warning == SITE_SEARCH_FAILURE_WARNING
     assert json.loads(result.output)["warning"] == SITE_SEARCH_FAILURE_WARNING
 
 

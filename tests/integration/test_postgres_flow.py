@@ -14,11 +14,23 @@ from sqlalchemy.exc import DataError
 from nptu_assistant.core.settings import Settings
 from nptu_assistant.crawlers.models import AnnouncementCandidate
 from nptu_assistant.crawlers.service import CrawlerService
+from nptu_assistant.crawlers.site_models import SearchDeadline, SearchPlan
 from nptu_assistant.api.schemas import AnswerType
-from nptu_assistant.db.models import Announcement, Conversation, ConversationEvent, Document, Source
-from nptu_assistant.db.repositories import SqlAnnouncementRepository, SqlDocumentRepository
+from nptu_assistant.db.models import (
+    Announcement,
+    Conversation,
+    ConversationEvent,
+    Document,
+    Source,
+)
+from nptu_assistant.db.repositories import (
+    SqlAnnouncementRepository,
+    SqlDocumentRepository,
+)
 from nptu_assistant.db.session import create_session_factory
+from nptu_assistant.ingestion.chunking import TextChunk
 from nptu_assistant.ingestion.cleaning import extract_clean_html
+from nptu_assistant.ingestion.metadata import DocumentMetadata
 from nptu_assistant.ingestion.parsers import parse_document
 from nptu_assistant.ingestion.service import DocumentIngestionService
 from nptu_assistant.main import create_app
@@ -100,7 +112,9 @@ def test_fixture_ingestion_crawl_and_grounded_chat(tmp_path: Path) -> None:
                 encoding="utf-8"
             )
         )
-        announcement_chat = client.post("/v1/chat", json={"question": f"公告\n{detail}"})
+        announcement_chat = client.post(
+            "/v1/chat", json={"question": f"公告\n{detail}"}
+        )
         announcements = client.get("/v1/announcements?page=1&page_size=20")
 
         assert announcement_chat.status_code == 200
@@ -110,7 +124,9 @@ def test_fixture_ingestion_crawl_and_grounded_chat(tmp_path: Path) -> None:
         )
         assert announcements.status_code == 200
         assert announcements.json()["total"] >= 1
-        published_dates = [item["published_at"] for item in announcements.json()["items"]]
+        published_dates = [
+            item["published_at"] for item in announcements.json()["items"]
+        ]
         assert published_dates == sorted(published_dates, reverse=True)
 
 
@@ -209,7 +225,10 @@ def test_structured_announcement_retrieval_filters_sorts_and_gets_by_id() -> Non
     assert len(relevance) == 3
     assert all(query in item.title for item in relevance)
     assert [item.id for item in oldest] == public_ids[:2]
-    assert [item.published_at for item in ranged] == [date(2026, 7, 3), date(2026, 7, 2)]
+    assert [item.published_at for item in ranged] == [
+        date(2026, 7, 3),
+        date(2026, 7, 2),
+    ]
     assert all(item.url != fixture_url for item in newest + relevance + oldest + ranged)
     assert retriever.get_announcement(public_ids[0]).id == public_ids[0]
     assert retriever.get_announcement(fixture_id) is None
@@ -306,7 +325,92 @@ version: "1.0"
     assert current.supersedes_document_id == previous.id
 
 
-def test_announcement_content_change_reports_updated_then_unchanged(tmp_path: Path) -> None:
+def test_postgres_multi_query_document_retrieval_uses_vector_trigram_and_rrf() -> None:
+    settings = Settings(_env_file=None, database_url=os.environ["DATABASE_URL"])
+    factory = create_session_factory(settings)
+    repository = SqlDocumentRepository(factory)
+    embedding = FakeEmbeddingProvider(1536)
+    retriever = SqlRetriever(factory, embedding)
+    unique = uuid.uuid4().hex
+    admission_url = f"https://www.nptu.edu.tw/{unique}/admission"
+    dormitory_url = f"https://www.nptu.edu.tw/{unique}/dormitory-electricity"
+    admission_chunks = [
+        TextChunk(
+            sequence=0,
+            content="大學申請入學新生專區，錄取生應依規定完成網路報到。",
+            token_count=24,
+        ),
+        TextChunk(
+            sequence=1,
+            content="申請入學錄取新生須在期限內完成報到程序。",
+            token_count=22,
+        ),
+    ]
+    dormitory_chunks = [
+        TextChunk(
+            sequence=0,
+            content="學生宿舍用電依度數與公告收費標準計算。",
+            token_count=21,
+        )
+    ]
+    repository.save(
+        DocumentMetadata(
+            title="大學申請入學新生專區",
+            source_url=admission_url,
+            unit="教務處",
+            effective_from=date.today(),
+            document_type="official_web_page",
+            version=unique,
+        ),
+        "\n".join(chunk.content for chunk in admission_chunks),
+        admission_chunks,
+        embedding.embed([chunk.content for chunk in admission_chunks]),
+    )
+    repository.save(
+        DocumentMetadata(
+            title="住宿服務中心學生宿舍用電計費辦法",
+            source_url=dormitory_url,
+            unit="學務處",
+            effective_from=date.today(),
+            document_type="official_web_page",
+            version=unique,
+        ),
+        dormitory_chunks[0].content,
+        dormitory_chunks,
+        embedding.embed([dormitory_chunks[0].content]),
+    )
+
+    admission = retriever.search_documents_with_plan(
+        plan=SearchPlan(
+            query="個人申請新生資訊",
+            search_queries=["大學申請入學", "申請入學新生報到"],
+            concepts=["個人申請", "申請入學", "新生", "報到"],
+            limit=6,
+        ),
+        limit=6,
+        deadline=SearchDeadline.after(10),
+    )
+    dormitory = retriever.search_documents_with_plan(
+        plan=SearchPlan(
+            query="學生宿舍冷氣費怎麼計算",
+            search_queries=["宿舍電費計價", "學生宿舍用電收費標準"],
+            concepts=["學生宿舍", "冷氣", "電費", "收費"],
+            limit=6,
+        ),
+        limit=6,
+        deadline=SearchDeadline.after(10),
+    )
+
+    assert admission[0].url == admission_url
+    assert dormitory[0].url == dormitory_url
+    assert sum(item.url == admission_url for item in admission) == 1
+    assert len({item.url for item in admission}) == len(admission)
+    assert all(0.0 <= item.score <= 1.0 for item in admission + dormitory)
+
+
+def test_announcement_content_change_reports_updated_then_unchanged(
+    tmp_path: Path,
+) -> None:
     unique = uuid.uuid4().hex
     canonical_url = f"https://www.nptu.edu.tw/integration-announcement-{unique}"
     fixture_dir = tmp_path / "announcements"
@@ -320,7 +424,9 @@ def test_announcement_content_change_reports_updated_then_unchanged(tmp_path: Pa
         encoding="utf-8",
     )
     detail = fixture_dir / "detail.html"
-    detail.write_text("<main><h1>整合測試公告</h1><p>第一版內容</p></main>", encoding="utf-8")
+    detail.write_text(
+        "<main><h1>整合測試公告</h1><p>第一版內容</p></main>", encoding="utf-8"
+    )
     config = tmp_path / "sources.yaml"
     config.write_text(
         f"""sources:
@@ -344,7 +450,9 @@ def test_announcement_content_change_reports_updated_then_unchanged(tmp_path: Pa
     )
 
     first = service.run([f"integration-fixture-{unique}"])
-    detail.write_text("<main><h1>整合測試公告</h1><p>第二版內容</p></main>", encoding="utf-8")
+    detail.write_text(
+        "<main><h1>整合測試公告</h1><p>第二版內容</p></main>", encoding="utf-8"
+    )
     second = service.run([f"integration-fixture-{unique}"])
     third = service.run([f"integration-fixture-{unique}"])
 
@@ -418,18 +526,24 @@ def test_announcement_source_snapshot_tri_state_and_metadata_only_update() -> No
         warning="測試警告",
     )
 
-    assert repository.upsert(
-        original,
-        source_name=source_name,
-        source_url=source_url,
-        interval_minutes=60,
-    ) == "created"
-    assert repository.upsert(
-        updated_metadata,
-        source_name=source_name,
-        source_url=source_url,
-        interval_minutes=60,
-    ) == "unchanged"
+    assert (
+        repository.upsert(
+            original,
+            source_name=source_name,
+            source_url=source_url,
+            interval_minutes=60,
+        )
+        == "created"
+    )
+    assert (
+        repository.upsert(
+            updated_metadata,
+            source_name=source_name,
+            source_url=source_url,
+            interval_minutes=60,
+        )
+        == "unchanged"
+    )
 
     with factory() as session:
         stored = session.scalar(

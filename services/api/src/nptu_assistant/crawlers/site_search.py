@@ -392,6 +392,10 @@ class SitePageIngestionResult:
     warning: str | None
     diagnostics: SearchDiagnostics = SearchDiagnostics()
     deadline: SearchDeadline | None = None
+    relevant_pages_found: int = 0
+    relevant_pages_persisted: int = 0
+    ingestion_timed_out: bool = False
+    ingestion_complete: bool = True
 
 
 class SitePageIngestionService:
@@ -416,13 +420,17 @@ class SitePageIngestionService:
         ]
         return len(reliable) < self._config.database_min_results
 
+    def new_deadline(self) -> SearchDeadline:
+        return self._search.new_deadline()
+
     def ingest(
         self,
         plan: SearchPlan | str,
         *,
         max_items: int,
+        deadline: SearchDeadline | None = None,
     ) -> SitePageIngestionResult:
-        deadline = self._search.new_deadline()
+        deadline = deadline or self.new_deadline()
         search_result = self._search.search(
             plan,
             max_items=max_items,
@@ -430,6 +438,28 @@ class SitePageIngestionService:
         )
         diagnostics = search_result.diagnostics
         summary = IngestionSummary()
+        relevant_pages_found = len(search_result.pages)
+        relevant_pages_persisted = 0
+
+        def result(
+            warning: str | None,
+            *,
+            timed_out: bool = False,
+        ) -> SitePageIngestionResult:
+            return SitePageIngestionResult(
+                summary=summary,
+                warning=warning,
+                diagnostics=diagnostics,
+                deadline=deadline,
+                relevant_pages_found=relevant_pages_found,
+                relevant_pages_persisted=relevant_pages_persisted,
+                ingestion_timed_out=timed_out,
+                ingestion_complete=(
+                    relevant_pages_persisted == relevant_pages_found
+                    and summary.failed == 0
+                ),
+            )
+
         prepared: list[tuple[NptuSitePage, str, str, list[TextChunk]]] = []
         for page in search_result.pages:
             try:
@@ -443,17 +473,16 @@ class SitePageIngestionService:
                 deadline.raise_if_expired()
                 if already_stored:
                     summary.skipped += 1
+                    relevant_pages_persisted += 1
                     continue
                 chunks = chunk_text(raw_text)
                 deadline.raise_if_expired()
                 prepared.append((page, raw_text, digest, chunks))
             except SearchDeadlineExceeded:
                 diagnostics = replace(diagnostics, query_timed_out=True)
-                return SitePageIngestionResult(
-                    summary,
+                return result(
                     self._warning_for(diagnostics),
-                    diagnostics,
-                    deadline,
+                    timed_out=True,
                 )
             except Exception as exc:
                 summary.failed += 1
@@ -478,32 +507,23 @@ class SitePageIngestionService:
             deadline.raise_if_expired()
         except SearchDeadlineExceeded:
             diagnostics = replace(diagnostics, query_timed_out=True)
-            return SitePageIngestionResult(
-                summary,
+            return result(
                 self._warning_for(diagnostics),
-                diagnostics,
-                deadline,
+                timed_out=True,
             )
         except Exception as exc:
             if deadline.expired():
                 diagnostics = replace(diagnostics, query_timed_out=True)
-                return SitePageIngestionResult(
-                    summary,
+                return result(
                     self._warning_for(diagnostics),
-                    diagnostics,
-                    deadline,
+                    timed_out=True,
                 )
             summary.failed += len(prepared)
             summary.errors.extend(
                 f"{page.canonical_url}: {type(exc).__name__}"
                 for page, _raw_text, _digest, _chunks in prepared
             )
-            return SitePageIngestionResult(
-                summary,
-                SITE_SEARCH_FAILURE_WARNING,
-                diagnostics,
-                deadline,
-            )
+            return result(SITE_SEARCH_FAILURE_WARNING)
 
         embedding_offset = 0
         for page, raw_text, digest, chunks in prepared:
@@ -526,6 +546,7 @@ class SitePageIngestionService:
                 )
                 self._repository.save(metadata, raw_text, chunks, embeddings)
                 summary.created += 1
+                relevant_pages_persisted += 1
                 deadline.raise_if_expired()
             except SearchDeadlineExceeded:
                 diagnostics = replace(diagnostics, query_timed_out=True)
@@ -541,7 +562,7 @@ class SitePageIngestionService:
                 if summary.created == 0 and summary.skipped == 0
                 else SITE_SEARCH_PARTIAL_WARNING
             )
-        return SitePageIngestionResult(summary, warning, diagnostics, deadline)
+        return result(warning, timed_out=diagnostics.query_timed_out)
 
     def _warning_for(self, diagnostics: SearchDiagnostics) -> str | None:
         if diagnostics.relevant_success_count == 0:

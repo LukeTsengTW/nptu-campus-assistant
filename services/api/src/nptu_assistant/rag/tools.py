@@ -18,6 +18,7 @@ from nptu_assistant.crawlers.search import (
 )
 from nptu_assistant.crawlers.site_search import (
     SITE_SEARCH_FAILURE_WARNING,
+    SITE_SEARCH_PARTIAL_WARNING,
     ScoredEvidence,
     SitePageIngestionResult,
 )
@@ -188,10 +189,19 @@ class KeywordAnnouncementIngestor(Protocol):
 
 
 class SitePageIngestor(Protocol):
+    def new_deadline(self) -> SearchDeadline:
+        raise NotImplementedError
+
     def should_search_live(self, evidence: Collection[ScoredEvidence]) -> bool:
         raise NotImplementedError
 
-    def ingest(self, plan: SearchPlan, *, max_items: int) -> SitePageIngestionResult:
+    def ingest(
+        self,
+        plan: SearchPlan,
+        *,
+        max_items: int,
+        deadline: SearchDeadline,
+    ) -> SitePageIngestionResult:
         raise NotImplementedError
 
 
@@ -421,36 +431,90 @@ class ToolExecutor:
         self,
         parsed: SearchDocumentsArguments,
     ) -> tuple[list[Evidence], str | None]:
-        cached = self._retriever.search_documents_with_plan(
-            plan=parsed,
-            limit=parsed.limit,
-        )
-        if (
-            self._site_page_ingestor is None
-            or not self._site_page_ingestor.should_search_live(cached)
-        ):
+        if self._site_page_ingestor is None:
+            return (
+                self._retriever.search_documents_with_plan(
+                    plan=parsed,
+                    limit=parsed.limit,
+                ),
+                None,
+            )
+        deadline = self._site_page_ingestor.new_deadline()
+        try:
+            cached = self._retriever.search_documents_with_plan(
+                plan=parsed,
+                limit=parsed.limit,
+                deadline=deadline,
+            )
+        except SearchDeadlineExceeded:
+            return [], SITE_SEARCH_FAILURE_WARNING
+        if not self._site_page_ingestor.should_search_live(cached):
             return cached, None
+        if deadline.expired():
+            return cached, self._document_search_fallback_warning(cached)
         try:
             ingestion = self._site_page_ingestor.ingest(
                 parsed,
                 max_items=parsed.limit,
+                deadline=deadline,
             )
         except Exception:
-            return cached, SITE_SEARCH_FAILURE_WARNING
-        if ingestion.deadline is not None and ingestion.deadline.expired():
-            warning = ingestion.warning
-            if not cached and warning is None:
-                warning = SITE_SEARCH_FAILURE_WARNING
-            return cached, warning
+            return cached, self._document_search_fallback_warning(cached)
+        if deadline.expired():
+            return cached, self._document_search_warning(
+                cached=cached,
+                final_evidence=cached,
+                ingestion=ingestion,
+                refreshed_completed=False,
+            )
         try:
             refreshed = self._retriever.search_documents_with_plan(
                 plan=parsed,
                 limit=parsed.limit,
-                deadline=ingestion.deadline,
+                deadline=deadline,
             )
-        except SearchDeadlineExceeded:
-            return cached, ingestion.warning or SITE_SEARCH_FAILURE_WARNING
-        return refreshed or cached, ingestion.warning
+        except Exception:
+            return cached, self._document_search_warning(
+                cached=cached,
+                final_evidence=cached,
+                ingestion=ingestion,
+                refreshed_completed=False,
+            )
+        final_evidence = refreshed or cached
+        return final_evidence, self._document_search_warning(
+            cached=cached,
+            final_evidence=final_evidence,
+            ingestion=ingestion,
+            refreshed_completed=True,
+        )
+
+    @staticmethod
+    def _document_search_fallback_warning(
+        cached: Collection[Evidence],
+    ) -> str:
+        return SITE_SEARCH_PARTIAL_WARNING if cached else SITE_SEARCH_FAILURE_WARNING
+
+    @classmethod
+    def _document_search_warning(
+        cls,
+        *,
+        cached: Collection[Evidence],
+        final_evidence: Collection[Evidence],
+        ingestion: SitePageIngestionResult,
+        refreshed_completed: bool,
+    ) -> str | None:
+        ingestion_incomplete = (
+            ingestion.ingestion_timed_out
+            or not ingestion.ingestion_complete
+            or ingestion.relevant_pages_persisted < ingestion.relevant_pages_found
+        )
+        if ingestion_incomplete:
+            return cls._document_search_fallback_warning(final_evidence)
+        if not refreshed_completed and ingestion.relevant_pages_found:
+            return cls._document_search_fallback_warning(cached)
+        if ingestion.relevant_pages_found and not final_evidence:
+            return SITE_SEARCH_FAILURE_WARNING
+        return ingestion.warning
 
     def execute(self, name: str, arguments: str) -> ToolExecutionResult:
         validators: dict[str, type[BaseModel]] = {

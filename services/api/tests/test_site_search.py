@@ -208,6 +208,10 @@ def test_site_page_ingestion_indexes_pages_without_pretending_they_are_announcem
 
     assert result.summary.created == 1
     assert result.summary.failed == 0
+    assert result.relevant_pages_found == 1
+    assert result.relevant_pages_persisted == 1
+    assert result.ingestion_timed_out is False
+    assert result.ingestion_complete is True
     assert len(repository.saved) == 1
     metadata, raw_text = repository.saved[0]
     assert metadata.document_type == "official_web_page"

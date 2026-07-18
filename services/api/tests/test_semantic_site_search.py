@@ -267,6 +267,18 @@ class MemoryDocumentRepository:
         self.saved.append(metadata)
 
 
+class ExpiringSaveRepository(MemoryDocumentRepository):
+    def __init__(self, clock: FakeClock, duration: float) -> None:
+        super().__init__()
+        self._clock = clock
+        self._duration = duration
+
+    def save(self, metadata, raw_text, chunks, embeddings) -> None:
+        super().save(metadata, raw_text, chunks, embeddings)
+        if len(self.saved) == 1:
+            self._clock.advance(self._duration)
+
+
 def config(**overrides: object) -> SiteSearchConfig:
     values: dict[str, object] = {
         "enabled": True,
@@ -622,6 +634,54 @@ def test_ingestion_embedding_batch_uses_same_live_search_deadline() -> None:
     assert result.diagnostics.query_timed_out is True
     assert embedding.timeouts == [pytest.approx(1.0)]
     assert repository.saved == []
+    assert result.relevant_pages_found == 1
+    assert result.relevant_pages_persisted == 0
+    assert result.ingestion_timed_out is True
+    assert result.ingestion_complete is False
+
+
+def test_ingestion_reports_partial_persist_before_deadline() -> None:
+    clock = FakeClock()
+    first_url = "https://www.nptu.edu.tw/first"
+    second_url = "https://www.nptu.edu.tw/second"
+    current_config = config(
+        query_timeout_seconds=1.0,
+        relevance_threshold=0.2,
+        high_confidence_score=0.8,
+        early_stop_min_results=2,
+    )
+    search = NptuSiteSearchService(
+        current_config,
+        MappingHttpClient(
+            {
+                first_url: "<main><h1>第一頁</h1><p>完整相關官方內容。</p></main>",
+                second_url: "<main><h1>第二頁</h1><p>另一份相關官方內容。</p></main>",
+            }
+        ),
+        scorer=DeterministicScorer({first_url: 0.9, second_url: 0.85, ROOT_URL: 0.0}),
+        discovery=RecordingDiscovery(
+            (
+                DiscoveredPage(first_url, "第一頁", 0.9),
+                DiscoveredPage(second_url, "第二頁", 0.85),
+            )
+        ),
+        clock=clock,
+    )
+    repository = ExpiringSaveRepository(clock, duration=1.1)
+
+    result = SitePageIngestionService(
+        search,
+        repository,
+        FixtureEmbeddingProvider(),
+        current_config,
+    ).ingest(SearchPlan.from_query("相關官方內容"), max_items=6)
+
+    assert result.summary.created == 1
+    assert result.relevant_pages_found == 2
+    assert result.relevant_pages_persisted == 1
+    assert result.ingestion_timed_out is True
+    assert result.ingestion_complete is False
+    assert len(repository.saved) == 1
 
 
 def test_actual_high_relevance_fetch_failure_emits_partial_warning() -> None:

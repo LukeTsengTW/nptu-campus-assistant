@@ -3,9 +3,10 @@ from __future__ import annotations
 import uuid
 from collections import defaultdict
 from datetime import date
+import math
 from typing import cast
 
-from sqlalchemy import case, desc, func, literal, select
+from sqlalchemy import case, desc, func, literal, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from nptu_assistant.api.schemas import AnswerType
@@ -37,6 +38,29 @@ def _public_announcement_source_filter() -> object:
 def _validate_limit(limit: int) -> None:
     if not 1 <= limit <= 20:
         raise ValueError("limit 必須介於 1 到 20")
+
+
+def _is_postgres_query_cancelled(exc: Exception) -> bool:
+    original = getattr(exc, "orig", None)
+    return (
+        getattr(original, "sqlstate", None) == "57014"
+        or getattr(original, "pgcode", None) == "57014"
+    )
+
+
+def _apply_statement_timeout(
+    session: Session,
+    deadline: SearchDeadline | None,
+) -> None:
+    if deadline is None:
+        return
+    deadline.raise_if_expired()
+    get_bind = getattr(session, "get_bind", None)
+    if get_bind is None or get_bind().dialect.name != "postgresql":
+        return
+    remaining_ms = max(1, math.ceil(deadline.remaining_seconds() * 1_000))
+    session.execute(text(f"SET LOCAL statement_timeout = {remaining_ms}"))
+    deadline.raise_if_expired()
 
 
 class SqlRetriever:
@@ -85,45 +109,60 @@ class SqlRetriever:
             raise ValueError("文件查詢與 embedding 數量不一致")
         base_columns = (DocumentChunk, Document, Source)
         ranked_rows: list[list[object]] = []
-        with self._factory() as session:
-            for query, vector in zip(queries, vectors, strict=True):
-                if deadline is not None:
-                    deadline.raise_if_expired()
-                vector_score = (
-                    1 - DocumentChunk.embedding.cosine_distance(vector)
-                ).label("score")
-                keyword_score = func.greatest(
-                    func.similarity(DocumentChunk.content, query),
-                    func.similarity(Document.title, query),
-                ).label("score")
-                ranked_rows.append(
-                    list(
-                        session.execute(
-                            select(*base_columns, vector_score)
-                            .join(Document, Document.id == DocumentChunk.document_id)
-                            .join(Source, Source.id == Document.source_id)
-                            .where(Document.is_current.is_(True))
-                            .order_by(desc("score"))
-                            .limit(DOCUMENT_QUERY_CANDIDATE_LIMIT)
-                        ).all()
+        try:
+            with self._factory() as session:
+                for query, vector in zip(queries, vectors, strict=True):
+                    if deadline is not None:
+                        deadline.raise_if_expired()
+                    vector_score = (
+                        1 - DocumentChunk.embedding.cosine_distance(vector)
+                    ).label("score")
+                    keyword_score = func.greatest(
+                        func.similarity(DocumentChunk.content, query),
+                        func.similarity(Document.title, query),
+                    ).label("score")
+                    _apply_statement_timeout(session, deadline)
+                    ranked_rows.append(
+                        list(
+                            session.execute(
+                                select(*base_columns, vector_score)
+                                .join(
+                                    Document, Document.id == DocumentChunk.document_id
+                                )
+                                .join(Source, Source.id == Document.source_id)
+                                .where(Document.is_current.is_(True))
+                                .order_by(desc("score"))
+                                .limit(DOCUMENT_QUERY_CANDIDATE_LIMIT)
+                            ).all()
+                        )
                     )
-                )
-                if deadline is not None:
-                    deadline.raise_if_expired()
-                ranked_rows.append(
-                    list(
-                        session.execute(
-                            select(*base_columns, keyword_score)
-                            .join(Document, Document.id == DocumentChunk.document_id)
-                            .join(Source, Source.id == Document.source_id)
-                            .where(Document.is_current.is_(True))
-                            .order_by(desc("score"))
-                            .limit(DOCUMENT_QUERY_CANDIDATE_LIMIT)
-                        ).all()
+                    if deadline is not None:
+                        deadline.raise_if_expired()
+                    _apply_statement_timeout(session, deadline)
+                    ranked_rows.append(
+                        list(
+                            session.execute(
+                                select(*base_columns, keyword_score)
+                                .join(
+                                    Document, Document.id == DocumentChunk.document_id
+                                )
+                                .join(Source, Source.id == Document.source_id)
+                                .where(Document.is_current.is_(True))
+                                .order_by(desc("score"))
+                                .limit(DOCUMENT_QUERY_CANDIDATE_LIMIT)
+                            ).all()
+                        )
                     )
-                )
-                if deadline is not None:
-                    deadline.raise_if_expired()
+                    if deadline is not None:
+                        deadline.raise_if_expired()
+        except SearchDeadlineExceeded:
+            raise
+        except Exception as exc:
+            if deadline is not None and (
+                deadline.expired() or _is_postgres_query_cancelled(exc)
+            ):
+                raise SearchDeadlineExceeded("文件檢索 SQL 已耗盡搜尋時間額度") from exc
+            raise
         return self._rrf_merge(
             ranked_rows,
             queries=queries,
