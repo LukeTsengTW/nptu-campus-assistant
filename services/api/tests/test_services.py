@@ -56,11 +56,18 @@ def test_health_service_reports_ok_degraded_and_unhealthy() -> None:
     )
 
     assert HealthService(HealthyFactory(), fake_settings).check()["status"] == "ok"
-    assert HealthService(HealthyFactory(), openai_without_key).check()["status"] == "degraded"
-    assert HealthService(FailingFactory(), fake_settings).check()["status"] == "unhealthy"
+    assert (
+        HealthService(HealthyFactory(), openai_without_key).check()["status"]
+        == "degraded"
+    )
+    assert (
+        HealthService(FailingFactory(), fake_settings).check()["status"] == "unhealthy"
+    )
 
 
-def test_wiring_shares_one_openai_client_between_text_and_embeddings(monkeypatch) -> None:
+def test_wiring_shares_one_openai_client_between_text_and_embeddings(
+    monkeypatch,
+) -> None:
     clients: list[object] = []
 
     class FakeOpenAIClient:
@@ -85,7 +92,9 @@ def test_wiring_shares_one_openai_client_between_text_and_embeddings(monkeypatch
 
     assert len(clients) == 1
     assert chat_service._llm._client is clients[0]
-    assert chat_service._tool_executor._retriever._embedding_provider._client is clients[0]
+    assert (
+        chat_service._tool_executor._retriever._embedding_provider._client is clients[0]
+    )
     keyword_ingestor = chat_service._tool_executor._keyword_ingestor
     crawler_service = services["crawler_service"]
     assert keyword_ingestor is not None
@@ -186,7 +195,9 @@ def test_document_ingestion_creates_then_skips_same_content(tmp_path: Path) -> N
         encoding="utf-8",
     )
     repository = MemoryDocumentRepository()
-    service = DocumentIngestionService(tmp_path, repository, FakeEmbeddingProvider(1536))
+    service = DocumentIngestionService(
+        tmp_path, repository, FakeEmbeddingProvider(1536)
+    )
 
     first = service.run()
     second = service.run()
@@ -238,7 +249,9 @@ def test_fixture_crawler_creates_then_reports_unchanged(tmp_path: Path) -> None:
     assert repository.source_urls[0].startswith("https://")
 
 
-def test_empty_fixture_listing_is_a_successful_empty_source_scope(tmp_path: Path) -> None:
+def test_empty_fixture_listing_is_a_successful_empty_source_scope(
+    tmp_path: Path,
+) -> None:
     fixture_dir = tmp_path / "data/fixtures/announcements"
     fixture_dir.mkdir(parents=True)
     fixture_dir.joinpath("overview.xml").write_text(
@@ -299,6 +312,7 @@ def test_http_client_checks_robots_and_retries_twice() -> None:
         {"interval_seconds": -1},
         {"max_response_bytes": 0},
         {"max_redirects": -1},
+        {"timeout_seconds": 0},
     ],
 )
 def test_http_client_rejects_invalid_resource_limits(kwargs: dict[str, int]) -> None:
@@ -339,7 +353,11 @@ def test_http_client_rejects_redirect_outside_nptu_allowlist() -> None:
         if request.url.path == "/robots.txt":
             return httpx.Response(200, text="User-agent: *\nAllow: /", request=request)
         if request.url.host == "www.nptu.edu.tw":
-            return httpx.Response(302, headers={"Location": "https://example.com/content"}, request=request)
+            return httpx.Response(
+                302,
+                headers={"Location": "https://example.com/content"},
+                request=request,
+            )
         return httpx.Response(200, text="external", request=request)
 
     client = CrawlHttpClient(
@@ -355,6 +373,30 @@ def test_http_client_rejects_redirect_outside_nptu_allowlist() -> None:
         client.close()
 
     assert "example.com" not in requested_hosts
+
+
+def test_http_client_get_html_rejects_non_html_content_type() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/robots.txt":
+            return httpx.Response(200, text="User-agent: *\nAllow: /", request=request)
+        return httpx.Response(
+            200,
+            content=b"%PDF-1.7",
+            headers={"Content-Type": "application/pdf"},
+            request=request,
+        )
+
+    client = CrawlHttpClient(
+        "NPTU-Test/1.0",
+        interval_seconds=0,
+        sleep=lambda _: None,
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        with pytest.raises(ValueError, match="HTML"):
+            client.get_html("https://www.nptu.edu.tw/file")
+    finally:
+        client.close()
 
 
 def test_http_client_rejects_redirect_outside_source_host_before_request() -> None:
@@ -410,17 +452,22 @@ def test_http_client_allows_validated_redirect_and_checks_target_robots() -> Non
         transport=httpx.MockTransport(handler),
     )
     try:
-        assert client.get(
-            "https://ccs.nptu.edu.tw/list",
-            allowed_hosts=["ccs.nptu.edu.tw"],
-        ) == "redirected"
+        assert (
+            client.get(
+                "https://ccs.nptu.edu.tw/list",
+                allowed_hosts=["ccs.nptu.edu.tw"],
+            )
+            == "redirected"
+        )
     finally:
         client.close()
 
     assert robots_hosts == ["ccs.nptu.edu.tw", "news.ccs.nptu.edu.tw"]
 
 
-def test_http_client_get_form_redirect_uses_location_query_without_reapplying_fields() -> None:
+def test_http_client_get_form_redirect_uses_location_query_without_reapplying_fields() -> (
+    None
+):
     requested_queries: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -474,7 +521,9 @@ def test_http_client_rejects_oversized_response() -> None:
         client.close()
 
 
-def test_crawler_preserves_feed_description_and_records_detail_warning(tmp_path: Path) -> None:
+def test_crawler_preserves_feed_description_and_records_detail_warning(
+    tmp_path: Path,
+) -> None:
     config = tmp_path / "sources.yaml"
     config.write_text(
         """sources:

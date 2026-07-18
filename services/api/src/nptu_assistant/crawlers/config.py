@@ -162,6 +162,22 @@ class CrawlerSourceConfig(BaseModel):
         return self
 
 
+class SiteSearchScoringWeights(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    phrase: float = Field(default=0.16, ge=0, le=1)
+    title: float = Field(default=0.14, ge=0, le=1)
+    heading: float = Field(default=0.10, ge=0, le=1)
+    anchor: float = Field(default=0.10, ge=0, le=1)
+    url: float = Field(default=0.05, ge=0, le=1)
+    body: float = Field(default=0.08, ge=0, le=1)
+    lexical: float = Field(default=0.13, ge=0, le=1)
+    semantic: float = Field(default=0.16, ge=0, le=1)
+    parent: float = Field(default=0.10, ge=0, le=1)
+    discovery: float = Field(default=0.05, ge=0, le=1)
+    depth_penalty: float = Field(default=0.03, ge=0, le=0.25)
+
+
 class SiteSearchConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
@@ -171,6 +187,24 @@ class SiteSearchConfig(BaseModel):
     allowed_hosts: list[str] = Field(default_factory=list)
     max_pages: int = Field(default=40, ge=1, le=200)
     max_items: int = Field(default=20, ge=1, le=20)
+    max_candidate_urls: int = Field(default=80, ge=1, le=500)
+    max_depth: int = Field(default=3, ge=0, le=8)
+    max_pages_per_host: int = Field(default=30, ge=1, le=200)
+    request_timeout_seconds: float = Field(default=15.0, ge=1.0, le=60.0)
+    query_timeout_seconds: float = Field(default=25.0, ge=1.0, le=120.0)
+    max_response_bytes: int = Field(
+        default=2 * 1024 * 1024, ge=1024, le=8 * 1024 * 1024
+    )
+    embedding_batch_size: int = Field(default=32, ge=1, le=128)
+    cache_ttl_seconds: int = Field(default=300, ge=0, le=3600)
+    relevance_threshold: float = Field(default=0.18, ge=0, le=1)
+    high_confidence_score: float = Field(default=0.50, ge=0, le=1)
+    failure_warning_margin: float = Field(default=0.05, ge=0, le=1)
+    early_stop_min_results: int = Field(default=4, ge=1, le=20)
+    database_min_score: float = Field(default=0.58, ge=0, le=1)
+    database_min_results: int = Field(default=2, ge=1, le=20)
+    database_min_content_chars: int = Field(default=160, ge=1, le=10_000)
+    weights: SiteSearchScoringWeights = Field(default_factory=SiteSearchScoringWeights)
     unit: str = "國立屏東大學"
     category: str = "NPTU 網域搜尋"
 
@@ -209,11 +243,17 @@ class SiteSearchConfig(BaseModel):
             try:
                 canonical_url = canonicalize_nptu_url(url)
             except ValueError as exc:
-                raise ValueError("網站搜尋 seed URL 必須是 NPTU 官方 HTTPS 網址") from exc
+                raise ValueError(
+                    "網站搜尋 seed URL 必須是 NPTU 官方 HTTPS 網址"
+                ) from exc
             if not is_allowed_source_url(canonical_url, self.allowed_hosts):
                 raise ValueError("網站搜尋 seed URL 不在 allowed host 範圍內")
             normalized_urls.append(canonical_url)
         self.seed_urls = list(dict.fromkeys(normalized_urls))
+        if self.high_confidence_score < self.relevance_threshold:
+            raise ValueError("高可信度門檻不得低於相關性門檻")
+        if self.max_candidate_urls < self.max_items:
+            raise ValueError("候選 URL 上限不得低於回傳結果上限")
         return self
 
 
@@ -251,7 +291,10 @@ class KeywordSearchConfig(BaseModel):
     @field_validator("aliases")
     @classmethod
     def validate_aliases(cls, value: dict[str, str]) -> dict[str, str]:
-        if any(not alias.strip() or not canonical.strip() for alias, canonical in value.items()):
+        if any(
+            not alias.strip() or not canonical.strip()
+            for alias, canonical in value.items()
+        ):
             raise ValueError("搜尋別名與完整名稱不得為空")
         return {alias.strip(): canonical.strip() for alias, canonical in value.items()}
 
@@ -279,9 +322,10 @@ def _load_payload(path: Path) -> dict[str, object]:
 
 def load_source_configs(path: Path) -> list[CrawlerSourceConfig]:
     payload = _load_payload(path)
-    if not isinstance(payload.get("sources"), list):
+    sources = payload.get("sources")
+    if not isinstance(sources, list):
         raise ValueError("crawler 設定必須包含 sources list")
-    configs = [CrawlerSourceConfig.model_validate(item) for item in payload["sources"]]
+    configs = [CrawlerSourceConfig.model_validate(item) for item in sources]
     if len({item.name for item in configs}) != len(configs):
         raise ValueError("crawler source name 不可重複")
     return configs

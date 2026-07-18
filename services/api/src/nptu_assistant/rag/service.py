@@ -51,7 +51,16 @@ class LlmProvider(Protocol):
 class ConversationStore(Protocol):
     def load_or_create(self, conversation_id: str | None) -> ConversationContext: ...
 
-    def save_turn(self, **kwargs: object) -> None: ...
+    def save_turn(
+        self,
+        *,
+        conversation_id: str,
+        user_message: str,
+        assistant_message: str,
+        warning: str | None,
+        tool_events: list[dict[str, object]],
+        sources: list[Evidence],
+    ) -> None: ...
 
     def delete(self, conversation_id: str) -> bool: ...
 
@@ -64,7 +73,9 @@ def confidence_for_score(score: float) -> Confidence:
     return Confidence.LOW
 
 
-def sanitize_user_facing_text(text: str, *, allowed_urls: set[str] | None = None) -> str:
+def sanitize_user_facing_text(
+    text: str, *, allowed_urls: set[str] | None = None
+) -> str:
     allowed_urls = allowed_urls or set()
     cleaned = _INTERNAL_SOURCE_ID.sub("", text)
 
@@ -106,7 +117,7 @@ class ChatService:
 
     def answer(self, question: str, conversation_id: str | None = None) -> ChatResponse:
         context = self._conversation_store.load_or_create(conversation_id)
-        input_items = [
+        input_items: list[dict[str, object]] = [
             *context.input_items,
             {"role": "user", "content": question},
         ]

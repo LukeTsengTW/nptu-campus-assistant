@@ -69,13 +69,13 @@
 
 ## NPTU 網域搜尋
 
-`keyword_search.site_search` 提供受後端設定控制的同網域搜尋，現行設定從 `https://www.nptu.edu.tw/` 開始，允許 `nptu.edu.tw` 根網域及其子網域，單次最多探索 40 個 HTML 頁面。它不是 Google 索引的鏡像，而是依 seed page 可達的連結做有限頁數的查詢相關性優先探索；每個請求仍會檢查 HTTPS、NPTU host、redirect 與 robots.txt。
+`keyword_search.site_search` 提供受後端設定控制的同網域搜尋，現行設定允許 `nptu.edu.tw` 根網域及其子網域。工具先以 conversation-aware `SearchPlan` 查詢既有 `documents`／`document_chunks`；資料不足時，才以 NPTU 官方搜尋表單與設定 seed 取得候選 URL，再執行 bounded best-first crawl。它不是 Google 索引的鏡像，也不接受模型或使用者提供任意 URL。
 
-探索排序會提高較長、較具辨識度的查詢詞權重；部分頁面失敗只有在命中最具辨識度查詢詞時才會觸發不完整警告，避免無關導覽頁的連線問題遮蔽有效結果。
+探索與最終排序綜合完整片語、title、heading、anchor text、URL path、正文、中文字元 n-gram、批次 embedding、父頁面相關性與深度 penalty。`SearchDiagnostics` 分開統計高相關成功、高相關失敗與無關失敗；只有可能影響答案的高排名失敗才顯示不完整警告，正常零結果不會偽裝成網路錯誤。
 
 - `search_documents`：符合查詢的 HTML 頁面會寫入既有 `documents`／向量索引，無日期頁面以爬取當日作為 `effective_from`，不會冒充公告發布日期。
 - `search_announcements`：只有頁面能解析出發布日期時才會合併到公告搜尋結果；來源名稱、seed URL 與頁面 canonical URL 由後端設定及資料庫保存。
-- 不追蹤外部網址、下載檔案、`javascript:`、`mailto:` 或任意使用者提供的 URL；頁數與結果數上限由 `SiteSearchConfig` 控制。
+- 不追蹤外部網址、下載檔案、`javascript:`、`mailto:` 或任意使用者提供的 URL；候選 URL、頁數、深度、每 host 頁數、查詢時間、response size、embedding batch、cache TTL、相關性門檻與權重均由 typed `SiteSearchConfig` 控制。
 
 ## 單位解析與查詢範圍
 
@@ -97,6 +97,7 @@
 - 連線 timeout 5 秒、整體 timeout 15 秒；timeout、傳輸錯誤與 HTTP 錯誤最多有限重試 3 次。
 - 同 host 請求有節流間隔；單一 process 最多跟隨 5 次 redirect。
 - 回應上限 2 MiB，超過即拒絕。
+- 一般網頁探索只接受 `text/html` 或 `application/xhtml+xml`；即使副檔名不明，PDF、圖片與 JavaScript 回應也不會交給 HTML parser。
 - Extension 不保存來源秘密，也不能要求 crawler 存取任意 URL。
 
 ## 新增或維護 HTML 來源

@@ -10,7 +10,10 @@ import pytest
 from nptu_assistant.api.errors import AppError
 from nptu_assistant.api.schemas import AnswerType
 from nptu_assistant.crawlers.refresh import RefreshResult
-from nptu_assistant.crawlers.config import load_keyword_search_config, load_source_configs
+from nptu_assistant.crawlers.config import (
+    load_keyword_search_config,
+    load_source_configs,
+)
 from nptu_assistant.crawlers.resolution import UnitSourceResolver
 from nptu_assistant.providers.fake import FakeLlmProvider
 from nptu_assistant.rag.models import (
@@ -183,6 +186,15 @@ def announcement_args() -> dict[str, object]:
     }
 
 
+def document_args(query: str = "學生就學貸款申請流程") -> dict[str, object]:
+    return {
+        "query": query,
+        "search_queries": [query, "就學貸款 辦理流程"],
+        "concepts": ["就學貸款", "申請", "流程"],
+        "limit": 6,
+    }
+
+
 def test_chat_executes_tool_and_returns_backend_allowlisted_sources() -> None:
     item = evidence()
     provider = ScriptedProvider(
@@ -193,9 +205,9 @@ def test_chat_executes_tool_and_returns_backend_allowlisted_sources() -> None:
     )
     store = StubConversationStore()
 
-    response = ChatService(StubRetriever({"search_announcements": [item]}), provider, store).answer(
-        "最近公告"
-    )
+    response = ChatService(
+        StubRetriever({"search_announcements": [item]}), provider, store
+    ).answer("最近公告")
 
     assert response.conversation_id == "conversation-1"
     assert response.sources[0].id == item.id
@@ -271,7 +283,9 @@ def test_refresh_failure_without_database_evidence_remains_insufficient() -> Non
     provider = ScriptedProvider(
         [
             function_turn("call-1", "search_announcements", announcement_args()),
-            final_turn("目前收錄的官方資料不足以確認。", [], kind=ResponseKind.INSUFFICIENT),
+            final_turn(
+                "目前收錄的官方資料不足以確認。", [], kind=ResponseKind.INSUFFICIENT
+            ),
         ]
     )
 
@@ -292,23 +306,40 @@ def test_chat_supports_parallel_tools_in_one_model_turn() -> None:
     document = evidence("document-1", kind=AnswerType.OFFICIAL_DOCUMENT)
     first = ModelTurn(
         output_items=[
-            {"type": "function_call", "call_id": "a", "name": "search_announcements", "arguments": json.dumps(announcement_args())},
-            {"type": "function_call", "call_id": "d", "name": "search_documents", "arguments": json.dumps({"query": "學貸", "limit": 6})},
+            {
+                "type": "function_call",
+                "call_id": "a",
+                "name": "search_announcements",
+                "arguments": json.dumps(announcement_args()),
+            },
+            {
+                "type": "function_call",
+                "call_id": "d",
+                "name": "search_documents",
+                "arguments": json.dumps(document_args("學貸")),
+            },
         ],
         tool_calls=[
             ToolCall("a", "search_announcements", json.dumps(announcement_args())),
-            ToolCall("d", "search_documents", json.dumps({"query": "學貸", "limit": 6})),
+            ToolCall("d", "search_documents", json.dumps(document_args("學貸"))),
         ],
     )
-    provider = ScriptedProvider([first, final_turn("公告與流程如下。", [announcement.id, document.id])])
+    provider = ScriptedProvider(
+        [first, final_turn("公告與流程如下。", [announcement.id, document.id])]
+    )
     retriever = StubRetriever(
         {"search_announcements": [announcement], "search_documents": [document]}
     )
 
-    response = ChatService(retriever, provider, StubConversationStore()).answer("學貸公告與流程")
+    response = ChatService(retriever, provider, StubConversationStore()).answer(
+        "學貸公告與流程"
+    )
 
     assert [source.id for source in response.sources] == [announcement.id, document.id]
-    assert [call[0] for call in retriever.calls] == ["search_announcements", "search_documents"]
+    assert [call[0] for call in retriever.calls] == [
+        "search_announcements",
+        "search_documents",
+    ]
 
 
 def test_chat_rejects_unknown_tool_without_executing_retriever() -> None:
@@ -328,7 +359,10 @@ def test_chat_rejects_unknown_tool_without_executing_retriever() -> None:
 
 
 def test_chat_stops_after_four_tool_rounds() -> None:
-    turns = [function_turn(f"call-{index}", "search_announcements", announcement_args()) for index in range(5)]
+    turns = [
+        function_turn(f"call-{index}", "search_announcements", announcement_args())
+        for index in range(5)
+    ]
     service = ChatService(
         StubRetriever({"search_announcements": []}),
         ScriptedProvider(turns),
@@ -380,7 +414,13 @@ def test_grounded_answer_without_valid_sources_becomes_insufficient() -> None:
 def test_clarification_can_return_without_sources() -> None:
     response = ChatService(
         StubRetriever({}),
-        ScriptedProvider([final_turn("請問你指的是哪一類的前五個？", [], kind=ResponseKind.CLARIFICATION)]),
+        ScriptedProvider(
+            [
+                final_turn(
+                    "請問你指的是哪一類的前五個？", [], kind=ResponseKind.CLARIFICATION
+                )
+            ]
+        ),
         StubConversationStore(),
     ).answer("前五個")
 
@@ -441,7 +481,9 @@ def test_no_result_tool_cannot_create_grounded_sources() -> None:
     assert response.sources == []
 
 
-def test_fake_chat_routes_information_college_to_one_source_and_keeps_all_urls() -> None:
+def test_fake_chat_routes_information_college_to_one_source_and_keeps_all_urls() -> (
+    None
+):
     items = [
         replace(
             evidence(f"information-{index}"),
@@ -549,7 +591,9 @@ def test_fake_chat_unit_errors_do_not_refresh_or_query(
     assert refresher.calls == []
 
 
-def test_unit_refresh_failure_uses_only_cached_source_snapshot_and_keeps_warning() -> None:
+def test_unit_refresh_failure_uses_only_cached_source_snapshot_and_keeps_warning() -> (
+    None
+):
     cached = replace(
         evidence("information-cached"),
         title="資訊學院上次成功公告",

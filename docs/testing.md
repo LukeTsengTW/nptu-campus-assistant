@@ -39,6 +39,8 @@ uv run pytest ../../tests/integration
 
 所有自動化測試使用 Fake LLM 與 Fake Embedding Provider。live OpenAI 與 NPTU smoke tests 必須另外標示，不能成為預設測試的必要條件。
 
+一般官方網頁搜尋的主要回歸測試在 `tests/test_semantic_site_search.py`，使用固定 HTML fixture、deterministic embedding provider 與 fake discovery，覆蓋中文無空格、不同用語、對話追問、父頁面相關性傳遞、warning 語意、正常零結果、外部 URL／資源拒絕與禁止招生種類專用 production branch；預設測試不依賴 NPTU live network。
+
 啟用 NPTU 關鍵字公告搜尋 live smoke test：
 
 ```powershell

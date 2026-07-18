@@ -62,6 +62,8 @@ class NptuSitePage:
     published_at: date | None
     links: tuple[str, ...]
     link_texts: tuple[tuple[str, str], ...] = ()
+    headings: tuple[str, ...] = ()
+    score: float = 0.0
 
 
 class NptuSitePageAdapter:
@@ -82,12 +84,18 @@ class NptuSitePageAdapter:
         if title and not body.startswith(title):
             body = f"{title}\n{body}" if body else title
         body = normalize_text(body)[:_MAX_PAGE_TEXT]
+        headings = tuple(
+            dict.fromkeys(
+                heading
+                for node in soup.select("h1, h2, h3, h4, h5, h6")
+                if isinstance(node, Tag)
+                and (heading := normalize_text(node.get_text(" ", strip=True)))
+            )
+        )
         link_texts = tuple(
             self._link_details(soup, canonical_url, allowed_hosts=allowed_hosts)
         )
-        links = tuple(
-            url for url, _label in link_texts
-        )
+        links = tuple(url for url, _label in link_texts)
         return NptuSitePage(
             title=title or canonical_url,
             canonical_url=canonical_url,
@@ -95,6 +103,7 @@ class NptuSitePageAdapter:
             published_at=self._published_at(soup, body),
             links=links,
             link_texts=link_texts,
+            headings=headings,
         )
 
     @staticmethod
@@ -108,7 +117,11 @@ class NptuSitePageAdapter:
             node = soup.select_one(selector)
             if not isinstance(node, Tag):
                 continue
-            value = node.get("content") if node.name == "meta" else node.get_text(" ", strip=True)
+            value = (
+                node.get("content")
+                if node.name == "meta"
+                else node.get_text(" ", strip=True)
+            )
             title = normalize_text(str(value or ""))
             if title:
                 return title
@@ -132,7 +145,13 @@ class NptuSitePageAdapter:
         ):
             if not isinstance(node, Tag):
                 continue
-            candidates.append(str(node.get("datetime") or node.get("data-date") or node.get_text(" ", strip=True)))
+            candidates.append(
+                str(
+                    node.get("datetime")
+                    or node.get("data-date")
+                    or node.get_text(" ", strip=True)
+                )
+            )
         candidates.append(body[:5_000])
         for value in candidates:
             match = _DATE_PATTERN.search(value)
@@ -175,12 +194,16 @@ class NptuSitePageAdapter:
             if not isinstance(node, Tag):
                 continue
             raw_href = str(node.get("href") or "").strip()
-            if not raw_href or raw_href.startswith(("#", "mailto:", "tel:", "javascript:")):
+            if not raw_href or raw_href.startswith(
+                ("#", "mailto:", "tel:", "javascript:")
+            ):
                 continue
             target = urljoin(page_url, raw_href)
             if not is_allowed_nptu_url(target):
                 continue
-            if not is_allowed_source_url(target, allowed_hosts) or not cls._is_crawlable(target):
+            if not is_allowed_source_url(
+                target, allowed_hosts
+            ) or not cls.is_crawlable_url(target):
                 continue
             try:
                 canonical_url = canonicalize_nptu_url(target)
@@ -205,6 +228,6 @@ class NptuSitePageAdapter:
         return [(url, " ".join(labels[url])) for url in links]
 
     @staticmethod
-    def _is_crawlable(url: str) -> bool:
+    def is_crawlable_url(url: str) -> bool:
         path = urlsplit(url).path.lower()
         return not any(path.endswith(suffix) for suffix in _RESOURCE_SUFFIXES)

@@ -33,7 +33,9 @@ def site_config(**overrides: object) -> SiteSearchConfig:
 
 
 def test_project_site_search_is_enabled_and_root_scoped() -> None:
-    config = load_keyword_search_config(WORKSPACE_ROOT / "data/sources/announcements.yaml")
+    config = load_keyword_search_config(
+        WORKSPACE_ROOT / "data/sources/announcements.yaml"
+    )
 
     assert config.site_search is not None
     assert config.site_search.enabled is True
@@ -138,7 +140,9 @@ def test_site_search_prioritizes_query_relevant_links_before_unrelated_pages() -
     ]
 
 
-def test_site_page_ingestion_ignores_lower_priority_failed_pages_in_user_warning() -> None:
+def test_site_page_ingestion_ignores_lower_priority_failed_pages_in_user_warning() -> (
+    None
+):
     pages = {
         "https://www.nptu.edu.tw/": """
         <main><h1>校首頁</h1>
@@ -177,7 +181,9 @@ class MemoryDocumentRepository:
         self.saved.append((metadata, raw_text))
 
 
-def test_site_page_ingestion_indexes_pages_without_pretending_they_are_announcements() -> None:
+def test_site_page_ingestion_indexes_pages_without_pretending_they_are_announcements() -> (
+    None
+):
     html = "<main><h1>校務資訊</h1><p>人工智慧課程與申請說明。</p></main>"
     http = MappingHttpClient({"https://www.nptu.edu.tw/": html})
     config = site_config()

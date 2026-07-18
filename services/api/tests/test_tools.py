@@ -6,12 +6,16 @@ from datetime import date
 import pytest
 from pydantic import ValidationError
 
-from nptu_assistant.api.schemas import AnswerType
-from nptu_assistant.api.schemas import CrawlSummary
+from nptu_assistant.api.schemas import AnswerType, CrawlSummary, IngestionSummary
 from nptu_assistant.crawlers.search import KeywordIngestionResult
-from nptu_assistant.crawlers.config import load_keyword_search_config, load_source_configs
+from nptu_assistant.crawlers.config import (
+    load_keyword_search_config,
+    load_source_configs,
+)
 from nptu_assistant.crawlers.refresh import RefreshResult
 from nptu_assistant.crawlers.resolution import UnitSourceResolver
+from nptu_assistant.crawlers.site_models import SearchDiagnostics, SearchPlan
+from nptu_assistant.crawlers.site_search import SitePageIngestionResult
 from nptu_assistant.rag.models import Evidence
 from nptu_assistant.rag.tools import (
     AnnouncementSort,
@@ -102,6 +106,35 @@ class StubRefresher:
         )
 
 
+class DocumentSequenceRetriever(StubRetriever):
+    def __init__(self, responses: list[list[Evidence]]) -> None:
+        super().__init__()
+        self.responses = responses
+
+    def search_documents(self, **kwargs: object) -> list[Evidence]:
+        self.calls.append(("search_documents", kwargs))
+        return self.responses.pop(0)
+
+
+class StubSitePageIngestor:
+    def __init__(self, *, search_live: bool) -> None:
+        self.search_live = search_live
+        self.plans: list[SearchPlan] = []
+
+    def should_search_live(self, evidence: list[Evidence]) -> bool:
+        del evidence
+        return self.search_live
+
+    def ingest(self, plan: SearchPlan, *, max_items: int) -> SitePageIngestionResult:
+        assert max_items == plan.limit
+        self.plans.append(plan)
+        return SitePageIngestionResult(
+            IngestionSummary(created=1),
+            None,
+            SearchDiagnostics(relevant_success_count=1),
+        )
+
+
 def project_unit_resolver() -> UnitSourceResolver:
     return UnitSourceResolver(
         load_source_configs(CONFIG_PATH),
@@ -141,24 +174,75 @@ def test_search_announcement_arguments_validate_limits_dates_and_extra_fields() 
     assert parsed.date_from == date(2026, 7, 1)
 
     for invalid in (
-        {"query": None, "limit": 0, "sort": "newest", "unit": None, "date_from": None, "date_to": None},
-        {"query": None, "limit": 21, "sort": "newest", "unit": None, "date_from": None, "date_to": None},
-        {"query": None, "limit": 5, "sort": "unknown", "unit": None, "date_from": None, "date_to": None},
-        {"query": None, "limit": 5, "sort": "newest", "unit": None, "date_from": "2026-07-12", "date_to": "2026-07-01"},
-        {"query": None, "limit": 5, "sort": "newest", "unit": None, "date_from": None, "date_to": None, "sql": "select 1"},
+        {
+            "query": None,
+            "limit": 0,
+            "sort": "newest",
+            "unit": None,
+            "date_from": None,
+            "date_to": None,
+        },
+        {
+            "query": None,
+            "limit": 21,
+            "sort": "newest",
+            "unit": None,
+            "date_from": None,
+            "date_to": None,
+        },
+        {
+            "query": None,
+            "limit": 5,
+            "sort": "unknown",
+            "unit": None,
+            "date_from": None,
+            "date_to": None,
+        },
+        {
+            "query": None,
+            "limit": 5,
+            "sort": "newest",
+            "unit": None,
+            "date_from": "2026-07-12",
+            "date_to": "2026-07-01",
+        },
+        {
+            "query": None,
+            "limit": 5,
+            "sort": "newest",
+            "unit": None,
+            "date_from": None,
+            "date_to": None,
+            "sql": "select 1",
+        },
     ):
         with pytest.raises(ValidationError):
             SearchAnnouncementsArguments.model_validate(invalid)
 
 
 def test_other_tool_arguments_reject_missing_and_extra_fields() -> None:
-    assert SearchDocumentsArguments.model_validate({"query": "學貸", "limit": 6}).limit == 6
-    assert GetAnnouncementArguments.model_validate({"announcement_id": "announcement-1"}).announcement_id == "announcement-1"
+    document_plan = {
+        "query": "學生就學貸款申請流程",
+        "search_queries": ["就學貸款 申請", "學生學貸 辦理流程"],
+        "concepts": ["就學貸款", "申請", "流程"],
+        "limit": 6,
+    }
+    assert SearchDocumentsArguments.model_validate(document_plan).limit == 6
+    assert (
+        GetAnnouncementArguments.model_validate(
+            {"announcement_id": "announcement-1"}
+        ).announcement_id
+        == "announcement-1"
+    )
 
     with pytest.raises(ValidationError):
-        SearchDocumentsArguments.model_validate({"query": "學貸"})
+        SearchDocumentsArguments.model_validate({"query": "學貸", "limit": 6})
     with pytest.raises(ValidationError):
-        GetAnnouncementArguments.model_validate({"announcement_id": "announcement-1", "extra": True})
+        SearchDocumentsArguments.model_validate({**document_plan, "unexpected": True})
+    with pytest.raises(ValidationError):
+        GetAnnouncementArguments.model_validate(
+            {"announcement_id": "announcement-1", "extra": True}
+        )
 
 
 def test_executor_validates_arguments_and_serializes_safe_evidence() -> None:
@@ -207,7 +291,75 @@ def test_executor_returns_structured_errors_without_executing_unknown_tools() ->
     assert retriever.calls == []
 
 
-def test_executor_ingests_keyword_before_database_search_and_normalizes_filters() -> None:
+def test_document_search_uses_reliable_database_results_before_live_discovery() -> None:
+    cached = Evidence(
+        id="document-1",
+        kind=AnswerType.OFFICIAL_DOCUMENT,
+        title="就學貸款申請流程",
+        url="https://www.nptu.edu.tw/loan",
+        unit="學務處",
+        published_at=None,
+        content="學生申請就學貸款時應依期限完成校內程序。",
+        score=0.9,
+    )
+    retriever = DocumentSequenceRetriever([[cached]])
+    ingestor = StubSitePageIngestor(search_live=False)
+    executor = ToolExecutor(retriever, site_page_ingestor=ingestor)
+    arguments = {
+        "query": "學生就學貸款申請流程",
+        "search_queries": ["就學貸款 申請", "學生學貸 辦理流程"],
+        "concepts": ["就學貸款", "申請", "流程"],
+        "limit": 6,
+    }
+
+    result = executor.execute(
+        "search_documents", json.dumps(arguments, ensure_ascii=False)
+    )
+
+    assert result.evidence == [cached]
+    assert ingestor.plans == []
+    assert retriever.calls == [
+        ("search_documents", {"query": arguments["query"], "limit": 6})
+    ]
+
+
+def test_document_search_runs_one_live_plan_then_reranks_database_results() -> None:
+    refreshed = Evidence(
+        id="document-2",
+        kind=AnswerType.OFFICIAL_DOCUMENT,
+        title="新生報到流程",
+        url="https://www.nptu.edu.tw/check-in",
+        unit="教務處",
+        published_at=None,
+        content="錄取新生應備妥文件完成報到。",
+        score=0.82,
+    )
+    retriever = DocumentSequenceRetriever([[], [refreshed]])
+    ingestor = StubSitePageIngestor(search_live=True)
+    executor = ToolExecutor(retriever, site_page_ingestor=ingestor)
+    arguments = {
+        "query": "某招生管道錄取新生報到文件",
+        "search_queries": ["錄取新生 報到", "新生註冊 應備文件"],
+        "concepts": ["錄取", "新生", "報到", "應備文件"],
+        "limit": 6,
+    }
+
+    result = executor.execute(
+        "search_documents", json.dumps(arguments, ensure_ascii=False)
+    )
+
+    assert result.evidence == [refreshed]
+    assert len(ingestor.plans) == 1
+    assert ingestor.plans[0].search_queries == arguments["search_queries"]
+    assert [call[0] for call in retriever.calls] == [
+        "search_documents",
+        "search_documents",
+    ]
+
+
+def test_executor_ingests_keyword_before_database_search_and_normalizes_filters() -> (
+    None
+):
     retriever = StubRetriever()
     ingestor = StubKeywordIngestor()
     executor = ToolExecutor(retriever, keyword_ingestor=ingestor)
@@ -273,7 +425,9 @@ def test_executor_treats_generic_announcement_requests_as_newest_listing(
     assert retriever.calls[0][1]["canonical_urls"] == refresher.canonical_urls
 
 
-def test_executor_does_not_ingest_null_query_and_falls_back_on_ingestion_failure() -> None:
+def test_executor_does_not_ingest_null_query_and_falls_back_on_ingestion_failure() -> (
+    None
+):
     retriever = StubRetriever()
     ingestor = StubKeywordIngestor(fail=True)
     executor = ToolExecutor(retriever, keyword_ingestor=ingestor)
@@ -305,7 +459,9 @@ def test_executor_does_not_ingest_null_query_and_falls_back_on_ingestion_failure
         ),
     )
 
-    assert failed.warning == "本次官網公告搜尋失敗，以下內容來自資料庫最後成功收錄的資料。"
+    assert (
+        failed.warning == "本次官網公告搜尋失敗，以下內容來自資料庫最後成功收錄的資料。"
+    )
     assert ingestor.queries == ["電科系"]
     assert len(retriever.calls) == 2
     assert retriever.calls[0][1]["query"] == "電腦科學與人工智慧學系"
@@ -313,7 +469,9 @@ def test_executor_does_not_ingest_null_query_and_falls_back_on_ingestion_failure
     assert retriever.calls[1][1]["canonical_urls"] is None
 
 
-def test_executor_routes_resolved_unit_to_its_source_snapshot_without_keyword_search() -> None:
+def test_executor_routes_resolved_unit_to_its_source_snapshot_without_keyword_search() -> (
+    None
+):
     retriever = StubRetriever()
     refresher = StubRefresher()
     ingestor = StubKeywordIngestor()
@@ -358,7 +516,9 @@ def test_executor_routes_resolved_unit_to_its_source_snapshot_without_keyword_se
     assert result.evidence[0].unit == "資訊學院"
 
 
-def test_resolved_unit_relevance_defaults_to_newest_but_explicit_oldest_is_preserved() -> None:
+def test_resolved_unit_relevance_defaults_to_newest_but_explicit_oldest_is_preserved() -> (
+    None
+):
     retriever = StubRetriever()
     refresher = StubRefresher()
     executor = ToolExecutor(
@@ -421,7 +581,9 @@ def test_executor_returns_unit_resolution_errors_without_refresh_or_retrieval(
     assert ingestor.queries == []
 
 
-def test_unit_refresh_without_any_successful_snapshot_never_falls_back_to_broad_data() -> None:
+def test_unit_refresh_without_any_successful_snapshot_never_falls_back_to_broad_data() -> (
+    None
+):
     retriever = StubRetriever()
     refresher = StubRefresher(None, warning="最新公告更新失敗，請稍後再試。")
     executor = ToolExecutor(

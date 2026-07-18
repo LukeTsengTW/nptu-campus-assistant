@@ -23,7 +23,9 @@ class OutputItem:
 
 
 class Responses:
-    def __init__(self, response: object | None = None, error: Exception | None = None) -> None:
+    def __init__(
+        self, response: object | None = None, error: Exception | None = None
+    ) -> None:
         self.response = response
         self.error = error
         self.captured: dict[str, object] = {}
@@ -72,12 +74,13 @@ def test_fake_llm_runs_a_deterministic_tool_then_grounded_answer() -> None:
     assert second.generated is not None
     assert second.generated.used_source_ids == ["announcement-1"]
     assert second.generated.answer == (
-        "[2026-07-13｜測試公告](https://www.nptu.edu.tw/a)\n"
-        "資料來源：教務處官方網站"
+        "[2026-07-13｜測試公告](https://www.nptu.edu.tw/a)\n資料來源：教務處官方網站"
     )
 
 
-def test_fake_llm_treats_general_recent_announcements_as_an_unfiltered_listing() -> None:
+def test_fake_llm_treats_general_recent_announcements_as_an_unfiltered_listing() -> (
+    None
+):
     turn = FakeLlmProvider().create_turn(
         instructions="test",
         input_items=[{"role": "user", "content": "一般最近公告"}],
@@ -88,7 +91,9 @@ def test_fake_llm_treats_general_recent_announcements_as_an_unfiltered_listing()
     assert json.loads(turn.tool_calls[0].arguments)["query"] is None
 
 
-def test_fake_llm_routes_unit_announcement_and_unit_introduction_to_different_tools() -> None:
+def test_fake_llm_routes_unit_announcement_and_unit_introduction_to_different_tools() -> (
+    None
+):
     provider = FakeLlmProvider()
 
     announcement = provider.create_turn(
@@ -108,6 +113,33 @@ def test_fake_llm_routes_unit_announcement_and_unit_introduction_to_different_to
     assert arguments["sort"] == "newest"
     assert arguments["limit"] == 5
     assert [call.name for call in introduction.tool_calls] == ["search_documents"]
+    document_plan = json.loads(introduction.tool_calls[0].arguments)
+    assert document_plan["query"] == "資訊學院介紹"
+    assert document_plan["search_queries"]
+    assert document_plan["concepts"]
+
+
+def test_fake_llm_resolves_document_follow_up_into_standalone_search_plan() -> None:
+    turn = FakeLlmProvider().create_turn(
+        instructions="test",
+        input_items=[
+            {"role": "user", "content": "查詢個人申請新生入學資訊"},
+            {"role": "assistant", "content": "先前回答"},
+            {"role": "user", "content": "那報到要準備什麼？"},
+        ],
+        tools=[],
+    )
+
+    assert [call.name for call in turn.tool_calls] == ["search_documents"]
+    plan = json.loads(turn.tool_calls[0].arguments)
+    assert plan["query"] == "個人申請新生入學資訊 報到要準備什麼"
+    assert plan["search_queries"] == [
+        "個人申請新生入學資訊 報到要準備什麼",
+        "個人申請新生入學資訊",
+        "報到要準備什麼",
+    ]
+    assert len(plan["search_queries"]) <= 4
+    assert len(plan["concepts"]) <= 8
 
 
 @pytest.mark.parametrize(
@@ -168,7 +200,9 @@ def test_fake_llm_explains_when_requested_announcement_count_exceeds_limit() -> 
     assert "單次查詢上限為 20 則" in turn.generated.answer
 
 
-def test_fake_llm_treats_document_disclaimer_announcement_text_as_document_intent() -> None:
+def test_fake_llm_treats_document_disclaimer_announcement_text_as_document_intent() -> (
+    None
+):
     provider = FakeLlmProvider()
     question = (
         "學生申請請假時，應依規定檢附證明文件，並在期限內完成申請程序。"
@@ -216,7 +250,9 @@ def test_fake_llm_treats_document_disclaimer_announcement_text_as_document_inten
     assert "根據「學生請假規定」" in final.generated.answer
 
 
-def test_fake_llm_preserves_all_announcement_results_and_source_ids_in_tool_order() -> None:
+def test_fake_llm_preserves_all_announcement_results_and_source_ids_in_tool_order() -> (
+    None
+):
     provider = FakeLlmProvider()
     results = [
         {
@@ -239,14 +275,18 @@ def test_fake_llm_preserves_all_announcement_results_and_source_ids_in_tool_orde
             {
                 "type": "function_call_output",
                 "call_id": "fake-announcements",
-                "output": json.dumps({"results": results, "count": 5}, ensure_ascii=False),
+                "output": json.dumps(
+                    {"results": results, "count": 5}, ensure_ascii=False
+                ),
             },
         ],
         tools=[],
     )
 
     assert turn.generated is not None
-    assert turn.generated.used_source_ids == [f"announcement-{index}" for index in range(1, 6)]
+    assert turn.generated.used_source_ids == [
+        f"announcement-{index}" for index in range(1, 6)
+    ]
     assert turn.generated.answer.index("公告1") < turn.generated.answer.index("公告5")
     assert all(item["url"] in turn.generated.answer for item in results)
     assert "announcement-1" not in turn.generated.answer
@@ -343,7 +383,9 @@ def test_openai_provider_parses_function_calls_and_preserves_output_items() -> N
     assert turn.output_items[0]["type"] == "function_call"
     assert responses.captured["model"] == "gpt-5.4-mini"
     assert responses.captured["store"] is False
-    assert responses.captured["tools"] == [{"type": "function", "name": "search_documents"}]
+    assert responses.captured["tools"] == [
+        {"type": "function", "name": "search_documents"}
+    ]
 
 
 def test_openai_provider_parses_strict_grounded_final_answer() -> None:
@@ -369,7 +411,9 @@ def test_openai_provider_parses_strict_grounded_final_answer() -> None:
     assert output_format["name"] == "nptu_grounded_answer"
     assert output_format["strict"] is True
     assert output_format["schema"]["additionalProperties"] is False
-    assert set(output_format["schema"]["required"]) == set(output_format["schema"]["properties"])
+    assert set(output_format["schema"]["required"]) == set(
+        output_format["schema"]["properties"]
+    )
 
 
 def test_openai_provider_maps_invalid_output_timeout_and_rate_limit() -> None:
@@ -378,7 +422,13 @@ def test_openai_provider_maps_invalid_output_timeout_and_rate_limit() -> None:
         "gpt-5.4-mini",
     )
     timeout = OpenAILlmProvider(
-        client_with(Responses(error=APITimeoutError(request=httpx.Request("POST", "https://api.openai.com")))),
+        client_with(
+            Responses(
+                error=APITimeoutError(
+                    request=httpx.Request("POST", "https://api.openai.com")
+                )
+            )
+        ),
         "gpt-5.4-mini",
     )
     rate_limit = OpenAILlmProvider(

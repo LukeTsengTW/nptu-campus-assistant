@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Collection
 from dataclasses import dataclass, replace
 from datetime import date
 from enum import StrEnum
@@ -11,11 +12,16 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 
 from nptu_assistant.crawlers.refresh import REFRESH_FAILURE_WARNING, RefreshResult
 from nptu_assistant.crawlers.resolution import UnitResolutionStatus, UnitSourceResolver
-from nptu_assistant.crawlers.search import FULL_SEARCH_FAILURE_WARNING, KeywordIngestionResult
+from nptu_assistant.crawlers.search import (
+    FULL_SEARCH_FAILURE_WARNING,
+    KeywordIngestionResult,
+)
 from nptu_assistant.crawlers.site_search import (
     SITE_SEARCH_FAILURE_WARNING,
+    ScoredEvidence,
     SitePageIngestionResult,
 )
+from nptu_assistant.crawlers.site_models import SearchPlan
 from nptu_assistant.rag.models import Evidence
 
 
@@ -42,11 +48,8 @@ class SearchAnnouncementsArguments(BaseModel):
         return self
 
 
-class SearchDocumentsArguments(BaseModel):
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
-
-    query: str = Field(min_length=1, max_length=500)
-    limit: int = Field(ge=1, le=20)
+class SearchDocumentsArguments(SearchPlan):
+    pass
 
 
 class GetAnnouncementArguments(BaseModel):
@@ -91,15 +94,38 @@ def tool_definitions() -> list[dict[str, object]]:
         {
             "type": "function",
             "name": "search_documents",
-            "description": "搜尋國立屏東大學校規、申請流程、校務文件與官方網站頁面。",
+            "description": (
+                "搜尋國立屏東大學校規、申請流程、校務文件與官方網站頁面。"
+                "必須依最近對話產生獨立完整 query、少量語意變體與核心概念；"
+                "不得提供 URL，概念不要求全部逐字同時出現。"
+            ),
             "strict": True,
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "適合資料檢索的純查詢文字。"},
+                    "query": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 500,
+                        "description": "已解除代名詞與上下文指涉的 standalone query，不含「查詢、幫我找、請問」等操作詞。",
+                    },
+                    "search_queries": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 4,
+                        "items": {"type": "string", "minLength": 1, "maxLength": 200},
+                        "description": "1 到 4 個語意相近但用語不同的官方資料檢索變體。",
+                    },
+                    "concepts": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 8,
+                        "items": {"type": "string", "minLength": 1, "maxLength": 80},
+                        "description": "1 到 8 個語意概念；不代表頁面必須同時逐字包含所有概念。",
+                    },
                     "limit": {"type": "integer", "minimum": 1, "maximum": 20},
                 },
-                "required": ["query", "limit"],
+                "required": ["query", "search_queries", "concepts", "limit"],
                 "additionalProperties": False,
             },
         },
@@ -150,7 +176,10 @@ class KeywordAnnouncementIngestor(Protocol):
 
 
 class SitePageIngestor(Protocol):
-    def ingest(self, query: str, *, max_items: int) -> SitePageIngestionResult:
+    def should_search_live(self, evidence: Collection[ScoredEvidence]) -> bool:
+        raise NotImplementedError
+
+    def ingest(self, plan: SearchPlan, *, max_items: int) -> SitePageIngestionResult:
         raise NotImplementedError
 
 
@@ -202,10 +231,16 @@ _ANNOUNCEMENT_REQUEST_PREFIXES = (
 def _is_generic_announcement_query(query: str | None) -> bool:
     if not query:
         return False
-    normalized = re.sub(r"[\s\u3000，。！？!?、：:；;「」『』（）()【】\[\]<>〈〉…]+", "", query)
+    normalized = re.sub(
+        r"[\s\u3000，。！？!?、：:；;「」『』（）()【】\[\]<>〈〉…]+", "", query
+    )
     while normalized:
         prefix = next(
-            (item for item in _ANNOUNCEMENT_REQUEST_PREFIXES if normalized.startswith(item)),
+            (
+                item
+                for item in _ANNOUNCEMENT_REQUEST_PREFIXES
+                if normalized.startswith(item)
+            ),
             None,
         )
         if prefix is None:
@@ -237,7 +272,9 @@ def _serialize_evidence(item: Evidence, *, content_limit: int) -> dict[str, obje
 
 def _error(code: str, message: str) -> ToolExecutionResult:
     return ToolExecutionResult(
-        output=json.dumps({"error": {"code": code, "message": message}}, ensure_ascii=False),
+        output=json.dumps(
+            {"error": {"code": code, "message": message}}, ensure_ascii=False
+        ),
         evidence=[],
     )
 
@@ -296,7 +333,9 @@ class ToolExecutor:
             )
         return resolution.canonical_unit, resolution.source.name
 
-    def _refresh_overview(self, parsed: SearchAnnouncementsArguments) -> RefreshResult | None:
+    def _refresh_overview(
+        self, parsed: SearchAnnouncementsArguments
+    ) -> RefreshResult | None:
         if parsed.sort is not AnnouncementSort.NEWEST or self._refresher is None:
             return None
         try:
@@ -344,23 +383,53 @@ class ToolExecutor:
                 arguments["query"] = self._keyword_ingestor.normalize(parsed.query)
                 if parsed.unit:
                     arguments["unit"] = self._keyword_ingestor.normalize(parsed.unit)
-                ingestion = self._keyword_ingestor.ingest(parsed.query, max_items=parsed.limit)
+                ingestion = self._keyword_ingestor.ingest(
+                    parsed.query, max_items=parsed.limit
+                )
                 arguments["query"] = ingestion.retrieval_query
                 arguments["canonical_urls"] = ingestion.canonical_urls
                 warning = ingestion.warning
             except Exception:
                 warning = FULL_SEARCH_FAILURE_WARNING
         elif not parsed.query:
-            refresh = self._refresh_overview(parsed)
-            if refresh is not None:
+            overview_refresh = self._refresh_overview(parsed)
+            if overview_refresh is not None:
                 arguments["canonical_urls"] = (
-                    () if refresh.canonical_urls is None else refresh.canonical_urls
+                    ()
+                    if overview_refresh.canonical_urls is None
+                    else overview_refresh.canonical_urls
                 )
-                warning = refresh.warning
+                warning = overview_refresh.warning
         evidence = self._retriever.search_announcements(**arguments)
         if resolved_source is not None:
             evidence = [replace(item, unit=resolved_source[0]) for item in evidence]
         return evidence, warning
+
+    def _search_documents(
+        self,
+        parsed: SearchDocumentsArguments,
+    ) -> tuple[list[Evidence], str | None]:
+        cached = self._retriever.search_documents(
+            query=parsed.query,
+            limit=parsed.limit,
+        )
+        if (
+            self._site_page_ingestor is None
+            or not self._site_page_ingestor.should_search_live(cached)
+        ):
+            return cached, None
+        try:
+            ingestion = self._site_page_ingestor.ingest(
+                parsed,
+                max_items=parsed.limit,
+            )
+        except Exception:
+            return cached, SITE_SEARCH_FAILURE_WARNING
+        refreshed = self._retriever.search_documents(
+            query=parsed.query,
+            limit=parsed.limit,
+        )
+        return refreshed or cached, ingestion.warning
 
     def execute(self, name: str, arguments: str) -> ToolExecutionResult:
         validators: dict[str, type[BaseModel]] = {
@@ -385,15 +454,7 @@ class ToolExecutor:
                 evidence, refresh_warning = self._search_announcements(parsed)
                 content_limit = 2_000
             elif isinstance(parsed, SearchDocumentsArguments):
-                if self._site_page_ingestor is not None:
-                    try:
-                        refresh_warning = self._site_page_ingestor.ingest(
-                            parsed.query,
-                            max_items=parsed.limit,
-                        ).warning
-                    except Exception:
-                        refresh_warning = SITE_SEARCH_FAILURE_WARNING
-                evidence = self._retriever.search_documents(**parsed.model_dump())
+                evidence, refresh_warning = self._search_documents(parsed)
                 content_limit = 2_000
             else:
                 item = self._retriever.get_announcement(parsed.announcement_id)
@@ -408,7 +469,8 @@ class ToolExecutor:
 
         payload = {
             "results": [
-                _serialize_evidence(item, content_limit=content_limit) for item in evidence
+                _serialize_evidence(item, content_limit=content_limit)
+                for item in evidence
             ],
             "count": len(evidence),
             "warning": refresh_warning,

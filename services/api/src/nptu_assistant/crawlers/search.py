@@ -21,7 +21,9 @@ from nptu_assistant.crawlers.site_search import (
 
 
 PARTIAL_SEARCH_FAILURE_WARNING = "部分官網公告搜尋失敗，以下結果可能不完整。"
-FULL_SEARCH_FAILURE_WARNING = "本次官網公告搜尋失敗，以下內容來自資料庫最後成功收錄的資料。"
+FULL_SEARCH_FAILURE_WARNING = (
+    "本次官網公告搜尋失敗，以下內容來自資料庫最後成功收錄的資料。"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,10 +104,16 @@ class KeywordAnnouncementSearchService:
             tuple(self._config.search_types),
         )
 
-    def ingest(self, query: str, *, max_items: int | None = None) -> KeywordIngestionResult:
+    def ingest(
+        self, query: str, *, max_items: int | None = None
+    ) -> KeywordIngestionResult:
         expansion = self._resolver.expand(query)
         summary = CrawlSummary()
-        item_limit = self._config.max_items if max_items is None else min(max_items, self._config.max_items)
+        item_limit = (
+            self._config.max_items
+            if max_items is None
+            else min(max_items, self._config.max_items)
+        )
         form: SearchForm | None = None
         successful_searches = 0
         try:
@@ -126,10 +134,18 @@ class KeywordAnnouncementSearchService:
                             if search_type not in form.search_types:
                                 raise ValueError(f"官網搜尋表單缺少分類：{search_type}")
                             fields = dict(form.hidden_fields)
-                            fields.update({"SchKey": search_term, "SchType": search_type})
-                            content = self._http.submit_form(form.method, form.action_url, fields)
-                            parsed_results = self._adapter.parse_results(content, form.action_url)
-                            next_form = self._adapter.parse_form(content, self._config.url)
+                            fields.update(
+                                {"SchKey": search_term, "SchType": search_type}
+                            )
+                            content = self._http.submit_form(
+                                form.method, form.action_url, fields
+                            )
+                            parsed_results = self._adapter.parse_results(
+                                content, form.action_url
+                            )
+                            next_form = self._adapter.parse_form(
+                                content, self._config.url
+                            )
                             results.extend(parsed_results)
                             form = next_form
                             successful_searches += 1
@@ -139,7 +155,9 @@ class KeywordAnnouncementSearchService:
                             form = None
                     else:
                         summary.failed += 1
-                        error_name = type(last_error).__name__ if last_error else "RuntimeError"
+                        error_name = (
+                            type(last_error).__name__ if last_error else "RuntimeError"
+                        )
                         summary.errors.append(f"{search_type} 搜尋失敗：{error_name}")
 
         if self._site_searcher is not None:
@@ -147,9 +165,12 @@ class KeywordAnnouncementSearchService:
                 site_result = self._site_searcher.search(
                     expansion.retrieval_query,
                     max_items=item_limit,
+                    use_discovery=False,
                 )
                 results.extend(
-                    site_page_to_announcement_result(page, config=self._site_searcher.config)
+                    site_page_to_announcement_result(
+                        page, config=self._site_searcher.config
+                    )
                     for page in site_result.pages
                     if page.published_at is not None
                 )
@@ -170,7 +191,10 @@ class KeywordAnnouncementSearchService:
             unique_results.setdefault(result.canonical_url, result)
         ordered = sorted(
             unique_results.values(),
-            key=lambda item: (item.published_at is not None, item.published_at or date.min),
+            key=lambda item: (
+                item.published_at is not None,
+                item.published_at or date.min,
+            ),
             reverse=True,
         )[:item_limit]
 

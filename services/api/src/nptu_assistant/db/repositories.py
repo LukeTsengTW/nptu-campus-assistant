@@ -4,7 +4,7 @@ from datetime import date, datetime, timezone
 from urllib.parse import urlsplit
 
 from sqlalchemy import func, select
-from sqlalchemy.orm import Session, joinedload, sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 
 from nptu_assistant.api.schemas import AnnouncementItem, AnnouncementListResponse
 from nptu_assistant.crawlers.models import AnnouncementCandidate
@@ -56,12 +56,15 @@ class SqlDocumentRepository:
 
     def has_hash(self, canonical_url: str, digest: str) -> bool:
         with self._factory() as session:
-            return session.scalar(
-                select(Document.id).where(
-                    Document.canonical_url == canonical_url,
-                    Document.content_hash == digest,
+            return (
+                session.scalar(
+                    select(Document.id).where(
+                        Document.canonical_url == canonical_url,
+                        Document.content_hash == digest,
+                    )
                 )
-            ) is not None
+                is not None
+            )
 
     def save(
         self,
@@ -125,7 +128,9 @@ def _upsert_announcement(
 ) -> str:
     digest = content_hash("\n".join([candidate.title, candidate.body]))
     existing = session.scalar(
-        select(Announcement).where(Announcement.canonical_url == candidate.canonical_url)
+        select(Announcement).where(
+            Announcement.canonical_url == candidate.canonical_url
+        )
     )
     if existing:
         existing.title = candidate.title
@@ -165,7 +170,9 @@ class SqlAnnouncementRepository:
     def latest_crawled_at(self, source_name: str) -> datetime | None:
         with self._factory() as session:
             return session.scalar(
-                select(Source.last_successful_crawl_at).where(Source.name == source_name)
+                select(Source.last_successful_crawl_at).where(
+                    Source.name == source_name
+                )
             )
 
     def canonical_urls_for_source(self, source_name: str) -> tuple[str, ...] | None:
@@ -279,7 +286,9 @@ class SqlAnnouncementRepository:
     ) -> AnnouncementListResponse:
         filters = []
         if q:
-            filters.append(Announcement.title.ilike(f"%{q}%") | Announcement.body.ilike(f"%{q}%"))
+            filters.append(
+                Announcement.title.ilike(f"%{q}%") | Announcement.body.ilike(f"%{q}%")
+            )
         if unit:
             filters.append(Announcement.unit == unit)
         if date_from:
@@ -287,7 +296,12 @@ class SqlAnnouncementRepository:
         if date_to:
             filters.append(Announcement.published_at <= date_to)
         with self._factory() as session:
-            total = session.scalar(select(func.count()).select_from(Announcement).where(*filters)) or 0
+            total = (
+                session.scalar(
+                    select(func.count()).select_from(Announcement).where(*filters)
+                )
+                or 0
+            )
             rows = session.scalars(
                 select(Announcement)
                 .where(*filters)

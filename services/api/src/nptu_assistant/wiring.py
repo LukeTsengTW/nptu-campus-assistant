@@ -4,9 +4,16 @@ from openai import OpenAI
 
 from nptu_assistant.api.errors import AppError
 from nptu_assistant.api.services import AnnouncementService, HealthService
-from nptu_assistant.core.settings import Settings, WORKSPACE_ROOT, resolve_workspace_path
+from nptu_assistant.core.settings import (
+    Settings,
+    WORKSPACE_ROOT,
+    resolve_workspace_path,
+)
 from nptu_assistant.crawlers.http import CrawlHttpClient
-from nptu_assistant.crawlers.config import load_keyword_search_config, load_source_configs
+from nptu_assistant.crawlers.config import (
+    load_keyword_search_config,
+    load_source_configs,
+)
 from nptu_assistant.crawlers.refresh import (
     AnnouncementRefreshCoordinator,
     AnnouncementRefreshScheduler,
@@ -14,18 +21,24 @@ from nptu_assistant.crawlers.refresh import (
 from nptu_assistant.crawlers.resolution import UnitSourceResolver
 from nptu_assistant.crawlers.service import CrawlerService
 from nptu_assistant.crawlers.search import KeywordAnnouncementSearchService
+from nptu_assistant.crawlers.site_discovery import NptuOfficialSearchDiscovery
 from nptu_assistant.crawlers.site_search import (
     NptuSiteSearchService,
     SitePageIngestionService,
 )
-from nptu_assistant.db.repositories import SqlAnnouncementRepository, SqlDocumentRepository
+from nptu_assistant.crawlers.site_scoring import HybridCandidateScorer
+from nptu_assistant.db.repositories import (
+    SqlAnnouncementRepository,
+    SqlDocumentRepository,
+)
 from nptu_assistant.db.session import create_session_factory
 from nptu_assistant.ingestion.service import DocumentIngestionService
 from nptu_assistant.providers.fake import FakeEmbeddingProvider, FakeLlmProvider
 from nptu_assistant.providers.openai import OpenAIEmbeddingProvider, OpenAILlmProvider
+from nptu_assistant.providers.protocols import EmbeddingProvider
 from nptu_assistant.rag.conversation import SqlConversationStore
 from nptu_assistant.rag.retrieval import SqlRetriever
-from nptu_assistant.rag.service import ChatService
+from nptu_assistant.rag.service import ChatService, LlmProvider
 
 
 class UnavailableEmbeddingProvider:
@@ -43,15 +56,16 @@ def build_services(settings: Settings) -> dict[str, object]:
     crawler_config_path = resolve_workspace_path(settings.crawler_config_path)
     source_configs = load_source_configs(crawler_config_path)
     keyword_search_config = load_keyword_search_config(crawler_config_path)
+    openai_api_key = settings.openai_api_key
     openai_client = (
-        OpenAI(api_key=settings.openai_api_key.get_secret_value())
-        if settings.has_openai_key
+        OpenAI(api_key=openai_api_key.get_secret_value())
+        if openai_api_key is not None
         and (
-            settings.embedding_provider == "openai"
-            or settings.llm_provider == "openai"
+            settings.embedding_provider == "openai" or settings.llm_provider == "openai"
         )
         else None
     )
+    embedding: EmbeddingProvider
     if settings.embedding_provider == "fake":
         embedding = FakeEmbeddingProvider(settings.openai_embedding_dimensions)
     elif openai_client is not None:
@@ -62,6 +76,7 @@ def build_services(settings: Settings) -> dict[str, object]:
         )
     else:
         embedding = UnavailableEmbeddingProvider()
+    llm: LlmProvider | None
     if settings.llm_provider == "fake":
         llm = FakeLlmProvider()
     elif openai_client is not None:
@@ -73,9 +88,14 @@ def build_services(settings: Settings) -> dict[str, object]:
         llm = None
     document_repository = SqlDocumentRepository(factory)
     announcement_repository = SqlAnnouncementRepository(factory)
+    site_config = keyword_search_config.site_search
     http_client = CrawlHttpClient(
         settings.crawler_user_agent,
         interval_seconds=settings.crawler_request_interval_seconds,
+        max_response_bytes=(
+            site_config.max_response_bytes if site_config else 2 * 1024 * 1024
+        ),
+        timeout_seconds=site_config.request_timeout_seconds if site_config else 15.0,
     )
     crawler_service = CrawlerService(
         crawler_config_path,
@@ -83,9 +103,23 @@ def build_services(settings: Settings) -> dict[str, object]:
         http_client,
         workspace_root=WORKSPACE_ROOT,
     )
+    site_discovery = (
+        NptuOfficialSearchDiscovery(keyword_search_config, site_config, http_client)
+        if site_config and site_config.enabled
+        else None
+    )
     site_searcher = (
-        NptuSiteSearchService(keyword_search_config.site_search, http_client)
-        if keyword_search_config.site_search and keyword_search_config.site_search.enabled
+        NptuSiteSearchService(
+            site_config,
+            http_client,
+            scorer=HybridCandidateScorer(
+                site_config.weights,
+                embedding,
+                batch_size=site_config.embedding_batch_size,
+            ),
+            discovery=site_discovery,
+        )
+        if site_config and site_config.enabled
         else None
     )
     keyword_search_service = KeywordAnnouncementSearchService(
@@ -99,9 +133,9 @@ def build_services(settings: Settings) -> dict[str, object]:
             site_searcher,
             document_repository,
             embedding,
-            keyword_search_config.site_search,
+            site_config,
         )
-        if site_searcher and keyword_search_config.site_search
+        if site_searcher and site_config
         else None
     )
     announcement_refresher = AnnouncementRefreshCoordinator(

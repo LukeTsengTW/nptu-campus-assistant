@@ -32,12 +32,21 @@ CHINESE_DIGITS = {
     "九": 9,
 }
 
+_DOCUMENT_OPERATION_PREFIX = re.compile(
+    r"^(?:請問|麻煩|幫我|幫忙|我想|想要|請)?(?:查詢|搜尋|搜索|查|找|看)?"
+)
+_FOLLOW_UP_PREFIXES = ("那", "那個", "剛才", "剛剛", "前面", "這個", "它")
+_FOLLOW_UP_REFERENCE = re.compile(r"^(?:(?:那個|這個|剛才|剛剛|前面)(?:的)?|那|它)\s*")
+
 
 def _is_relevant_result(result: dict[str, object]) -> bool:
     if result.get("kind") == "announcement":
         return True
+    value = result.get("score", 0.0)
+    if not isinstance(value, (str, int, float)):
+        return False
     try:
-        return float(result.get("score", 0.0)) >= MIN_DOCUMENT_RELEVANCE
+        return float(value) >= MIN_DOCUMENT_RELEVANCE
     except (TypeError, ValueError):
         return False
 
@@ -74,7 +83,46 @@ def _announcement_limit(question: str) -> tuple[int, bool]:
     requested = _parse_announcement_count(match.group("count"))
     if requested is None:
         return DEFAULT_ANNOUNCEMENT_LIMIT, False
-    return max(1, min(requested, MAX_ANNOUNCEMENT_LIMIT)), requested > MAX_ANNOUNCEMENT_LIMIT
+    return max(
+        1, min(requested, MAX_ANNOUNCEMENT_LIMIT)
+    ), requested > MAX_ANNOUNCEMENT_LIMIT
+
+
+def _clean_document_question(question: str) -> str:
+    cleaned = _DOCUMENT_OPERATION_PREFIX.sub("", question.strip())
+    return re.sub(r"[\s，。！？、；：]+", " ", cleaned).strip()
+
+
+def _fake_document_plan(
+    input_items: list[dict[str, object]],
+    question: str,
+) -> dict[str, object]:
+    user_questions = [
+        str(item.get("content", ""))
+        for item in input_items
+        if item.get("role") == "user" and item.get("content")
+    ]
+    current = _clean_document_question(question)
+    previous = (
+        _clean_document_question(user_questions[-2]) if len(user_questions) > 1 else ""
+    )
+    is_follow_up = len(current) <= 16 or current.startswith(_FOLLOW_UP_PREFIXES)
+    if is_follow_up:
+        current = _FOLLOW_UP_REFERENCE.sub("", current).strip()
+    standalone = " ".join(
+        value for value in (previous if is_follow_up else "", current) if value
+    )
+    concepts = list(
+        dict.fromkeys(value for value in standalone.split() if value.strip())
+    )[:8]
+    concepts = concepts or [standalone]
+    variants = list(dict.fromkeys((standalone, *concepts)))
+    return {
+        "query": standalone,
+        "search_queries": variants[:4],
+        "concepts": concepts[:8],
+        "limit": 6,
+    }
 
 
 class FakeEmbeddingProvider:
@@ -86,7 +134,10 @@ class FakeEmbeddingProvider:
         for text in texts:
             digest = hashlib.sha256(text.encode("utf-8")).digest()
             vectors.append(
-                [((digest[index % len(digest)] / 255.0) * 2.0) - 1.0 for index in range(self.dimensions)]
+                [
+                    ((digest[index % len(digest)] / 255.0) * 2.0) - 1.0
+                    for index in range(self.dimensions)
+                ]
             )
         return vectors
 
@@ -112,10 +163,15 @@ class FakeLlmProvider:
         count_limit_notice = (
             "單次查詢上限為 20 則，已依上限查詢。"
             if count_was_limited
-            and any(term in question for term in ("公告", "最新消息", "最近消息", "消息", "通知"))
+            and any(
+                term in question
+                for term in ("公告", "最新消息", "最近消息", "消息", "通知")
+            )
             else None
         )
-        outputs = [item for item in input_items if item.get("type") == "function_call_output"]
+        outputs = [
+            item for item in input_items if item.get("type") == "function_call_output"
+        ]
         if outputs:
             results: list[dict[str, object]] = []
             unit_error: dict[str, object] | None = None
@@ -130,7 +186,9 @@ class FakeLlmProvider:
                     unit_error = payload["error"]
                     break
                 if isinstance(payload.get("results"), list):
-                    results.extend(value for value in payload["results"] if isinstance(value, dict))
+                    results.extend(
+                        value for value in payload["results"] if isinstance(value, dict)
+                    )
             results = [result for result in results if _is_relevant_result(result)]
             if unit_error is not None:
                 code = str(unit_error.get("code", ""))
@@ -169,9 +227,12 @@ class FakeLlmProvider:
                             lines.append(f"[{published_at}｜{title}]({url})")
                         else:
                             lines.append(f"{published_at}｜{title}")
-                        unit = str(result.get("unit", "")).strip()
-                        if unit and unit not in announcement_units:
-                            announcement_units.append(unit)
+                        announcement_unit = str(result.get("unit", "")).strip()
+                        if (
+                            announcement_unit
+                            and announcement_unit not in announcement_units
+                        ):
+                            announcement_units.append(announcement_unit)
                     else:
                         lines.append(f"根據「{title}」：{result.get('content', '')}")
                         if url:
@@ -191,11 +252,23 @@ class FakeLlmProvider:
             )
 
         announcement_intent = any(
-            term in question for term in ("公告", "最新消息", "最近消息", "消息", "通知")
+            term in question
+            for term in ("公告", "最新消息", "最近消息", "消息", "通知")
         )
         document_intent = any(
             term in question
-            for term in ("介紹", "業務", "職掌", "校規", "申請", "流程", "規定", "學貸", "學分", "課程")
+            for term in (
+                "介紹",
+                "業務",
+                "職掌",
+                "校規",
+                "申請",
+                "流程",
+                "規定",
+                "學貸",
+                "學分",
+                "課程",
+            )
         )
         explicit_both = bool(
             len(question) <= 50
@@ -258,16 +331,20 @@ class FakeLlmProvider:
             ensure_ascii=False,
         )
         document_arguments = json.dumps(
-            {"query": question, "limit": 6},
+            _fake_document_plan(input_items, question),
             ensure_ascii=False,
         )
         calls: list[ToolCall] = []
         if announcement_intent:
             calls.append(
-                ToolCall("fake-announcements", "search_announcements", announcement_arguments)
+                ToolCall(
+                    "fake-announcements", "search_announcements", announcement_arguments
+                )
             )
         if document_intent or not announcement_intent:
-            calls.append(ToolCall("fake-documents", "search_documents", document_arguments))
+            calls.append(
+                ToolCall("fake-documents", "search_documents", document_arguments)
+            )
         return ModelTurn(
             output_items=[
                 {

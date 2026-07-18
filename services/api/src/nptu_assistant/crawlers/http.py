@@ -18,6 +18,7 @@ class CrawlHttpClient:
         interval_seconds: float = 1.0,
         max_response_bytes: int = 2 * 1024 * 1024,
         max_redirects: int = 5,
+        timeout_seconds: float = 15.0,
         sleep: Callable[[float], None] = time.sleep,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
@@ -27,6 +28,8 @@ class CrawlHttpClient:
             raise ValueError("回應大小上限必須大於零")
         if max_redirects < 0:
             raise ValueError("redirect 上限不得小於零")
+        if timeout_seconds <= 0:
+            raise ValueError("HTTP timeout 必須大於零")
         self._user_agent = user_agent
         self._interval = interval_seconds
         self._max_response_bytes = max_response_bytes
@@ -36,7 +39,7 @@ class CrawlHttpClient:
         self._last_request: dict[str, float] = {}
         self._client = httpx.Client(
             headers={"User-Agent": user_agent},
-            timeout=httpx.Timeout(15.0, connect=5.0),
+            timeout=httpx.Timeout(timeout_seconds, connect=min(5.0, timeout_seconds)),
             follow_redirects=False,
             transport=transport,
         )
@@ -51,6 +54,18 @@ class CrawlHttpClient:
         self._validate_url(url, allowed_hosts)
         self._ensure_allowed_by_robots(url, allowed_hosts)
         return self._request("get", url, allowed_hosts=allowed_hosts)
+
+    def get_html(
+        self, url: str, *, allowed_hosts: Collection[str] | None = None
+    ) -> str:
+        self._validate_url(url, allowed_hosts)
+        self._ensure_allowed_by_robots(url, allowed_hosts)
+        return self._request(
+            "get",
+            url,
+            allowed_hosts=allowed_hosts,
+            allowed_content_types=("text/html", "application/xhtml+xml"),
+        )
 
     def submit_form(
         self,
@@ -80,6 +95,7 @@ class CrawlHttpClient:
         *,
         allowed_hosts: Collection[str] | None = None,
         check_redirect_robots: bool = True,
+        allowed_content_types: tuple[str, ...] | None = None,
     ) -> str:
         last_error: Exception | None = None
         for attempt in range(3):
@@ -96,7 +112,9 @@ class CrawlHttpClient:
                         params=current_fields if current_method == "get" else None,
                         data=current_fields if current_method == "post" else None,
                     ) as response:
-                        self._last_request[urlsplit(current_url).netloc.lower()] = time.monotonic()
+                        self._last_request[urlsplit(current_url).netloc.lower()] = (
+                            time.monotonic()
+                        )
                         if response.is_redirect:
                             if redirect_count >= self._max_redirects:
                                 raise ValueError("redirect 次數超過安全上限")
@@ -119,6 +137,12 @@ class CrawlHttpClient:
                             continue
 
                         response.raise_for_status()
+                        content_type = response.headers.get("content-type", "").lower()
+                        if allowed_content_types and not any(
+                            content_type.startswith(value)
+                            for value in allowed_content_types
+                        ):
+                            raise ValueError("官方來源回應不是支援的 HTML 格式")
                         content_length = response.headers.get("content-length")
                         if (
                             content_length
@@ -134,7 +158,11 @@ class CrawlHttpClient:
                             chunks.append(chunk)
                         encoding = response.encoding or "utf-8"
                         return b"".join(chunks).decode(encoding, errors="replace")
-            except (httpx.TimeoutException, httpx.TransportError, httpx.HTTPStatusError) as exc:
+            except (
+                httpx.TimeoutException,
+                httpx.TransportError,
+                httpx.HTTPStatusError,
+            ) as exc:
                 last_error = exc
                 if attempt < 2:
                     self._sleep(0.5 * (2**attempt))
