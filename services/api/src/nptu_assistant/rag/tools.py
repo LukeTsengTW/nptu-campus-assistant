@@ -437,7 +437,7 @@ class ToolExecutor:
         if _is_generic_announcement_query(parsed.query):
             parsed = parsed.model_copy(update={"query": None})
             generic_latest = True
-        if generic_latest or resolution is not None:
+        if generic_latest:
             if parsed.sort is AnnouncementSort.RELEVANCE:
                 parsed = parsed.model_copy(update={"sort": AnnouncementSort.NEWEST})
         arguments = parsed.model_dump()

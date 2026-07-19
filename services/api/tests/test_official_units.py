@@ -108,6 +108,8 @@ class ScopedAnnouncementIngestor:
         self.canonical_urls = canonical_urls
         self.warning = warning
         self.scopes: list[DocumentSearchScope] = []
+        self.sorts: list[object] = []
+        self.topics: list[str | None] = []
 
     def new_deadline(self) -> SearchDeadline:
         return SearchDeadline.after(10)
@@ -122,8 +124,10 @@ class ScopedAnnouncementIngestor:
         sort: object = "newest",
         topic: str | None = None,
     ) -> ScopedAnnouncementIngestionResult:
-        del plan, max_items, deadline, sort, topic
+        del plan, max_items, deadline
         self.scopes.append(scope)
+        self.sorts.append(sort)
+        self.topics.append(topic)
         return ScopedAnnouncementIngestionResult(
             self.canonical_urls,
             self.warning,
@@ -143,12 +147,17 @@ def document_arguments(query: str) -> str:
     )
 
 
-def announcement_arguments(query: str | None, unit: str | None) -> str:
+def announcement_arguments(
+    query: str | None,
+    unit: str | None,
+    *,
+    sort: str = "newest",
+) -> str:
     return json.dumps(
         {
             "query": query,
             "limit": 5,
-            "sort": "newest",
+            "sort": sort,
             "unit": unit,
             "date_from": None,
             "date_to": None,
@@ -388,17 +397,19 @@ def test_scoped_partial_persistence_returns_only_database_backed_urls() -> None:
         score=0.9,
     )
     retriever = RecordingRetriever([persisted])
+    scoped = ScopedAnnouncementIngestor((persisted_url,), SITE_SEARCH_PARTIAL_WARNING)
     result = ToolExecutor(
         retriever,
         unit_resolver=project_resolver(),
-        site_page_ingestor=ScopedAnnouncementIngestor(
-            (persisted_url,), SITE_SEARCH_PARTIAL_WARNING
-        ),
+        site_page_ingestor=scoped,
     ).execute(
         "search_announcements",
-        announcement_arguments("人工智慧", "資工系"),
+        announcement_arguments("人工智慧", "資工系", sort="relevance"),
     )
 
     assert result.evidence == [persisted]
     assert result.warning == SITE_SEARCH_PARTIAL_WARNING
     assert retriever.calls[0][1]["canonical_urls"] == (persisted_url,)
+    assert retriever.calls[0][1]["sort"].value == "relevance"
+    assert scoped.sorts[0].value == "relevance"
+    assert scoped.topics == ["人工智慧"]

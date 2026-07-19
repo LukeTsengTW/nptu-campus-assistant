@@ -937,7 +937,7 @@ def test_executor_routes_resolved_unit_to_its_source_snapshot_without_keyword_se
     assert result.evidence[0].unit == "資訊學院"
 
 
-def test_resolved_unit_relevance_defaults_to_newest_but_explicit_oldest_is_preserved() -> (
+def test_resolved_unit_preserves_topic_relevance_and_generic_latest_uses_newest() -> (
     None
 ):
     retriever = StubRetriever()
@@ -956,12 +956,48 @@ def test_resolved_unit_relevance_defaults_to_newest_but_explicit_oldest_is_prese
         "date_to": None,
     }
 
-    executor.execute("search_announcements", json.dumps({**base, "sort": "relevance"}))
-    executor.execute("search_announcements", json.dumps({**base, "sort": "oldest"}))
+    executor.execute(
+        "search_announcements",
+        json.dumps(
+            {
+                **base,
+                "query": "人工智慧",
+                "unit": "資訊學院",
+                "sort": "relevance",
+            }
+        ),
+    )
+    executor.execute(
+        "search_announcements",
+        json.dumps(
+            {
+                **base,
+                "query": "最新公告",
+                "unit": "資訊學院",
+                "sort": "relevance",
+            }
+        ),
+    )
+    executor.execute(
+        "search_announcements",
+        json.dumps(
+            {
+                **base,
+                "query": "最新公告",
+                "unit": "資訊學院",
+                "sort": "oldest",
+            }
+        ),
+    )
 
-    assert retriever.calls[0][1]["sort"] is AnnouncementSort.NEWEST
-    assert retriever.calls[1][1]["sort"] is AnnouncementSort.OLDEST
-    assert refresher.calls == ["information-college-html", "information-college-html"]
+    assert retriever.calls[0][1]["sort"] is AnnouncementSort.RELEVANCE
+    assert retriever.calls[1][1]["sort"] is AnnouncementSort.NEWEST
+    assert retriever.calls[2][1]["sort"] is AnnouncementSort.OLDEST
+    assert refresher.calls == [
+        "information-college-html",
+        "information-college-html",
+        "information-college-html",
+    ]
 
 
 @pytest.mark.parametrize(
