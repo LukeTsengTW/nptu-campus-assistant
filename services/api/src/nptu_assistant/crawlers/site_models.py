@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 
 MAX_RETRIEVAL_QUERIES = 5
+MAX_VARIANTS_PER_RETRIEVAL_STAGE = 2
 
 
 def normalize_search_query(value: str) -> str:
@@ -143,8 +144,36 @@ class SearchPlan(BaseModel):
         return tuple(queries)
 
     @property
+    def retrieval_batches(self) -> tuple[RetrievalQueryBatch, ...]:
+        queries = self.retrieval_queries
+        if not queries:
+            return ()
+        batches = [RetrievalQueryBatch(stage=1, queries=(queries[0],))]
+        for start in range(1, len(queries), MAX_VARIANTS_PER_RETRIEVAL_STAGE):
+            batches.append(
+                RetrievalQueryBatch(
+                    stage=len(batches) + 1,
+                    queries=queries[start : start + MAX_VARIANTS_PER_RETRIEVAL_STAGE],
+                )
+            )
+        return tuple(batches)
+
+    @property
     def semantic_text(self) -> str:
         return "\n".join((*self.retrieval_queries, *self.concepts))
+
+
+@dataclass(frozen=True, slots=True)
+class ProgressiveRetrievalPolicy:
+    min_results: int = 2
+    min_score: float = 0.58
+    min_content_chars: int = 160
+
+
+@dataclass(frozen=True, slots=True)
+class RetrievalQueryBatch:
+    stage: int
+    queries: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)

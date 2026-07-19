@@ -4,6 +4,7 @@ from collections.abc import Callable, Collection
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone
 import heapq
+import json
 import logging
 import re
 import time
@@ -32,17 +33,25 @@ from nptu_assistant.crawlers.site_models import (
     SearchPlan,
 )
 from nptu_assistant.crawlers.site_scoring import CandidateScorer, HybridCandidateScorer
+from nptu_assistant.crawlers.site_search_cache import (
+    InMemorySiteSearchCache,
+    SiteSearchCache,
+    SingleFlightLease,
+    SingleFlightRunner,
+)
 from nptu_assistant.crawlers.models import AnnouncementCandidate
 from nptu_assistant.ingestion.chunking import TextChunk, chunk_text
 from nptu_assistant.ingestion.cleaning import content_hash
 from nptu_assistant.ingestion.metadata import DocumentMetadata
 from nptu_assistant.providers.protocols import EmbeddingProvider
+from nptu_assistant.rag.embedding_cache import RetrievalExecutionContext
 
 
 SITE_SEARCH_PARTIAL_WARNING = "NPTU 網域搜尋有部分頁面無法取得，結果可能不完整。"
 SITE_SEARCH_FAILURE_WARNING = (
     "NPTU 網域搜尋目前無法取得頁面，以下內容來自資料庫既有資料。"
 )
+SITE_SEARCH_SCORING_VERSION = "p1-v1"
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +105,8 @@ class NptuSiteSearchService:
         scorer: CandidateScorer | None = None,
         discovery: SiteDiscovery | None = None,
         clock: Callable[[], float] = time.monotonic,
+        cache: SiteSearchCache | None = None,
+        single_flight: SingleFlightRunner | None = None,
     ) -> None:
         if not config.enabled:
             raise ValueError("NPTU 網域搜尋設定尚未啟用")
@@ -108,10 +119,8 @@ class NptuSiteSearchService:
         )
         self._discovery = discovery
         self._clock = clock
-        self._result_cache: dict[
-            tuple[object, ...],
-            tuple[float, SiteSearchResult],
-        ] = {}
+        self._result_cache = cache or InMemorySiteSearchCache(clock=clock)
+        self._single_flight = single_flight
         self._page_cache: dict[str, tuple[float, NptuSitePage]] = {}
 
     @property
@@ -160,6 +169,34 @@ class NptuSiteSearchService:
             self._page_cache[canonical_url] = (self._clock(), page)
         return page
 
+    def _cache_key(
+        self,
+        search_plan: SearchPlan,
+        *,
+        limit: int,
+        use_discovery: bool,
+        scope: DocumentSearchScope | None,
+    ) -> str:
+        allowed_hosts = (
+            scope.allowed_hosts if scope is not None else self._config.allowed_hosts
+        )
+        seed_urls = scope.seed_urls if scope is not None else self._config.seed_urls
+        effective_discovery = use_discovery and scope is None
+        payload = {
+            "schema": SITE_SEARCH_SCORING_VERSION,
+            "query": search_plan.query,
+            "variants": list(search_plan.retrieval_queries[1:]),
+            "concepts": list(search_plan.concepts),
+            "limit": limit,
+            "canonical_unit": scope.canonical_unit if scope is not None else None,
+            "allowed_hosts": list(allowed_hosts),
+            "preferred_hosts": list(scope.preferred_hosts if scope is not None else ()),
+            "seed_urls": list(seed_urls),
+            "discovery_enabled": effective_discovery,
+            "scoring_version": SITE_SEARCH_SCORING_VERSION,
+        }
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
     def search(
         self,
         plan: SearchPlan | str,
@@ -168,6 +205,7 @@ class NptuSiteSearchService:
         use_discovery: bool = True,
         deadline: SearchDeadline | None = None,
         scope: DocumentSearchScope | None = None,
+        execution_context: RetrievalExecutionContext | None = None,
     ) -> SiteSearchResult:
         search_deadline = deadline or self.new_deadline()
         requested_limit = self._config.max_items if max_items is None else max_items
@@ -177,25 +215,92 @@ class NptuSiteSearchService:
         )
         if search_plan.limit != limit:
             search_plan = search_plan.model_copy(update={"limit": limit})
-        now = self._clock()
+        effective_discovery = use_discovery and scope is None
+        cache_key = self._cache_key(
+            search_plan,
+            limit=limit,
+            use_discovery=use_discovery,
+            scope=scope,
+        )
+        cached_result = self._result_cache.get(cache_key)
+        if cached_result is not None:
+            return cached_result
+
+        lease: SingleFlightLease | None = None
+        if self._single_flight is not None:
+            lease = self._single_flight.acquire(cache_key)
+            if lease is None:
+                while not search_deadline.expired():
+                    cached_result = self._result_cache.get(cache_key)
+                    if cached_result is not None:
+                        return cached_result
+                    lease = self._single_flight.acquire(cache_key)
+                    if lease is not None:
+                        break
+                    time.sleep(min(0.05, search_deadline.remaining_seconds()))
+                if lease is None:
+                    return SiteSearchResult(
+                        (),
+                        SearchDiagnostics(query_timed_out=True),
+                    )
+            try:
+                cached_result = self._result_cache.get(cache_key)
+                if cached_result is not None:
+                    return cached_result
+                result = self._search_uncached(
+                    search_plan,
+                    limit=limit,
+                    use_discovery=effective_discovery,
+                    deadline=search_deadline,
+                    scope=scope,
+                    execution_context=execution_context,
+                )
+                if (
+                    self._config.cache_ttl_seconds
+                    and not result.diagnostics.query_timed_out
+                    and result.diagnostics.failed_count == 0
+                ):
+                    self._result_cache.set(
+                        cache_key,
+                        result,
+                        self._config.cache_ttl_seconds,
+                    )
+                return result
+            finally:
+                lease.release()
+
+        result = self._search_uncached(
+            search_plan,
+            limit=limit,
+            use_discovery=effective_discovery,
+            deadline=search_deadline,
+            scope=scope,
+            execution_context=execution_context,
+        )
+        if (
+            self._config.cache_ttl_seconds
+            and not result.diagnostics.query_timed_out
+            and result.diagnostics.failed_count == 0
+        ):
+            self._result_cache.set(cache_key, result, self._config.cache_ttl_seconds)
+        return result
+
+    def _search_uncached(
+        self,
+        search_plan: SearchPlan,
+        *,
+        limit: int,
+        use_discovery: bool,
+        deadline: SearchDeadline,
+        scope: DocumentSearchScope | None,
+        execution_context: RetrievalExecutionContext | None,
+    ) -> SiteSearchResult:
+        search_deadline = deadline
         allowed_hosts = (
             scope.allowed_hosts if scope is not None else self._config.allowed_hosts
         )
         seed_urls = scope.seed_urls if scope is not None else self._config.seed_urls
         effective_discovery = use_discovery and scope is None
-        cache_key = (
-            *search_plan.cache_key,
-            effective_discovery,
-            tuple(allowed_hosts),
-            tuple(seed_urls),
-        )
-        cached_result = self._result_cache.get(cache_key)
-        if (
-            cached_result is not None
-            and self._config.cache_ttl_seconds
-            and now - cached_result[0] <= self._config.cache_ttl_seconds
-        ):
-            return cached_result[1]
 
         queue: list[tuple[float, int, CandidatePage]] = []
         queued_scores: dict[str, float] = {}
@@ -350,6 +455,9 @@ class NptuSiteSearchService:
 
         if queue and not query_timed_out:
             skipped_candidate_count += len(queued_scores)
+        set_execution_context = getattr(self._scorer, "set_execution_context", None)
+        if callable(set_execution_context):
+            set_execution_context(execution_context)
         try:
             search_deadline.raise_if_expired()
             scores = self._scorer.score_pages(
@@ -362,6 +470,9 @@ class NptuSiteSearchService:
         except SearchDeadlineExceeded:
             query_timed_out = True
             scores = preliminary_scores
+        finally:
+            if callable(set_execution_context):
+                set_execution_context(None)
         scored_pages = []
         for page, score in zip(pages, scores, strict=True):
             if scope is not None:
@@ -412,8 +523,6 @@ class NptuSiteSearchService:
             highest_unattempted_score=max(timed_out_scores, default=None),
         )
         result = SiteSearchResult(tuple(relevant_pages[:limit]), diagnostics)
-        if self._config.cache_ttl_seconds and not query_timed_out:
-            self._result_cache[cache_key] = (self._clock(), result)
         return result
 
 
@@ -508,6 +617,7 @@ class SitePageIngestionService:
         max_items: int,
         deadline: SearchDeadline | None = None,
         scope: DocumentSearchScope | None = None,
+        execution_context: RetrievalExecutionContext | None = None,
     ) -> SitePageIngestionResult:
         deadline = deadline or self.new_deadline()
         search_result = self._search.search(
@@ -515,6 +625,7 @@ class SitePageIngestionService:
             max_items=max_items,
             deadline=deadline,
             scope=scope,
+            execution_context=execution_context,
         )
         diagnostics = search_result.diagnostics
         summary = IngestionSummary()

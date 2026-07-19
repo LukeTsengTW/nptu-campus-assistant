@@ -18,6 +18,7 @@ from nptu_assistant.crawlers.site_models import (
 )
 from nptu_assistant.crawlers.site_search import SitePageIngestionService
 from nptu_assistant.db.models import Announcement
+from nptu_assistant.rag.embedding_cache import RetrievalExecutionContext
 from nptu_assistant.rag.retrieval import SqlRetriever
 from nptu_assistant.rag.tools import AnnouncementSort
 
@@ -378,8 +379,11 @@ def test_document_multi_query_retrieval_finds_different_admission_wording() -> N
         limit=6,
     )
 
-    assert embedding.calls == [list(search_plan.retrieval_queries)]
-    assert len(session.statements) == len(search_plan.retrieval_queries) * 2
+    assert embedding.calls == [
+        [search_plan.query],
+        list(search_plan.retrieval_queries[1:]),
+    ]
+    assert len(session.statements) == 6
     assert [item.title for item in evidence] == ["大學申請入學新生專區"]
     assert 0.0 <= evidence[0].score <= 1.0
     current_config = SiteSearchConfig(
@@ -414,16 +418,15 @@ def test_scoped_document_retrieval_generates_global_unit_and_exact_host_pools() 
         scope=scope,
     )
 
-    assert len(session.statements) == 6
-    unit_statements = [sql(item) for item in session.statements[2:4]]
-    host_statements = [sql(item) for item in session.statements[4:6]]
-    assert all("sources.unit = '資訊工程學系'" in item for item in unit_statements)
+    assert len(session.statements) == 2
+    statements = [sql(item) for item in session.statements]
+    assert all("sources.unit = '資訊工程學系'" in item for item in statements)
     assert all(
         "documents.canonical_url = 'https://csie.nptu.edu.tw'" in item
         and "documents.canonical_url LIKE 'https://csie.nptu.edu.tw/%%'" in item
-        for item in host_statements
+        for item in statements
     )
-    assert all("%csie.nptu.edu.tw%" not in item for item in host_statements)
+    assert all("%csie.nptu.edu.tw%" not in item for item in statements)
 
 
 def test_document_multi_query_retrieval_generalizes_to_dormitory_billing() -> None:
@@ -448,9 +451,76 @@ def test_document_multi_query_retrieval_generalizes_to_dormitory_billing() -> No
         limit=6,
     )
 
-    assert embedding.calls == [list(search_plan.retrieval_queries)]
+    assert embedding.calls == [
+        [search_plan.query],
+        list(search_plan.retrieval_queries[1:]),
+    ]
     assert [item.title for item in evidence] == ["住宿服務中心學生宿舍用電計費辦法"]
     assert evidence[0].score >= 0.58
+
+
+def test_document_retrieval_keeps_high_confidence_primary_results_without_variants() -> None:
+    session = FakeSession(
+        result_batches=[
+            [
+                document_row(
+                    title="校務資訊完整指南",
+                    content="完整校務資訊內容。" * 30,
+                    url="https://www.nptu.edu.tw/guide",
+                    score=0.95,
+                ),
+                document_row(
+                    title="校務資訊申請流程",
+                    content="申請流程完整說明。" * 30,
+                    url="https://www.nptu.edu.tw/process",
+                    score=0.94,
+                ),
+            ],
+            [],
+        ]
+    )
+    embedding = RecordingEmbedding()
+    plan = SearchPlan(
+        query="校務資訊",
+        search_queries=["校務資訊 變體一", "校務資訊 變體二"],
+        concepts=["校務資訊"],
+        limit=6,
+    )
+
+    result = make_retriever(session, embedding).search_documents_with_plan(
+        plan=plan,
+        limit=6,
+    )
+
+    assert result
+    assert embedding.calls == [[plan.query]]
+    assert len(session.statements) == 2
+
+
+def test_document_retrieval_reuses_query_embeddings_across_refresh() -> None:
+    session = FakeSession(result_batches=[[], [], [], []])
+    embedding = RecordingEmbedding()
+    context = RetrievalExecutionContext()
+    retriever = make_retriever(session, embedding)
+    plan = SearchPlan(
+        query="校務資訊",
+        search_queries=["校務資訊變體"],
+        concepts=["校務"],
+        limit=6,
+    )
+
+    retriever.search_documents_with_plan(
+        plan=plan,
+        limit=6,
+        execution_context=context,
+    )
+    retriever.search_documents_with_plan(
+        plan=plan,
+        limit=6,
+        execution_context=context,
+    )
+
+    assert embedding.calls == [[plan.query], ["校務資訊變體"]]
 
 
 def test_document_multi_query_embedding_uses_remaining_live_deadline() -> None:

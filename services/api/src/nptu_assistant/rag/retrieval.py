@@ -16,20 +16,22 @@ from nptu_assistant.api.schemas import AnswerType
 from nptu_assistant.crawlers.site_models import (
     SearchDeadline,
     SearchDeadlineExceeded,
+    ProgressiveRetrievalPolicy,
     SearchPlan,
     search_query_key,
 )
 from nptu_assistant.crawlers.official_units import DocumentSearchScope
 from nptu_assistant.db.models import Announcement, Document, DocumentChunk, Source
 from nptu_assistant.providers.protocols import EmbeddingProvider
+from nptu_assistant.rag.embedding_cache import RetrievalExecutionContext
 from nptu_assistant.rag.models import Evidence
 from nptu_assistant.rag.tools import AnnouncementSort
 
 
 FAILED_SEARCH_MIN_SIMILARITY = 0.1
-DOCUMENT_GLOBAL_CANDIDATE_LIMIT = 20
-DOCUMENT_UNIT_CANDIDATE_LIMIT = 20
-DOCUMENT_HOST_CANDIDATE_LIMIT = 20
+DOCUMENT_COMBINED_CANDIDATE_LIMIT = 60
+DOCUMENT_KEYWORD_PREFILTER_MIN_LENGTH = 4
+DOCUMENT_KEYWORD_PREFILTER_THRESHOLD = 0.08
 DOCUMENT_RRF_K = 60
 DOCUMENT_RAW_SCORE_WEIGHT = 0.72
 DOCUMENT_RRF_SCORE_WEIGHT = 0.20
@@ -91,9 +93,11 @@ class SqlRetriever:
         self,
         factory: sessionmaker[Session],
         embedding_provider: EmbeddingProvider,
+        progressive_policy: ProgressiveRetrievalPolicy | None = None,
     ) -> None:
         self._factory = factory
         self._embedding_provider = embedding_provider
+        self._progressive_policy = progressive_policy or ProgressiveRetrievalPolicy()
 
     def search_documents(self, *, query: str, limit: int = 6) -> list[Evidence]:
         query = query.strip()
@@ -111,24 +115,73 @@ class SqlRetriever:
         limit: int = 6,
         deadline: SearchDeadline | None = None,
         scope: DocumentSearchScope | None = None,
+        execution_context: RetrievalExecutionContext | None = None,
     ) -> list[Evidence]:
         _validate_limit(limit)
         if deadline is not None:
             deadline.raise_if_expired()
-        queries = plan.retrieval_queries
-        try:
-            vectors = self._embedding_provider.embed(
-                list(queries),
-                timeout_seconds=(deadline.remaining_seconds() if deadline else None),
+        context = execution_context or RetrievalExecutionContext()
+        ranked_rows: list[list[object]] = []
+        searched_queries: list[str] = []
+        for batch in plan.retrieval_batches:
+            queries = batch.queries
+            try:
+                vectors = context.embed(
+                    self._embedding_provider,
+                    queries,
+                    deadline=deadline,
+                )
+                if deadline is not None:
+                    deadline.raise_if_expired()
+                ranked_rows.extend(
+                    self._search_ranked_rows(
+                        queries=queries,
+                        vectors=vectors,
+                        deadline=deadline,
+                        scope=scope,
+                    )
+                )
+                searched_queries.extend(queries)
+            except SearchDeadlineExceeded:
+                raise
+            except Exception as exc:
+                if deadline is not None and (
+                    deadline.expired() or _is_postgres_query_cancelled(exc)
+                ):
+                    raise SearchDeadlineExceeded(
+                        "文件檢索已耗盡搜尋時間額度"
+                    ) from exc
+                raise
+            evidence = self._rrf_merge(
+                ranked_rows,
+                queries=tuple(searched_queries),
+                concepts=tuple(plan.concepts),
+                limit=limit,
+                scope=scope,
             )
-        except Exception as exc:
-            if deadline is not None and deadline.expired():
-                raise SearchDeadlineExceeded(
-                    "文件檢索 embedding 已耗盡網站搜尋時間額度"
-                ) from exc
-            raise
-        if deadline is not None:
-            deadline.raise_if_expired()
+            if batch.stage == 1 and self._has_sufficient_results(
+                evidence,
+                policy=self._progressive_policy,
+            ):
+                return evidence
+            if deadline is not None:
+                deadline.raise_if_expired()
+        return self._rrf_merge(
+            ranked_rows,
+            queries=tuple(searched_queries),
+            concepts=tuple(plan.concepts),
+            limit=limit,
+            scope=scope,
+        )
+
+    def _search_ranked_rows(
+        self,
+        *,
+        queries: tuple[str, ...],
+        vectors: list[list[float]],
+        deadline: SearchDeadline | None,
+        scope: DocumentSearchScope | None,
+    ) -> list[list[object]]:
         if len(vectors) != len(queries):
             raise ValueError("文件查詢與 embedding 數量不一致")
         base_columns = (DocumentChunk, Document, Source)
@@ -145,45 +198,38 @@ class SqlRetriever:
                         func.similarity(DocumentChunk.content, query),
                         func.similarity(Document.title, query),
                     ).label("score")
-
-                    def append_pool(
-                        pool_filter: ColumnElement[bool],
-                        candidate_limit: int,
-                    ) -> None:
-                        for score_expression in (vector_score, keyword_score):
-                            if deadline is not None:
-                                deadline.raise_if_expired()
-                            _apply_statement_timeout(session, deadline)
-                            ranked_rows.append(
-                                list(
-                                    session.execute(
-                                        select(*base_columns, score_expression)
-                                        .join(
-                                            Document,
-                                            Document.id == DocumentChunk.document_id,
-                                        )
-                                        .join(Source, Source.id == Document.source_id)
-                                        .where(
-                                            Document.is_current.is_(True),
-                                            pool_filter,
-                                        )
-                                        .order_by(desc("score"))
-                                        .limit(candidate_limit)
-                                    ).all()
-                                )
+                    scope_boost = self._scope_boost(scope)
+                    common_filter = Document.is_current.is_(True)
+                    keyword_prefilter = or_(
+                        func.length(literal(query))
+                        < DOCUMENT_KEYWORD_PREFILTER_MIN_LENGTH,
+                        DocumentChunk.content.op("%")(query),
+                        Document.title.op("%")(query),
+                        func.greatest(
+                            func.similarity(DocumentChunk.content, query),
+                            func.similarity(Document.title, query),
+                        )
+                        >= DOCUMENT_KEYWORD_PREFILTER_THRESHOLD,
+                    )
+                    for score_expression, extra_filter in (
+                        (vector_score, literal(True)),
+                        (keyword_score, keyword_prefilter),
+                    ):
+                        if deadline is not None:
+                            deadline.raise_if_expired()
+                        _apply_statement_timeout(session, deadline)
+                        statement = (
+                            select(*base_columns, score_expression)
+                            .join(
+                                Document,
+                                Document.id == DocumentChunk.document_id,
                             )
-
-                    append_pool(literal(True), DOCUMENT_GLOBAL_CANDIDATE_LIMIT)
-                    if scope is not None and scope.canonical_unit:
-                        append_pool(
-                            Source.unit == scope.canonical_unit,
-                            DOCUMENT_UNIT_CANDIDATE_LIMIT,
+                            .join(Source, Source.id == Document.source_id)
+                            .where(common_filter, extra_filter)
+                            .order_by(desc(score_expression + scope_boost))
+                            .limit(DOCUMENT_COMBINED_CANDIDATE_LIMIT)
                         )
-                    if scope is not None and scope.preferred_hosts:
-                        append_pool(
-                            _preferred_host_filter(scope.preferred_hosts),
-                            DOCUMENT_HOST_CANDIDATE_LIMIT,
-                        )
+                        ranked_rows.append(list(session.execute(statement).all()))
                     if deadline is not None:
                         deadline.raise_if_expired()
         except SearchDeadlineExceeded:
@@ -194,13 +240,43 @@ class SqlRetriever:
             ):
                 raise SearchDeadlineExceeded("文件檢索 SQL 已耗盡搜尋時間額度") from exc
             raise
-        return self._rrf_merge(
-            ranked_rows,
-            queries=queries,
-            concepts=tuple(plan.concepts),
-            limit=limit,
-            scope=scope,
+        return ranked_rows
+
+    @staticmethod
+    def _scope_boost(scope: DocumentSearchScope | None) -> ColumnElement[Any]:
+        if scope is None:
+            return literal(0.0)
+        host_filter = _preferred_host_filter(scope.preferred_hosts)
+        return case(
+            (
+                Document.canonical_url == scope.homepage_url
+                if scope.homepage_url
+                else literal(False),
+                literal(0.40),
+            ),
+            (
+                Source.unit == scope.canonical_unit
+                if scope.canonical_unit
+                else literal(False),
+                literal(0.24),
+            ),
+            (host_filter, literal(0.18)),
+            else_=literal(0.0),
         )
+
+    @staticmethod
+    def _has_sufficient_results(
+        evidence: list[Evidence],
+        *,
+        policy: ProgressiveRetrievalPolicy,
+    ) -> bool:
+        reliable = [
+            item
+            for item in evidence
+            if item.score >= policy.min_score
+            and len(item.content.strip()) >= policy.min_content_chars
+        ]
+        return len(reliable) >= policy.min_results
 
     @staticmethod
     def _rrf_merge(

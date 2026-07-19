@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 import yaml
 from fastapi.testclient import TestClient
-from sqlalchemy import select
+from sqlalchemy import delete, select, text
 from sqlalchemy.exc import DataError
 
 from nptu_assistant.core.settings import Settings
@@ -25,10 +25,20 @@ from nptu_assistant.crawlers.official_units import (
 )
 from nptu_assistant.crawlers.resolution import UnitSourceResolver
 from nptu_assistant.crawlers.service import CrawlerService
-from nptu_assistant.crawlers.site_models import SearchDeadline, SearchPlan
+from nptu_assistant.crawlers.site_models import (
+    DiscoveredPage,
+    SearchDeadline,
+    SearchPlan,
+)
 from nptu_assistant.crawlers.site_search import (
     NptuSiteSearchService,
     SitePageIngestionService,
+)
+from nptu_assistant.crawlers.site_search_cache import (
+    InMemorySiteSearchCache,
+    LayeredSiteSearchCache,
+    PostgresSiteSearchCache,
+    SingleFlightSearchRunner,
 )
 from nptu_assistant.api.schemas import AnswerType
 from nptu_assistant.db.models import (
@@ -36,6 +46,7 @@ from nptu_assistant.db.models import (
     Conversation,
     ConversationEvent,
     Document,
+    SiteSearchCacheRecord,
     Source,
 )
 from nptu_assistant.db.repositories import (
@@ -95,6 +106,46 @@ class ScopePoolEmbeddingProvider:
     ) -> list[list[float]]:
         del timeout_seconds
         return [[1.0, *([0.0] * 1535)] for _text in texts]
+
+
+class RecordingSiteDiscovery:
+    def __init__(self, url: str) -> None:
+        self.url = url
+        self.calls = 0
+
+    def discover(
+        self,
+        plan: SearchPlan,
+        *,
+        max_items: int,
+        deadline: SearchDeadline,
+    ) -> tuple[DiscoveredPage, ...]:
+        del plan, max_items
+        self.calls += 1
+        deadline.raise_if_expired()
+        return (DiscoveredPage(self.url, "校務資訊", 1.0),)
+
+
+class RecordingSiteHttpClient(MappingNptuHttpClient):
+    def __init__(self, pages: dict[str, str]) -> None:
+        super().__init__(pages)
+        self.calls = 0
+
+    def get(
+        self,
+        url: str,
+        *,
+        allowed_hosts: object | None = None,
+        timeout_seconds: float | None = None,
+        deadline: SearchDeadline | None = None,
+    ) -> str:
+        self.calls += 1
+        return super().get(
+            url,
+            allowed_hosts=allowed_hosts,
+            timeout_seconds=timeout_seconds,
+            deadline=deadline,
+        )
 
 
 def test_fixture_ingestion_crawl_and_grounded_chat(tmp_path: Path) -> None:
@@ -379,19 +430,19 @@ def test_postgres_multi_query_document_retrieval_uses_vector_trigram_and_rrf() -
     admission_chunks = [
         TextChunk(
             sequence=0,
-            content="大學申請入學新生專區，錄取生應依規定完成網路報到。",
+            content=f"大學申請入學新生專區 {unique}，錄取生應依規定完成網路報到。",
             token_count=24,
         ),
         TextChunk(
             sequence=1,
-            content="申請入學錄取新生須在期限內完成報到程序。",
+            content=f"申請入學錄取新生 {unique} 須在期限內完成報到程序。",
             token_count=22,
         ),
     ]
     dormitory_chunks = [
         TextChunk(
             sequence=0,
-            content="學生宿舍用電依度數與公告收費標準計算。",
+            content=f"學生宿舍用電 {unique} 依度數與公告收費標準計算。",
             token_count=21,
         )
     ]
@@ -423,9 +474,12 @@ def test_postgres_multi_query_document_retrieval_uses_vector_trigram_and_rrf() -
     )
 
     admission = retriever.search_documents_with_plan(
-        plan=SearchPlan(
-            query="個人申請新生資訊",
-            search_queries=["大學申請入學", "申請入學新生報到"],
+            plan=SearchPlan(
+                query=f"個人申請新生資訊 {unique}",
+                search_queries=[
+                    f"大學申請入學 {unique}",
+                    f"申請入學新生報到 {unique}",
+                ],
             concepts=["個人申請", "申請入學", "新生", "報到"],
             limit=6,
         ),
@@ -433,9 +487,12 @@ def test_postgres_multi_query_document_retrieval_uses_vector_trigram_and_rrf() -
         deadline=SearchDeadline.after(10),
     )
     dormitory = retriever.search_documents_with_plan(
-        plan=SearchPlan(
-            query="學生宿舍冷氣費怎麼計算",
-            search_queries=["宿舍電費計價", "學生宿舍用電收費標準"],
+            plan=SearchPlan(
+                query=f"學生宿舍冷氣費怎麼計算 {unique}",
+                search_queries=[
+                    f"宿舍電費計價 {unique}",
+                    f"學生宿舍用電收費標準 {unique}",
+                ],
             concepts=["學生宿舍", "冷氣", "電費", "收費"],
             limit=6,
         ),
@@ -509,6 +566,109 @@ def test_postgres_scoped_candidate_pools_recover_target_beyond_global_top_20() -
     assert evidence[0].url == target_url
     assert evidence[0].unit == target_unit
     assert all(0.0 <= item.score <= 1.0 for item in evidence)
+
+
+def test_postgres_retrieval_indexes_and_shared_site_search_cache() -> None:
+    settings = Settings(_env_file=None, database_url=os.environ["DATABASE_URL"])
+    factory = create_session_factory(settings)
+    unique = uuid.uuid4().hex
+    with factory() as session:
+        index_names = {
+            row[0]
+            for row in session.execute(
+                text(
+                    "SELECT indexname FROM pg_indexes "
+                    "WHERE indexname IN ("
+                    "'ix_document_chunks_content_trgm', "
+                    "'ix_documents_title_trgm', "
+                    "'ix_site_search_cache_expires_at')"
+                )
+            )
+        }
+    assert index_names == {
+        "ix_document_chunks_content_trgm",
+        "ix_documents_title_trgm",
+        "ix_site_search_cache_expires_at",
+    }
+    with factory() as session:
+        extension = session.scalar(
+            text("SELECT extname FROM pg_extension WHERE extname = 'pg_trgm'")
+        )
+    assert extension == "pg_trgm"
+
+    root_url = f"https://www.nptu.edu.tw/{unique}/"
+    page_url = f"https://www.nptu.edu.tw/{unique}/guide"
+    http = RecordingSiteHttpClient(
+        {
+            root_url: "<main><h1>首頁</h1></main>",
+            page_url: "<main><h1>校務資訊</h1><p>完整校務資訊內容。</p></main>",
+        }
+    )
+    discovery = RecordingSiteDiscovery(page_url)
+    config = SiteSearchConfig(
+        enabled=True,
+        seed_urls=[root_url],
+        allowed_hosts=["nptu.edu.tw"],
+        max_pages=2,
+        max_items=2,
+        max_candidate_urls=8,
+        cache_ttl_seconds=60,
+    )
+    cache_one = LayeredSiteSearchCache(
+        InMemorySiteSearchCache(),
+        PostgresSiteSearchCache(factory),
+        ttl_seconds=60,
+    )
+    first = NptuSiteSearchService(
+        config,
+        http,
+        discovery=discovery,
+        cache=cache_one,
+        single_flight=SingleFlightSearchRunner(factory),
+    )
+    first_result = first.search("校務資訊")
+    assert first_result.pages
+    assert discovery.calls == 1
+
+    cache_two = LayeredSiteSearchCache(
+        InMemorySiteSearchCache(),
+        PostgresSiteSearchCache(factory),
+        ttl_seconds=60,
+    )
+    second = NptuSiteSearchService(
+        config,
+        http,
+        discovery=discovery,
+        cache=cache_two,
+        single_flight=SingleFlightSearchRunner(factory),
+    )
+    second_result = second.search("校務資訊")
+
+    assert second_result == first_result
+    assert discovery.calls == 1
+    assert http.calls == 2
+    with factory() as session:
+        session.execute(
+            delete(SiteSearchCacheRecord).where(
+                SiteSearchCacheRecord.cache_key.contains(unique)
+            )
+        )
+        session.commit()
+
+
+def test_postgres_advisory_lock_is_distributed_and_released() -> None:
+    settings = Settings(_env_file=None, database_url=os.environ["DATABASE_URL"])
+    factory = create_session_factory(settings)
+    first = SingleFlightSearchRunner(factory)
+    second = SingleFlightSearchRunner(factory)
+
+    leader = first.acquire("postgres-single-flight-test")
+    assert leader is not None
+    assert second.acquire("postgres-single-flight-test") is None
+    leader.release()
+    waiter = second.acquire("postgres-single-flight-test")
+    assert waiter is not None
+    waiter.release()
 
 
 def test_scoped_fixture_persists_then_returns_database_id_and_detail() -> None:

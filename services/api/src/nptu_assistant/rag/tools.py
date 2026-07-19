@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import re
@@ -8,7 +9,7 @@ from collections.abc import Collection
 from dataclasses import dataclass, replace
 from datetime import date
 from enum import StrEnum
-from typing import Protocol
+from typing import Any, Protocol, cast
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
@@ -45,6 +46,7 @@ from nptu_assistant.crawlers.unit_intents import (
     extract_announcement_topic,
 )
 from nptu_assistant.rag.models import Evidence
+from nptu_assistant.rag.embedding_cache import RetrievalExecutionContext
 
 
 logger = logging.getLogger(__name__)
@@ -564,6 +566,22 @@ class ToolExecutor:
         self,
         parsed: SearchDocumentsArguments,
     ) -> tuple[list[Evidence], str | None]:
+        execution_context = RetrievalExecutionContext()
+
+        def retrieve(**kwargs: object) -> list[Evidence]:
+            method = cast(Any, self._retriever.search_documents_with_plan)
+            if "execution_context" in inspect.signature(method).parameters:
+                kwargs["execution_context"] = execution_context
+            return method(**kwargs)
+
+        def ingest(**kwargs: object) -> SitePageIngestionResult:
+            if self._site_page_ingestor is None:
+                raise RuntimeError("site page ingestor 未設定")
+            method = cast(Any, self._site_page_ingestor.ingest)
+            if "execution_context" in inspect.signature(method).parameters:
+                kwargs["execution_context"] = execution_context
+            return method(**kwargs)
+
         scope: DocumentSearchScope | None = None
         official_unit: ResolvedOfficialUnit | None = None
         if self._unit_resolver is not None:
@@ -606,12 +624,12 @@ class ToolExecutor:
             )
         if self._site_page_ingestor is None:
             if scope is None:
-                evidence = self._retriever.search_documents_with_plan(
+                evidence = retrieve(
                     plan=parsed,
                     limit=parsed.limit,
                 )
             else:
-                evidence = self._retriever.search_documents_with_plan(
+                evidence = retrieve(
                     plan=parsed,
                     limit=parsed.limit,
                     scope=scope,
@@ -623,13 +641,13 @@ class ToolExecutor:
         deadline = self._site_page_ingestor.new_deadline()
         try:
             if scope is None:
-                cached = self._retriever.search_documents_with_plan(
+                cached = retrieve(
                     plan=parsed,
                     limit=parsed.limit,
                     deadline=deadline,
                 )
             else:
-                cached = self._retriever.search_documents_with_plan(
+                cached = retrieve(
                     plan=parsed,
                     limit=parsed.limit,
                     deadline=deadline,
@@ -642,8 +660,8 @@ class ToolExecutor:
         if deadline.expired():
             return cached, self._document_search_fallback_warning(cached)
         try:
-            ingestion = self._site_page_ingestor.ingest(
-                parsed,
+            ingestion = ingest(
+                plan=parsed,
                 max_items=parsed.limit,
                 deadline=deadline,
                 scope=scope,
@@ -659,13 +677,13 @@ class ToolExecutor:
             )
         try:
             if scope is None:
-                refreshed = self._retriever.search_documents_with_plan(
+                refreshed = retrieve(
                     plan=parsed,
                     limit=parsed.limit,
                     deadline=deadline,
                 )
             else:
-                refreshed = self._retriever.search_documents_with_plan(
+                refreshed = retrieve(
                     plan=parsed,
                     limit=parsed.limit,
                     deadline=deadline,

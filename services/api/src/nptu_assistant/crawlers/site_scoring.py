@@ -16,6 +16,7 @@ from nptu_assistant.crawlers.site_models import (
     SearchPlan,
 )
 from nptu_assistant.providers.protocols import EmbeddingProvider
+from nptu_assistant.rag.embedding_cache import RetrievalExecutionContext
 
 
 _SEARCH_SEPARATOR = re.compile(r"[^0-9a-z\u3400-\u9fff]+", re.IGNORECASE)
@@ -113,6 +114,13 @@ class HybridCandidateScorer:
         self._weights = weights
         self._embedding_provider = embedding_provider
         self._batch_size = batch_size
+        self._execution_context: RetrievalExecutionContext | None = None
+
+    def set_execution_context(
+        self,
+        execution_context: RetrievalExecutionContext | None,
+    ) -> None:
+        self._execution_context = execution_context
 
     def score_candidate(self, plan: SearchPlan, candidate: CandidatePage) -> float:
         queries = plan.retrieval_queries
@@ -233,11 +241,20 @@ class HybridCandidateScorer:
             if deadline is not None:
                 deadline.raise_if_expired()
             first_page_count = max(0, self._batch_size - 1)
-            first_vectors = self._embedding_provider.embed(
-                [plan.semantic_text, *page_texts[:first_page_count]],
-                timeout_seconds=(
-                    deadline.remaining_seconds() if deadline is not None else None
-                ),
+            texts = [plan.semantic_text, *page_texts[:first_page_count]]
+            first_vectors = (
+                self._execution_context.embed(
+                    self._embedding_provider,
+                    texts,
+                    deadline=deadline,
+                )
+                if self._execution_context is not None
+                else self._embedding_provider.embed(
+                    texts,
+                    timeout_seconds=(
+                        deadline.remaining_seconds() if deadline is not None else None
+                    ),
+                )
             )
             if deadline is not None:
                 deadline.raise_if_expired()

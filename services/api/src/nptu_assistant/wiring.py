@@ -29,7 +29,14 @@ from nptu_assistant.crawlers.site_search import (
     NptuSiteSearchService,
     SitePageIngestionService,
 )
+from nptu_assistant.crawlers.site_search_cache import (
+    InMemorySiteSearchCache,
+    LayeredSiteSearchCache,
+    PostgresSiteSearchCache,
+    SingleFlightSearchRunner,
+)
 from nptu_assistant.crawlers.site_scoring import HybridCandidateScorer
+from nptu_assistant.crawlers.site_models import ProgressiveRetrievalPolicy
 from nptu_assistant.db.repositories import (
     SqlAnnouncementRepository,
     SqlDocumentRepository,
@@ -98,6 +105,13 @@ def build_services(settings: Settings) -> dict[str, object]:
     document_repository = SqlDocumentRepository(factory)
     announcement_repository = SqlAnnouncementRepository(factory)
     site_config = keyword_search_config.site_search
+    progressive_policy = ProgressiveRetrievalPolicy(
+        min_results=site_config.database_min_results if site_config else 2,
+        min_score=site_config.database_min_score if site_config else 0.58,
+        min_content_chars=(
+            site_config.database_min_content_chars if site_config else 160
+        ),
+    )
     http_client = CrawlHttpClient(
         settings.crawler_user_agent,
         interval_seconds=settings.crawler_request_interval_seconds,
@@ -127,6 +141,12 @@ def build_services(settings: Settings) -> dict[str, object]:
                 batch_size=site_config.embedding_batch_size,
             ),
             discovery=site_discovery,
+            cache=LayeredSiteSearchCache(
+                InMemorySiteSearchCache(),
+                PostgresSiteSearchCache(factory),
+                ttl_seconds=site_config.cache_ttl_seconds,
+            ),
+            single_flight=SingleFlightSearchRunner(factory),
         )
         if site_config and site_config.enabled
         else None
@@ -158,7 +178,11 @@ def build_services(settings: Settings) -> dict[str, object]:
         "health_service": HealthService(factory, settings),
         "chat_service": (
             ChatService(
-                SqlRetriever(factory, embedding),
+                SqlRetriever(
+                    factory,
+                    embedding,
+                    progressive_policy=progressive_policy,
+                ),
                 llm,
                 SqlConversationStore(factory),
                 announcement_refresher,
