@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from collections.abc import Callable, Collection
 from dataclasses import dataclass, replace
-from datetime import date
+from datetime import date, datetime, timezone
 import heapq
+import logging
+import re
 import time
 from typing import Protocol
 from urllib.parse import urlsplit
@@ -12,7 +14,12 @@ from pydantic import HttpUrl
 
 from nptu_assistant.api.schemas import IngestionSummary
 from nptu_assistant.core.security import canonicalize_nptu_url, is_allowed_source_url
-from nptu_assistant.crawlers.adapters.nptu_site import NptuSitePage, NptuSitePageAdapter
+from nptu_assistant.crawlers.adapters.nptu_site import (
+    NptuListingItem,
+    NptuSitePage,
+    NptuSitePageAdapter,
+    UnitAnnouncementPageRole,
+)
 from nptu_assistant.crawlers.adapters.nptu_search import AnnouncementSearchResult
 from nptu_assistant.crawlers.config import SiteSearchConfig
 from nptu_assistant.crawlers.official_units import DocumentSearchScope
@@ -25,6 +32,7 @@ from nptu_assistant.crawlers.site_models import (
     SearchPlan,
 )
 from nptu_assistant.crawlers.site_scoring import CandidateScorer, HybridCandidateScorer
+from nptu_assistant.crawlers.models import AnnouncementCandidate
 from nptu_assistant.ingestion.chunking import TextChunk, chunk_text
 from nptu_assistant.ingestion.cleaning import content_hash
 from nptu_assistant.ingestion.metadata import DocumentMetadata
@@ -35,6 +43,8 @@ SITE_SEARCH_PARTIAL_WARNING = "NPTU 網域搜尋有部分頁面無法取得，�
 SITE_SEARCH_FAILURE_WARNING = (
     "NPTU 網域搜尋目前無法取得頁面，以下內容來自資料庫既有資料。"
 )
+
+logger = logging.getLogger(__name__)
 
 
 class SiteSearchHttpClient(Protocol):
@@ -113,6 +123,42 @@ class NptuSiteSearchService:
             self._config.query_timeout_seconds,
             clock=self._clock,
         )
+
+    def fetch_page(
+        self,
+        url: str,
+        *,
+        allowed_hosts: Collection[str],
+        deadline: SearchDeadline,
+    ) -> NptuSitePage:
+        canonical_url = canonicalize_nptu_url(url)
+        if not is_allowed_source_url(canonical_url, allowed_hosts):
+            raise ValueError("網站頁面不在來源 host allowlist")
+        deadline.raise_if_expired()
+        cached_page = self._page_cache.get(canonical_url)
+        if (
+            cached_page is not None
+            and self._config.cache_ttl_seconds
+            and self._clock() - cached_page[0] <= self._config.cache_ttl_seconds
+        ):
+            return cached_page[1]
+        get_html = getattr(self._http, "get_html", self._http.get)
+        content = get_html(
+            canonical_url,
+            allowed_hosts=allowed_hosts,
+            timeout_seconds=deadline.remaining_seconds(),
+            deadline=deadline,
+        )
+        deadline.raise_if_expired()
+        page = self._adapter.parse_page(
+            content,
+            canonical_url,
+            allowed_hosts=list(allowed_hosts),
+        )
+        deadline.raise_if_expired()
+        if self._config.cache_ttl_seconds:
+            self._page_cache[canonical_url] = (self._clock(), page)
+        return page
 
     def search(
         self,
@@ -218,7 +264,7 @@ class NptuSiteSearchService:
             except SearchDeadlineExceeded:
                 query_timed_out = True
             except Exception:
-                pass
+                logger.exception("NPTU 官方網站 discovery 失敗")
         for seed_url in seed_urls:
             enqueue(CandidatePage(seed_url))
 
@@ -243,30 +289,11 @@ class NptuSiteSearchService:
             visited.add(url)
             pages_per_host[host] = pages_per_host.get(host, 0) + 1
             try:
-                cached_page = self._page_cache.get(url)
-                if (
-                    cached_page is not None
-                    and self._config.cache_ttl_seconds
-                    and self._clock() - cached_page[0] <= self._config.cache_ttl_seconds
-                ):
-                    page = cached_page[1]
-                else:
-                    get_html = getattr(self._http, "get_html", self._http.get)
-                    content = get_html(
-                        url,
-                        allowed_hosts=allowed_hosts,
-                        timeout_seconds=search_deadline.remaining_seconds(),
-                        deadline=search_deadline,
-                    )
-                    search_deadline.raise_if_expired()
-                    page = self._adapter.parse_page(
-                        content,
-                        url,
-                        allowed_hosts=allowed_hosts,
-                    )
-                    search_deadline.raise_if_expired()
-                    if self._config.cache_ttl_seconds:
-                        self._page_cache[url] = (self._clock(), page)
+                page = self.fetch_page(
+                    url,
+                    allowed_hosts=allowed_hosts,
+                    deadline=search_deadline,
+                )
             except SearchDeadlineExceeded:
                 query_timed_out = True
                 timed_out_scores.append(relevance)
@@ -274,6 +301,10 @@ class NptuSiteSearchService:
                 break
             except Exception:
                 fetch_failure_scores.append(relevance)
+                logger.exception(
+                    "NPTU 官方網站頁面取得失敗",
+                    extra={"url": url},
+                )
                 continue
 
             pages.append(page)
@@ -342,6 +373,11 @@ class NptuSiteSearchService:
             page
             for page in scored_pages
             if page.score >= self._config.relevance_threshold
+            or (
+                scope is not None
+                and page.role is UnitAnnouncementPageRole.LISTING
+                and page.announcement_items
+            )
         ]
         relevant_pages.sort(
             key=lambda page: (
@@ -393,6 +429,19 @@ class DocumentRepository(Protocol):
     ) -> None: ...
 
 
+class ScopedAnnouncementRepository(Protocol):
+    def merge_source_announcements(
+        self,
+        candidates: list[AnnouncementCandidate],
+        *,
+        source_name: str,
+        source_url: str,
+        source_unit: str,
+        interval_minutes: int,
+        crawled_at: datetime,
+    ) -> list[str]: ...
+
+
 class ScoredEvidence(Protocol):
     @property
     def score(self) -> float: ...
@@ -413,6 +462,18 @@ class SitePageIngestionResult:
     ingestion_complete: bool = True
 
 
+@dataclass(frozen=True, slots=True)
+class ScopedAnnouncementIngestionResult:
+    canonical_urls: tuple[str, ...]
+    warning: str | None
+    diagnostics: SearchDiagnostics = SearchDiagnostics()
+    found_count: int = 0
+    persisted_count: int = 0
+    failed_count: int = 0
+    undated_count: int = 0
+    complete: bool = True
+
+
 class SitePageIngestionService:
     def __init__(
         self,
@@ -420,11 +481,13 @@ class SitePageIngestionService:
         repository: DocumentRepository,
         embedding_provider: EmbeddingProvider,
         config: SiteSearchConfig,
+        announcement_repository: ScopedAnnouncementRepository | None = None,
     ) -> None:
         self._search = search_service
         self._repository = repository
         self._embedding_provider = embedding_provider
         self._config = config
+        self._announcement_repository = announcement_repository
 
     def should_search_live(self, evidence: Collection[ScoredEvidence]) -> bool:
         reliable = [
@@ -592,50 +655,174 @@ class SitePageIngestionService:
         scope: DocumentSearchScope,
         max_items: int,
         deadline: SearchDeadline,
-    ) -> tuple[tuple[AnnouncementSearchResult, ...], str | None]:
+        sort: object = "newest",
+        topic: str | None = None,
+    ) -> ScopedAnnouncementIngestionResult:
+        search_limit = min(self._config.max_items, max(max_items, 3))
         result = self._search.search(
             plan,
-            max_items=max_items,
+            max_items=search_limit,
             use_discovery=False,
             deadline=deadline,
             scope=scope,
         )
-        markers = (
-            "公告",
-            "消息",
-            "訊息",
-            "通知",
-            "news",
-            "/p/403-",
-            "/p/404-",
-            "/p/406-",
-        )
-        pages = tuple(
-            page
-            for page in result.pages
-            if any(
-                marker.casefold()
-                in " ".join((page.title, *page.headings, page.canonical_url)).casefold()
-                for marker in markers
+        canonical_unit = scope.canonical_unit
+        if not canonical_unit:
+            raise ValueError("scoped 公告搜尋缺少 canonical unit")
+        if self._announcement_repository is None:
+            return ScopedAnnouncementIngestionResult(
+                (),
+                SITE_SEARCH_FAILURE_WARNING,
+                result.diagnostics,
+                complete=False,
             )
-        )
-        source_url = (
-            scope.seed_urls[0] if scope.seed_urls else (scope.homepage_url or "")
-        )
-        announcements = tuple(
-            AnnouncementSearchResult(
-                title=page.title,
-                canonical_url=page.canonical_url,
-                unit=scope.canonical_unit or self._config.unit,
-                category="單位公告",
-                published_at=page.published_at,
-                body=page.body,
-                source_name=f"unit-scoped:{scope.canonical_unit or self._config.unit}",
-                source_url=source_url,
+
+        listing_items: list[NptuListingItem] = []
+        detail_pages: dict[str, tuple[NptuSitePage, NptuListingItem | None]] = {}
+        for page in result.pages:
+            if page.role is UnitAnnouncementPageRole.LISTING:
+                listing_items.extend(page.announcement_items)
+            elif page.role is UnitAnnouncementPageRole.DETAIL:
+                detail_pages[page.canonical_url] = (page, None)
+
+        deduplicated_items = {item.canonical_url: item for item in listing_items}
+        failed_count = 0
+        timed_out = False
+        for item in list(deduplicated_items.values())[:max_items]:
+            if item.canonical_url in detail_pages:
+                page, _existing = detail_pages[item.canonical_url]
+                detail_pages[item.canonical_url] = (page, item)
+                continue
+            try:
+                page = self._search.fetch_page(
+                    item.canonical_url,
+                    allowed_hosts=scope.allowed_hosts,
+                    deadline=deadline,
+                )
+                if page.role is UnitAnnouncementPageRole.LISTING:
+                    failed_count += 1
+                    continue
+                detail_pages[item.canonical_url] = (page, item)
+            except SearchDeadlineExceeded:
+                timed_out = True
+                break
+            except Exception:
+                failed_count += 1
+                logger.exception(
+                    "單位公告詳情頁取得失敗",
+                    extra={"unit": canonical_unit, "url": item.canonical_url},
+                )
+
+        candidates: list[AnnouncementCandidate] = []
+        undated_count = 0
+        for page, listing_item in detail_pages.values():
+            published_at = page.published_at or (
+                listing_item.published_at if listing_item is not None else None
             )
-            for page in pages[:max_items]
+            if published_at is None:
+                undated_count += 1
+                continue
+            title = page.title
+            if listing_item is not None and (
+                not title or title == page.canonical_url or len(title) > 300
+            ):
+                title = listing_item.title
+            body = page.body.strip()
+            if not body:
+                failed_count += 1
+                continue
+            candidates.append(
+                AnnouncementCandidate(
+                    title=title,
+                    canonical_url=page.canonical_url,
+                    unit=canonical_unit,
+                    category="單位公告",
+                    published_at=published_at,
+                    deadline_at=None,
+                    body=body,
+                )
+            )
+
+        sort_value = str(getattr(sort, "value", sort)).casefold()
+        topic_key = re.sub(r"\s+", "", topic or "").casefold()
+
+        def relevance(candidate: AnnouncementCandidate) -> int:
+            if not topic_key:
+                return 0
+            searchable = re.sub(
+                r"\s+", "", f"{candidate.title} {candidate.body}"
+            ).casefold()
+            return searchable.count(topic_key)
+
+        if sort_value == "oldest":
+            candidates.sort(
+                key=lambda item: (item.published_at.toordinal(), item.canonical_url)
+            )
+        elif sort_value == "relevance":
+            candidates.sort(
+                key=lambda item: (
+                    -relevance(item),
+                    -item.published_at.toordinal(),
+                    item.canonical_url,
+                )
+            )
+        else:
+            candidates.sort(
+                key=lambda item: (-item.published_at.toordinal(), item.canonical_url)
+            )
+
+        source_url = scope.homepage_url or (
+            scope.seed_urls[0] if scope.seed_urls else ""
         )
-        return announcements, self._warning_for(result.diagnostics)
+        source_name = f"unit-scoped:{canonical_unit}"
+        persisted_urls: list[str] = []
+        crawled_at = datetime.now(timezone.utc)
+        for candidate in candidates[:max_items]:
+            try:
+                deadline.raise_if_expired()
+                self._announcement_repository.merge_source_announcements(
+                    [candidate],
+                    source_name=source_name,
+                    source_url=source_url,
+                    source_unit=canonical_unit,
+                    interval_minutes=60,
+                    crawled_at=crawled_at,
+                )
+                persisted_urls.append(candidate.canonical_url)
+            except SearchDeadlineExceeded:
+                timed_out = True
+                break
+            except Exception:
+                failed_count += 1
+                logger.exception(
+                    "單位公告持久化失敗",
+                    extra={"unit": canonical_unit, "url": candidate.canonical_url},
+                )
+
+        found_count = len(detail_pages)
+        incomplete = bool(
+            failed_count
+            or undated_count
+            or timed_out
+            or result.diagnostics.query_timed_out
+            or self._warning_for(result.diagnostics)
+        )
+        if persisted_urls:
+            warning = SITE_SEARCH_PARTIAL_WARNING if incomplete else None
+        elif incomplete:
+            warning = SITE_SEARCH_FAILURE_WARNING
+        else:
+            warning = None
+        return ScopedAnnouncementIngestionResult(
+            canonical_urls=tuple(dict.fromkeys(persisted_urls)),
+            warning=warning,
+            diagnostics=result.diagnostics,
+            found_count=found_count,
+            persisted_count=len(persisted_urls),
+            failed_count=failed_count,
+            undated_count=undated_count,
+            complete=not incomplete,
+        )
 
     def _warning_for(self, diagnostics: SearchDiagnostics) -> str | None:
         if diagnostics.relevant_success_count == 0:

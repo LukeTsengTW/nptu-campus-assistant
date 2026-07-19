@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 from nptu_assistant.crawlers.aliases import AliasNormalizer
-from nptu_assistant.crawlers.config import CrawlerSourceConfig, load_keyword_search_config, load_source_configs
+from nptu_assistant.crawlers.config import (
+    CrawlerSourceConfig,
+    load_keyword_search_config,
+    load_source_configs,
+)
 from nptu_assistant.crawlers.resolution import (
     UnitResolutionStatus,
     UnitSourceResolver,
@@ -59,6 +63,32 @@ def test_alias_normalizer_uses_longest_non_overlapping_alias() -> None:
     assert resolver.normalize("電科系最新公告") == "電腦科學與人工智慧學系最新公告"
 
 
+@pytest.mark.parametrize(
+    ("alias", "canonical"),
+    [
+        ("資工系", "資訊工程學系"),
+        ("中文系", "中國語文學系"),
+        ("教育行政所", "教育行政研究所"),
+    ],
+)
+def test_safe_derived_unit_aliases_resolve(alias: str, canonical: str) -> None:
+    result = project_resolver().resolve(alias, "最新公告")
+
+    assert result.canonical_unit == canonical
+    assert result.status is not UnitResolutionStatus.UNKNOWN
+
+
+@pytest.mark.parametrize("query", ["家庭教育系最新公告", "商務英語系最新公告"])
+def test_unknown_longer_unit_name_never_falls_back_to_known_suffix(query: str) -> None:
+    result = project_resolver().resolve(None, query)
+
+    assert result.status in {
+        UnitResolutionStatus.UNKNOWN,
+        UnitResolutionStatus.AMBIGUOUS,
+    }
+    assert result.canonical_unit not in {"教育學系", "英語學系"}
+
+
 def test_resolver_resolves_canonical_unit_and_query_mention() -> None:
     resolver = project_resolver()
 
@@ -83,7 +113,9 @@ def test_known_unit_without_enabled_source_is_unsupported() -> None:
 def test_unknown_explicit_or_query_unit_requires_clarification() -> None:
     resolver = project_resolver()
 
-    assert resolver.resolve("火星學院", "最新公告").status is UnitResolutionStatus.UNKNOWN
+    assert (
+        resolver.resolve("火星學院", "最新公告").status is UnitResolutionStatus.UNKNOWN
+    )
     query_result = resolver.resolve(None, "火星學院最新公告")
     assert query_result.status is UnitResolutionStatus.UNKNOWN
     assert "火星學院" in query_result.requested
@@ -155,7 +187,9 @@ def test_source_route_conflicting_with_explicit_unit_is_ambiguous() -> None:
 def test_duplicate_source_alias_is_ambiguous_with_stable_candidates() -> None:
     sources = [
         html_source(name="beta", unit="乙中心", alias="共同中心", host="b.nptu.edu.tw"),
-        html_source(name="alpha", unit="甲中心", alias="共同中心", host="a.nptu.edu.tw"),
+        html_source(
+            name="alpha", unit="甲中心", alias="共同中心", host="a.nptu.edu.tw"
+        ),
     ]
     resolver = UnitSourceResolver(sources, {})
 

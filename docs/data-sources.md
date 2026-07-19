@@ -103,7 +103,11 @@ services/api/.venv/Scripts/python.exe scripts/audit_official_units.py --format j
 - `ambiguous_unit`：同時出現多個單位或 alias 對應衝突，列出穩定排序候選。
 - `none`：沒有單位意圖，保留既有全校公告／關鍵字搜尋流程。
 
-成功 crawl 會在同一交易中 upsert 公告、把本次 URL 全量寫入 `Source.canonical_urls`，並更新 `last_successful_crawl_at`；內容全部 unchanged 與手動 crawl 也遵循同一流程。成功空結果保存為空陣列；任一資料列或快照寫入失敗時整批回滾。單位查詢只檢索該快照中的 URL，限制與排序完成後才回傳最多 20 筆。
+configured listing 的成功 crawl 會在同一交易中 upsert 公告、把本次 URL 全量寫入 `Source.canonical_urls`，並更新 `last_successful_crawl_at`；內容全部 unchanged 與手動 crawl 也遵循同一流程。成功空結果保存為空陣列；任一資料列或快照寫入失敗時整批回滾。
+
+scoped site search 是 bounded crawl，不代表完整來源快照。其來源名稱固定為 `unit-scoped:<canonical unit>`，先辨識 listing DOM、抽取 detail URL，再取得 detail 並以 detail 日期優先；listing 本身不會成為公告。成功項目使用 merge upsert 加入既有 `Source.canonical_urls`，不會逐出舊快取。工具只以本次成功持久化的 canonical URL 回查資料庫，因此 Evidence ID 一律是 `Announcement.id`，可直接交給 `get_announcement`。部分 detail、日期、timeout 或持久化失敗只回傳成功寫入項目並附部分結果警告；完全失敗時才回退同單位既有快取。
+
+文件檢索有全域、精確 canonical unit 與 preferred HTTPS host 三組 vector／keyword SQL 候選池，再統一做 RRF、scope bonus 與文件去重。host pool 只接受設定中的精確 host 或其 HTTPS root prefix，不使用任意 substring URL matching。
 
 ## 爬取安全限制
 

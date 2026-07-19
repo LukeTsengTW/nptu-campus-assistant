@@ -10,6 +10,7 @@ from sqlalchemy.sql.elements import TextClause
 
 from nptu_assistant.api.schemas import AnswerType
 from nptu_assistant.crawlers.config import SiteSearchConfig
+from nptu_assistant.crawlers.official_units import DocumentSearchScope
 from nptu_assistant.crawlers.site_models import (
     SearchDeadline,
     SearchDeadlineExceeded,
@@ -395,6 +396,34 @@ def test_document_multi_query_retrieval_finds_different_admission_wording() -> N
         current_config,
     )
     assert ingestor.should_search_live(evidence) is False
+
+
+def test_scoped_document_retrieval_generates_global_unit_and_exact_host_pools() -> None:
+    session = FakeSession()
+    scope = DocumentSearchScope(
+        canonical_unit="資訊工程學系",
+        homepage_url="https://csie.nptu.edu.tw/",
+        preferred_hosts=("csie.nptu.edu.tw",),
+        allowed_hosts=("csie.nptu.edu.tw",),
+        seed_urls=("https://csie.nptu.edu.tw/",),
+    )
+
+    make_retriever(session).search_documents_with_plan(
+        plan=SearchPlan.from_query("人工智慧課程", limit=6),
+        limit=6,
+        scope=scope,
+    )
+
+    assert len(session.statements) == 6
+    unit_statements = [sql(item) for item in session.statements[2:4]]
+    host_statements = [sql(item) for item in session.statements[4:6]]
+    assert all("sources.unit = '資訊工程學系'" in item for item in unit_statements)
+    assert all(
+        "documents.canonical_url = 'https://csie.nptu.edu.tw'" in item
+        and "documents.canonical_url LIKE 'https://csie.nptu.edu.tw/%%'" in item
+        for item in host_statements
+    )
+    assert all("%csie.nptu.edu.tw%" not in item for item in host_statements)
 
 
 def test_document_multi_query_retrieval_generalizes_to_dormitory_billing() -> None:

@@ -5,9 +5,9 @@ import json
 from pathlib import Path
 
 import pytest
+import yaml
 
 from nptu_assistant.api.schemas import AnswerType
-from nptu_assistant.crawlers.adapters.nptu_search import AnnouncementSearchResult
 from nptu_assistant.crawlers.config import (
     load_keyword_search_config,
     load_source_configs,
@@ -22,6 +22,11 @@ from nptu_assistant.crawlers.official_units import (
 )
 from nptu_assistant.crawlers.resolution import UnitResolutionStatus, UnitSourceResolver
 from nptu_assistant.crawlers.site_models import SearchDeadline, SearchPlan
+from nptu_assistant.crawlers.site_search import ScopedAnnouncementIngestionResult
+from nptu_assistant.crawlers.site_search import (
+    SITE_SEARCH_FAILURE_WARNING,
+    SITE_SEARCH_PARTIAL_WARNING,
+)
 from nptu_assistant.crawlers.unit_intents import (
     UnitQueryIntent,
     classify_unit_query,
@@ -45,6 +50,21 @@ def test_missing_sibling_directory_uses_project_registry(tmp_path: Path) -> None
     directory = load_official_unit_directory_for_config(tmp_path / "announcements.yaml")
 
     assert directory.get("資訊學院").homepage_url == "https://ccs.nptu.edu.tw/"
+
+
+def test_registry_rejects_explicit_alias_colliding_with_derived_alias(
+    tmp_path: Path,
+) -> None:
+    payload = yaml.safe_load(UNIT_CONFIG.read_text(encoding="utf-8"))
+    payload["units"][0]["aliases"].append("資工系")
+    config = tmp_path / "official_units.yaml"
+    config.write_text(
+        yaml.safe_dump(payload, allow_unicode=True),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="alias 不可對應多個單位"):
+        load_official_unit_directory(config)
 
 
 def project_resolver() -> UnitSourceResolver:
@@ -80,8 +100,13 @@ class RecordingRetriever:
 
 
 class ScopedAnnouncementIngestor:
-    def __init__(self, results: tuple[AnnouncementSearchResult, ...]) -> None:
-        self.results = results
+    def __init__(
+        self,
+        canonical_urls: tuple[str, ...],
+        warning: str | None = None,
+    ) -> None:
+        self.canonical_urls = canonical_urls
+        self.warning = warning
         self.scopes: list[DocumentSearchScope] = []
 
     def new_deadline(self) -> SearchDeadline:
@@ -94,10 +119,16 @@ class ScopedAnnouncementIngestor:
         scope: DocumentSearchScope,
         max_items: int,
         deadline: SearchDeadline,
-    ) -> tuple[tuple[AnnouncementSearchResult, ...], str | None]:
-        del plan, max_items, deadline
+        sort: object = "newest",
+        topic: str | None = None,
+    ) -> ScopedAnnouncementIngestionResult:
+        del plan, max_items, deadline, sort, topic
         self.scopes.append(scope)
-        return self.results, None
+        return ScopedAnnouncementIngestionResult(
+            self.canonical_urls,
+            self.warning,
+            persisted_count=len(self.canonical_urls),
+        )
 
 
 def document_arguments(query: str) -> str:
@@ -263,21 +294,18 @@ def test_document_intent_does_not_misroute_information_term(question: str) -> No
 
 def test_scoped_announcement_search_stays_on_unit_host() -> None:
     official_url = "https://csie.nptu.edu.tw/p/406-1009-200001.php"
-    scoped = ScopedAnnouncementIngestor(
-        (
-            AnnouncementSearchResult(
-                title="資訊工程學系最新公告",
-                canonical_url=official_url,
-                unit="資訊工程學系",
-                category="單位公告",
-                published_at=date(2026, 7, 18),
-                body="公告內容",
-                source_name="unit-scoped:資訊工程學系",
-                source_url="https://csie.nptu.edu.tw/",
-            ),
-        )
+    scoped = ScopedAnnouncementIngestor((official_url,))
+    persisted = Evidence(
+        id="7dff5883-9e4d-4a8a-95ba-ceb79ef8e9dc",
+        kind=AnswerType.ANNOUNCEMENT,
+        title="資訊工程學系最新公告",
+        url=official_url,
+        unit="資訊工程學系",
+        published_at=date(2026, 7, 18),
+        content="公告內容",
+        score=0.9,
     )
-    retriever = RecordingRetriever()
+    retriever = RecordingRetriever([persisted])
 
     result = ToolExecutor(
         retriever,
@@ -291,8 +319,9 @@ def test_scoped_announcement_search_stays_on_unit_host() -> None:
     assert result.warning is None
     assert [item.url for item in result.evidence] == [official_url]
     assert result.evidence[0].kind is AnswerType.ANNOUNCEMENT
+    assert result.evidence[0].id == persisted.id
     assert scoped.scopes[0].allowed_hosts == ("csie.nptu.edu.tw",)
-    assert retriever.calls == []
+    assert retriever.calls[0][1]["canonical_urls"] == (official_url,)
 
 
 def test_scoped_cache_rejects_other_unit_results() -> None:
@@ -320,3 +349,56 @@ def test_scoped_cache_rejects_other_unit_results() -> None:
 
     assert result.evidence == []
     assert result.warning is None
+
+
+def test_scoped_failure_uses_matching_cache_with_failure_warning() -> None:
+    cached = Evidence(
+        id="persisted-cache-id",
+        kind=AnswerType.ANNOUNCEMENT,
+        title="資訊工程學系快取公告",
+        url="https://csie.nptu.edu.tw/p/406-cache.php",
+        unit="資訊工程學系",
+        published_at=date(2026, 7, 17),
+        content="快取內容",
+        score=0.8,
+    )
+    result = ToolExecutor(
+        RecordingRetriever([cached]),
+        unit_resolver=project_resolver(),
+        site_page_ingestor=ScopedAnnouncementIngestor((), SITE_SEARCH_FAILURE_WARNING),
+    ).execute(
+        "search_announcements",
+        announcement_arguments(None, "資工系"),
+    )
+
+    assert result.evidence == [cached]
+    assert result.warning == SITE_SEARCH_FAILURE_WARNING
+
+
+def test_scoped_partial_persistence_returns_only_database_backed_urls() -> None:
+    persisted_url = "https://csie.nptu.edu.tw/p/406-persisted.php"
+    persisted = Evidence(
+        id="database-announcement-id",
+        kind=AnswerType.ANNOUNCEMENT,
+        title="已持久化公告",
+        url=persisted_url,
+        unit="資訊工程學系",
+        published_at=date(2026, 7, 18),
+        content="正式內容",
+        score=0.9,
+    )
+    retriever = RecordingRetriever([persisted])
+    result = ToolExecutor(
+        retriever,
+        unit_resolver=project_resolver(),
+        site_page_ingestor=ScopedAnnouncementIngestor(
+            (persisted_url,), SITE_SEARCH_PARTIAL_WARNING
+        ),
+    ).execute(
+        "search_announcements",
+        announcement_arguments("人工智慧", "資工系"),
+    )
+
+    assert result.evidence == [persisted]
+    assert result.warning == SITE_SEARCH_PARTIAL_WARNING
+    assert retriever.calls[0][1]["canonical_urls"] == (persisted_url,)

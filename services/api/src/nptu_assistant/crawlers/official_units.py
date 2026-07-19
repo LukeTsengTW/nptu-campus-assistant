@@ -26,6 +26,16 @@ DEFAULT_OFFICIAL_UNITS_PATH = (
 )
 
 
+def derive_unit_aliases(canonical_name: str) -> tuple[str, ...]:
+    variants: list[str] = []
+    for suffix, replacement in (("學系", "系"), ("研究所", "所")):
+        if canonical_name.endswith(suffix):
+            prefix = canonical_name[: -len(suffix)]
+            if len(prefix) >= 2:
+                variants.append(prefix + replacement)
+    return tuple(variants)
+
+
 class UnitType(StrEnum):
     COLLEGE = "college"
     DEPARTMENT = "department"
@@ -259,7 +269,11 @@ class OfficialUnitDirectoryPayload(BaseModel):
             raise ValueError("configured source name 不可重複")
         aliases: dict[str, list[str]] = defaultdict(list)
         for unit in self.units:
-            for alias in (unit.canonical_name, *unit.aliases):
+            for alias in (
+                unit.canonical_name,
+                *unit.aliases,
+                *derive_unit_aliases(unit.canonical_name),
+            ):
                 aliases[alias].append(unit.canonical_name)
         ambiguous = {
             alias: units for alias, units in aliases.items() if len(set(units)) > 1
@@ -283,10 +297,14 @@ class OfficialUnitDirectory:
         alias_map = {
             alias: unit.canonical_name
             for unit in self.units
-            for alias in (unit.canonical_name, *unit.aliases)
+            for alias in (
+                unit.canonical_name,
+                *unit.aliases,
+                *derive_unit_aliases(unit.canonical_name),
+            )
         }
         self._aliases = alias_map
-        self._matcher = AliasNormalizer(alias_map)
+        self._matcher = AliasNormalizer(alias_map, unit_aware=True)
 
     @property
     def aliases(self) -> Mapping[str, str]:

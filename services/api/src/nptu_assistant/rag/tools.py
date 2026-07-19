@@ -13,7 +13,6 @@ from typing import Protocol
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from nptu_assistant.api.schemas import AnswerType
-from nptu_assistant.crawlers.adapters.nptu_search import AnnouncementSearchResult
 from nptu_assistant.crawlers.official_units import (
     DocumentSearchScope,
     ResolvedOfficialUnit,
@@ -32,6 +31,7 @@ from nptu_assistant.crawlers.site_search import (
     SITE_SEARCH_FAILURE_WARNING,
     SITE_SEARCH_PARTIAL_WARNING,
     ScoredEvidence,
+    ScopedAnnouncementIngestionResult,
     SitePageIngestionResult,
 )
 from nptu_assistant.crawlers.site_models import (
@@ -233,7 +233,9 @@ class SitePageIngestor(Protocol):
         scope: DocumentSearchScope,
         max_items: int,
         deadline: SearchDeadline,
-    ) -> tuple[tuple[AnnouncementSearchResult, ...], str | None]:
+        sort: object = "newest",
+        topic: str | None = None,
+    ) -> ScopedAnnouncementIngestionResult:
         raise NotImplementedError
 
 
@@ -452,8 +454,7 @@ class ToolExecutor:
                         f"目前無法查詢「{canonical_unit}」的官方公告來源。",
                     )
                 scope = directory.scope_for(official_unit)
-                live_results: tuple[AnnouncementSearchResult, ...] = ()
-                live_warning: str | None = None
+                scoped_ingestion: ScopedAnnouncementIngestionResult | None = None
                 scoped_search_completed = False
                 if self._site_page_ingestor is not None:
                     deadline = self._site_page_ingestor.new_deadline()
@@ -467,12 +468,14 @@ class ToolExecutor:
                         if value
                     )
                     try:
-                        live_results, live_warning = (
+                        scoped_ingestion = (
                             self._site_page_ingestor.search_unit_announcements(
                                 SearchPlan.from_query(search_text, limit=parsed.limit),
                                 scope=scope,
                                 max_items=parsed.limit,
                                 deadline=deadline,
+                                sort=parsed.sort,
+                                topic=parsed.query,
                             )
                         )
                         scoped_search_completed = True
@@ -481,40 +484,32 @@ class ToolExecutor:
                             "單位 scoped 公告搜尋失敗",
                             extra={"unit": canonical_unit},
                         )
-                        live_warning = SITE_SEARCH_FAILURE_WARNING
-                if live_results:
+                if scoped_ingestion is not None and scoped_ingestion.canonical_urls:
+                    persisted_arguments = {
+                        **arguments,
+                        "canonical_urls": scoped_ingestion.canonical_urls,
+                    }
+                    evidence = self._retriever.search_announcements(
+                        **persisted_arguments
+                    )
                     evidence = [
-                        Evidence(
-                            id=str(
-                                uuid.uuid5(
-                                    uuid.NAMESPACE_URL,
-                                    item.canonical_url,
-                                )
-                            ),
-                            kind=AnswerType.ANNOUNCEMENT,
-                            title=item.title,
-                            url=item.canonical_url,
-                            unit=canonical_unit,
-                            published_at=item.published_at,
-                            content=item.body,
-                            score=max(0.65, 1.0 - index * 0.02),
-                        )
-                        for index, item in enumerate(live_results)
+                        item for item in evidence if item.unit == canonical_unit
                     ]
-                    return evidence, live_warning
+                    return evidence, (
+                        scoped_ingestion.warning
+                        if evidence
+                        else SITE_SEARCH_FAILURE_WARNING
+                    )
                 cached = self._retriever.search_announcements(**arguments)
                 cached = [
                     replace(item, unit=canonical_unit)
                     for item in cached
                     if item.unit == canonical_unit
                 ]
+                if scoped_ingestion is not None:
+                    return cached, scoped_ingestion.warning
                 return cached, (
-                    SITE_SEARCH_PARTIAL_WARNING
-                    if cached
-                    else live_warning
-                    or (
-                        None if scoped_search_completed else SITE_SEARCH_FAILURE_WARNING
-                    )
+                    None if scoped_search_completed else SITE_SEARCH_FAILURE_WARNING
                 )
 
             source = resolution.source

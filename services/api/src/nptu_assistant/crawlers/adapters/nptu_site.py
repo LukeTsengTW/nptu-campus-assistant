@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import date
+from enum import StrEnum
 from urllib.parse import urljoin, urlsplit
 
 from bs4 import BeautifulSoup, Tag
@@ -54,6 +55,22 @@ _RESOURCE_SUFFIXES = frozenset(
 _MAX_PAGE_TEXT = 20_000
 
 
+class UnitAnnouncementPageRole(StrEnum):
+    OTHER = "other"
+    LISTING = "listing"
+    DETAIL = "detail"
+
+
+@dataclass(frozen=True, slots=True)
+class NptuListingItem:
+    title: str
+    canonical_url: str
+    published_at: date | None
+    summary: str
+    anchor_text: str
+    order: int
+
+
 @dataclass(frozen=True, slots=True)
 class NptuSitePage:
     title: str
@@ -64,6 +81,8 @@ class NptuSitePage:
     link_texts: tuple[tuple[str, str], ...] = ()
     headings: tuple[str, ...] = ()
     score: float = 0.0
+    role: UnitAnnouncementPageRole = UnitAnnouncementPageRole.OTHER
+    announcement_items: tuple[NptuListingItem, ...] = ()
 
 
 class NptuSitePageAdapter:
@@ -96,15 +115,164 @@ class NptuSitePageAdapter:
             self._link_details(soup, canonical_url, allowed_hosts=allowed_hosts)
         )
         links = tuple(url for url, _label in link_texts)
+        announcement_items = tuple(
+            self._listing_items(
+                soup,
+                canonical_url,
+                allowed_hosts=allowed_hosts,
+            )
+        )
+        published_at = self._published_at(soup, body)
         return NptuSitePage(
             title=title or canonical_url,
             canonical_url=canonical_url,
             body=body,
-            published_at=self._published_at(soup, body),
+            published_at=published_at,
             links=links,
             link_texts=link_texts,
             headings=headings,
+            role=self._page_role(
+                soup,
+                canonical_url,
+                title=title,
+                body=body,
+                published_at=published_at,
+                announcement_items=announcement_items,
+            ),
+            announcement_items=announcement_items,
         )
+
+    @classmethod
+    def _listing_items(
+        cls,
+        soup: BeautifulSoup,
+        page_url: str,
+        *,
+        allowed_hosts: list[str] | tuple[str, ...],
+    ) -> list[NptuListingItem]:
+        rows = soup.select(
+            ".row.listBS, table.listTB tbody tr, "
+            ".module .mtitle, .module-detail .mtitle, .mb .mtitle"
+        )
+        items: list[NptuListingItem] = []
+        seen: set[str] = set()
+        for order, matched_node in enumerate(rows):
+            if not isinstance(matched_node, Tag):
+                continue
+            item_node = matched_node
+            if "mtitle" in (matched_node.get("class") or []):
+                for parent in matched_node.parents:
+                    if not isinstance(parent, Tag):
+                        continue
+                    parent_classes = set(parent.get("class") or [])
+                    if parent.name == "tr" or parent_classes.intersection(
+                        {"d-txt", "row", "listBS"}
+                    ):
+                        item_node = parent
+                        break
+            anchor = matched_node.select_one(".mtitle > a[href], a[href]")
+            if not isinstance(anchor, Tag):
+                continue
+            raw_href = str(anchor.get("href") or "").strip()
+            if not raw_href or raw_href.startswith(
+                ("#", "mailto:", "tel:", "javascript:")
+            ):
+                continue
+            target = urljoin(page_url, raw_href)
+            if (
+                not is_allowed_nptu_url(target)
+                or not is_allowed_source_url(target, allowed_hosts)
+                or not cls.is_crawlable_url(target)
+            ):
+                continue
+            try:
+                canonical_url = canonicalize_nptu_url(target)
+            except ValueError:
+                continue
+            title = normalize_text(anchor.get_text(" ", strip=True))
+            if not title or canonical_url in seen:
+                continue
+            date_node = item_node.select_one(
+                'i.mdate, td[data-th="日期"], .mdate, .date, time, [data-date]'
+            )
+            published_at = None
+            if isinstance(date_node, Tag):
+                date_text = str(
+                    date_node.get("datetime")
+                    or date_node.get("data-date")
+                    or date_node.get_text(" ", strip=True)
+                )
+                match = _DATE_PATTERN.search(date_text)
+                if match:
+                    try:
+                        published_at = parse_published_at(match.group(0))
+                    except ValueError:
+                        pass
+            detail_path = urlsplit(canonical_url).path.casefold()
+            if "/p/406-" not in detail_path and published_at is None:
+                continue
+            summary_node = item_node.select_one(
+                ".mdetail, .summary, .mcont, .d-txt, td[data-th='內容']"
+            )
+            summary = (
+                normalize_text(summary_node.get_text(" ", strip=True))
+                if isinstance(summary_node, Tag)
+                else ""
+            )
+            seen.add(canonical_url)
+            items.append(
+                NptuListingItem(
+                    title=title,
+                    canonical_url=canonical_url,
+                    published_at=published_at,
+                    summary=summary,
+                    anchor_text=normalize_text(
+                        " ".join(
+                            str(value)
+                            for value in (anchor.get("title"), title)
+                            if value
+                        )
+                    ),
+                    order=order,
+                )
+            )
+        return items
+
+    @staticmethod
+    def _page_role(
+        soup: BeautifulSoup,
+        canonical_url: str,
+        *,
+        title: str,
+        body: str,
+        published_at: date | None,
+        announcement_items: tuple[NptuListingItem, ...],
+    ) -> UnitAnnouncementPageRole:
+        path = urlsplit(canonical_url).path.casefold()
+        has_listing_dom = bool(
+            soup.select_one(".row.listBS, table.listTB tbody tr, .module .mtitle")
+        )
+        if announcement_items and (
+            has_listing_dom
+            or len(announcement_items) >= 2
+            or "/p/403-" in path
+            or "/p/404-" in path
+        ):
+            return UnitAnnouncementPageRole.LISTING
+        has_detail_dom = bool(
+            soup.select_one(
+                "article, .mpgdetail, .module-detail, .news-detail, "
+                ".article-detail, [class*='detail']"
+            )
+        )
+        if (
+            not announcement_items
+            and title
+            and len(body) >= 40
+            and (has_detail_dom or (published_at is not None and "/p/406-" in path))
+        ):
+            return UnitAnnouncementPageRole.DETAIL
+        return UnitAnnouncementPageRole.OTHER
 
     @staticmethod
     def _title(soup: BeautifulSoup) -> str:

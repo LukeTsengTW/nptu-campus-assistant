@@ -4,10 +4,11 @@ import uuid
 from collections import defaultdict
 from datetime import date
 import math
+import re
 from typing import Any, cast
 from urllib.parse import urlsplit
 
-from sqlalchemy import case, desc, func, literal, select, text
+from sqlalchemy import case, desc, func, literal, or_, select, text
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.sql.elements import ColumnElement
 
@@ -26,7 +27,9 @@ from nptu_assistant.rag.tools import AnnouncementSort
 
 
 FAILED_SEARCH_MIN_SIMILARITY = 0.1
-DOCUMENT_QUERY_CANDIDATE_LIMIT = 20
+DOCUMENT_GLOBAL_CANDIDATE_LIMIT = 20
+DOCUMENT_UNIT_CANDIDATE_LIMIT = 20
+DOCUMENT_HOST_CANDIDATE_LIMIT = 20
 DOCUMENT_RRF_K = 60
 DOCUMENT_RAW_SCORE_WEIGHT = 0.72
 DOCUMENT_RRF_SCORE_WEIGHT = 0.20
@@ -36,6 +39,23 @@ DOCUMENT_EXACT_TITLE_WEIGHT = 0.02
 
 def _public_announcement_source_filter() -> ColumnElement[bool]:
     return Source.name.not_ilike("%fixture%")
+
+
+def _preferred_host_filter(hosts: tuple[str, ...]) -> ColumnElement[bool]:
+    predicates: list[ColumnElement[bool]] = []
+    for raw_host in hosts:
+        host = raw_host.strip().casefold().rstrip(".")
+        if not re.fullmatch(r"[a-z0-9.-]+", host):
+            continue
+        root = f"https://{host}"
+        predicates.extend(
+            (
+                Document.canonical_url == root,
+                Document.canonical_url == f"{root}/",
+                Document.canonical_url.like(f"{root}/%"),
+            )
+        )
+    return or_(*predicates) if predicates else literal(False)
 
 
 def _validate_limit(limit: int) -> None:
@@ -125,38 +145,45 @@ class SqlRetriever:
                         func.similarity(DocumentChunk.content, query),
                         func.similarity(Document.title, query),
                     ).label("score")
-                    _apply_statement_timeout(session, deadline)
-                    ranked_rows.append(
-                        list(
-                            session.execute(
-                                select(*base_columns, vector_score)
-                                .join(
-                                    Document, Document.id == DocumentChunk.document_id
+
+                    def append_pool(
+                        pool_filter: ColumnElement[bool],
+                        candidate_limit: int,
+                    ) -> None:
+                        for score_expression in (vector_score, keyword_score):
+                            if deadline is not None:
+                                deadline.raise_if_expired()
+                            _apply_statement_timeout(session, deadline)
+                            ranked_rows.append(
+                                list(
+                                    session.execute(
+                                        select(*base_columns, score_expression)
+                                        .join(
+                                            Document,
+                                            Document.id == DocumentChunk.document_id,
+                                        )
+                                        .join(Source, Source.id == Document.source_id)
+                                        .where(
+                                            Document.is_current.is_(True),
+                                            pool_filter,
+                                        )
+                                        .order_by(desc("score"))
+                                        .limit(candidate_limit)
+                                    ).all()
                                 )
-                                .join(Source, Source.id == Document.source_id)
-                                .where(Document.is_current.is_(True))
-                                .order_by(desc("score"))
-                                .limit(DOCUMENT_QUERY_CANDIDATE_LIMIT)
-                            ).all()
+                            )
+
+                    append_pool(literal(True), DOCUMENT_GLOBAL_CANDIDATE_LIMIT)
+                    if scope is not None and scope.canonical_unit:
+                        append_pool(
+                            Source.unit == scope.canonical_unit,
+                            DOCUMENT_UNIT_CANDIDATE_LIMIT,
                         )
-                    )
-                    if deadline is not None:
-                        deadline.raise_if_expired()
-                    _apply_statement_timeout(session, deadline)
-                    ranked_rows.append(
-                        list(
-                            session.execute(
-                                select(*base_columns, keyword_score)
-                                .join(
-                                    Document, Document.id == DocumentChunk.document_id
-                                )
-                                .join(Source, Source.id == Document.source_id)
-                                .where(Document.is_current.is_(True))
-                                .order_by(desc("score"))
-                                .limit(DOCUMENT_QUERY_CANDIDATE_LIMIT)
-                            ).all()
+                    if scope is not None and scope.preferred_hosts:
+                        append_pool(
+                            _preferred_host_filter(scope.preferred_hosts),
+                            DOCUMENT_HOST_CANDIDATE_LIMIT,
                         )
-                    )
                     if deadline is not None:
                         deadline.raise_if_expired()
         except SearchDeadlineExceeded:

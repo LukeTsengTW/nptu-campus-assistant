@@ -5,6 +5,7 @@ from urllib.parse import urlsplit
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.sql.elements import ColumnElement
 
 from nptu_assistant.api.schemas import AnnouncementItem, AnnouncementListResponse
 from nptu_assistant.crawlers.models import AnnouncementCandidate
@@ -274,6 +275,42 @@ class SqlAnnouncementRepository:
             source.last_successful_crawl_at = crawled_at
             return results
 
+    def merge_source_announcements(
+        self,
+        candidates: list[AnnouncementCandidate],
+        *,
+        source_name: str,
+        source_url: str,
+        source_unit: str,
+        interval_minutes: int,
+        crawled_at: datetime,
+    ) -> list[str]:
+        """Upsert a bounded scoped result without evicting the source cache."""
+        with self._factory.begin() as session:
+            source = get_or_create_source(
+                session,
+                name=source_name,
+                base_url=_base_url(source_url),
+                unit=source_unit,
+                source_type="announcement",
+                crawl_enabled=True,
+                crawl_interval_minutes=interval_minutes,
+            )
+            results = [
+                _upsert_announcement(session, candidate, source, crawled_at)
+                for candidate in candidates
+            ]
+            source.canonical_urls = list(
+                dict.fromkeys(
+                    [
+                        *(source.canonical_urls or []),
+                        *(candidate.canonical_url for candidate in candidates),
+                    ]
+                )
+            )
+            source.last_successful_crawl_at = crawled_at
+            return results
+
     def list(
         self,
         *,
@@ -284,7 +321,7 @@ class SqlAnnouncementRepository:
         page: int,
         page_size: int,
     ) -> AnnouncementListResponse:
-        filters = []
+        filters: list[ColumnElement[bool]] = []
         if q:
             filters.append(
                 Announcement.title.ilike(f"%{q}%") | Announcement.body.ilike(f"%{q}%")

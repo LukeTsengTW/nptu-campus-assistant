@@ -92,7 +92,10 @@ class UnitSourceResolver:
         self._alias_to_units = {
             alias: frozenset(units) for alias, units in alias_to_units.items()
         }
-        self._matcher = AliasNormalizer({alias: alias for alias in alias_to_units})
+        self._matcher = AliasNormalizer(
+            {alias: alias for alias in alias_to_units},
+            unit_aware=True,
+        )
         self._source_route_targets = {
             alias: source_by_name[source_name]
             for alias, source_name in configured_routes.items()

@@ -52,13 +52,17 @@ def _run_powershell(script: Path, *arguments: str) -> subprocess.CompletedProces
 
 
 def test_compose_services_restart_after_docker_restarts() -> None:
-    compose = yaml.safe_load((REPOSITORY_ROOT / "docker-compose.yml").read_text(encoding="utf-8"))
+    compose = yaml.safe_load(
+        (REPOSITORY_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    )
 
     assert compose["services"]["db"]["restart"] == "unless-stopped"
     assert compose["services"]["api"]["restart"] == "unless-stopped"
 
 
-def test_start_script_waits_for_docker_then_starts_compose_and_checks_health(tmp_path: Path) -> None:
+def test_start_script_waits_for_docker_then_starts_compose_and_checks_health(
+    tmp_path: Path,
+) -> None:
     fake_docker = tmp_path / "fake-docker.cmd"
     calls = tmp_path / "docker-calls.txt"
     first_attempt = tmp_path / "first-attempt"
@@ -109,7 +113,7 @@ def test_start_script_waits_for_docker_then_starts_compose_and_checks_health(tmp
         server.server_close()
 
     assert result.returncode == 0, result.stdout + result.stderr
-    all_calls = calls.read_text(encoding="utf-8").splitlines()
+    all_calls = calls.read_text(encoding="mbcs").splitlines()
     assert all_calls.count("info") >= 3
     compose_call = all_calls[-1]
     assert compose_call.startswith("compose --project-directory ")

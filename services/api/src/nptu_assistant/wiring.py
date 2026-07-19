@@ -143,6 +143,7 @@ def build_services(settings: Settings) -> dict[str, object]:
             document_repository,
             embedding,
             site_config,
+            announcement_repository,
         )
         if site_searcher and site_config
         else None

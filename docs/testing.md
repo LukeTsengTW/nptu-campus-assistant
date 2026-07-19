@@ -77,4 +77,4 @@ cd services/api
 uv run pytest tests/test_live_official_units.py -q
 ```
 
-抽樣資訊、管理、教育、人文社會、理學院單位；驗證 homepage HTML、allowlist，以及 configured listing 或 scoped search。未設定環境變數時 skipped，不是 deterministic CI 必要條件。
+抽樣資訊、教育、理學、國際、大武山學院；每個樣本必須抽出實際 listing item、取得 detail、驗證標題、日期排序、數量、精確 host，且不得把 homepage／listing 當成公告。configured listing smoke 會寫入 `DATABASE_URL` 指向的已 migration PostgreSQL，並以資料庫 ID 驗證 `get_announcement`。未設定環境變數時 skipped，不是 deterministic CI 必要條件；執行前需另行提供測試資料庫，且不得指向 production。
