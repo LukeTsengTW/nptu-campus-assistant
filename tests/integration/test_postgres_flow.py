@@ -474,12 +474,12 @@ def test_postgres_multi_query_document_retrieval_uses_vector_trigram_and_rrf() -
     )
 
     admission = retriever.search_documents_with_plan(
-            plan=SearchPlan(
-                query=f"個人申請新生資訊 {unique}",
-                search_queries=[
-                    f"大學申請入學 {unique}",
-                    f"申請入學新生報到 {unique}",
-                ],
+        plan=SearchPlan(
+            query=f"個人申請新生資訊 {unique}",
+            search_queries=[
+                f"大學申請入學 {unique}",
+                f"申請入學新生報到 {unique}",
+            ],
             concepts=["個人申請", "申請入學", "新生", "報到"],
             limit=6,
         ),
@@ -487,12 +487,12 @@ def test_postgres_multi_query_document_retrieval_uses_vector_trigram_and_rrf() -
         deadline=SearchDeadline.after(10),
     )
     dormitory = retriever.search_documents_with_plan(
-            plan=SearchPlan(
-                query=f"學生宿舍冷氣費怎麼計算 {unique}",
-                search_queries=[
-                    f"宿舍電費計價 {unique}",
-                    f"學生宿舍用電收費標準 {unique}",
-                ],
+        plan=SearchPlan(
+            query=f"學生宿舍冷氣費怎麼計算 {unique}",
+            search_queries=[
+                f"宿舍電費計價 {unique}",
+                f"學生宿舍用電收費標準 {unique}",
+            ],
             concepts=["學生宿舍", "冷氣", "電費", "收費"],
             limit=6,
         ),
@@ -626,6 +626,12 @@ def test_postgres_retrieval_indexes_and_shared_site_search_cache() -> None:
         cache=cache_one,
         single_flight=SingleFlightSearchRunner(factory),
     )
+    cache_key = first._cache_key(
+        SearchPlan.from_query("校務資訊", limit=2),
+        limit=2,
+        use_discovery=True,
+        scope=None,
+    )
     first_result = first.search("校務資訊")
     assert first_result.pages
     assert discovery.calls == 1
@@ -650,10 +656,113 @@ def test_postgres_retrieval_indexes_and_shared_site_search_cache() -> None:
     with factory() as session:
         session.execute(
             delete(SiteSearchCacheRecord).where(
-                SiteSearchCacheRecord.cache_key.contains(unique)
+                SiteSearchCacheRecord.cache_key == cache_key
             )
         )
         session.commit()
+
+
+def test_postgres_large_traditional_search_plan_writes_and_reads_l2_cache() -> None:
+    settings = Settings(_env_file=None, database_url=os.environ["DATABASE_URL"])
+    factory = create_session_factory(settings)
+    query = "甲乙丙丁戊己庚辛壬癸" * 50
+    variants = [f"變體{index}" + "子丑寅卯" * 49 for index in range(4)]
+    concepts = [f"概念{index}" + "春夏秋冬" * 19 for index in range(8)]
+    search_plan = SearchPlan(
+        query=query,
+        search_queries=variants,
+        concepts=concepts,
+        limit=20,
+    )
+    hosts = ("unit.nptu.edu.tw", "www.nptu.edu.tw", "admission.nptu.edu.tw")
+    urls = tuple(f"https://{host}/large-cache" for host in hosts)
+    scope = DocumentSearchScope(
+        canonical_unit="最大中文快取測試",
+        homepage_url=urls[0],
+        preferred_hosts=hosts[:2],
+        allowed_hosts=hosts,
+        seed_urls=urls,
+    )
+    pages = {url: f"<main><h1>大型快取測試</h1><p>{query}</p></main>" for url in urls}
+    http = RecordingSiteHttpClient(pages)
+    discovery = RecordingSiteDiscovery(urls[0])
+    config = SiteSearchConfig(
+        enabled=True,
+        seed_urls=[urls[0]],
+        allowed_hosts=list(hosts),
+        max_pages=3,
+        max_pages_per_host=1,
+        max_items=20,
+        max_candidate_urls=20,
+        relevance_threshold=0.0,
+        early_stop_min_results=3,
+        cache_ttl_seconds=60,
+    )
+    cache_one = LayeredSiteSearchCache(
+        InMemorySiteSearchCache(),
+        PostgresSiteSearchCache(factory),
+        ttl_seconds=60,
+    )
+    first = NptuSiteSearchService(
+        config,
+        http,
+        discovery=discovery,
+        cache=cache_one,
+        single_flight=SingleFlightSearchRunner(factory),
+    )
+    cache_key = first._cache_key(
+        search_plan,
+        limit=20,
+        use_discovery=True,
+        scope=scope,
+    )
+    canonical_json = json.dumps(
+        first._cache_payload(
+            search_plan,
+            limit=20,
+            use_discovery=True,
+            scope=scope,
+        ),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+    try:
+        first_result = first.search(search_plan, scope=scope)
+        assert len(canonical_json.encode("utf-8")) > 4_096
+        assert len(cache_key) == 64
+        assert len(cache_key.encode("ascii")) == 64
+        with factory() as session:
+            record = session.get(SiteSearchCacheRecord, cache_key)
+            assert record is not None
+            assert record.cache_key == cache_key
+            assert len(record.cache_key) == 64
+
+        cache_two = LayeredSiteSearchCache(
+            InMemorySiteSearchCache(),
+            PostgresSiteSearchCache(factory),
+            ttl_seconds=60,
+        )
+        second = NptuSiteSearchService(
+            config,
+            http,
+            discovery=discovery,
+            cache=cache_two,
+            single_flight=SingleFlightSearchRunner(factory),
+        )
+        second_result = second.search(search_plan, scope=scope)
+
+        assert second_result == first_result
+        assert discovery.calls == 0
+        assert http.calls == 3
+    finally:
+        with factory.begin() as session:
+            session.execute(
+                delete(SiteSearchCacheRecord).where(
+                    SiteSearchCacheRecord.cache_key == cache_key
+                )
+            )
 
 
 def test_postgres_advisory_lock_is_distributed_and_released() -> None:

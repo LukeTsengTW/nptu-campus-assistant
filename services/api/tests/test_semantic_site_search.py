@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from datetime import date
 from collections.abc import Sequence
+import threading
 
 import pytest
 
@@ -20,6 +21,7 @@ from nptu_assistant.crawlers.site_models import (
     DiscoveredPage,
     SearchDeadline,
     SearchPlan,
+    search_query_key,
 )
 from nptu_assistant.crawlers.site_scoring import HybridCandidateScorer
 from nptu_assistant.crawlers.site_search import (
@@ -29,6 +31,8 @@ from nptu_assistant.crawlers.site_search import (
     SitePageIngestionService,
     SiteSearchResult,
 )
+from nptu_assistant.crawlers.site_search_cache import SingleFlightSearchRunner
+from nptu_assistant.rag.embedding_cache import RetrievalExecutionContext
 from nptu_assistant.rag.prompts import SYSTEM_INSTRUCTIONS
 
 
@@ -185,8 +189,9 @@ class DeterministicScorer:
         pages: Sequence[NptuSitePage],
         *,
         deadline: SearchDeadline | None = None,
+        execution_context=None,
     ) -> list[float]:
-        del plan, pages, deadline
+        del plan, pages, deadline, execution_context
         return [self._scores.get(candidate.url, 0.0) for candidate in candidates]
 
 
@@ -331,6 +336,143 @@ def search_service(
     result = service.search(search_plan)
     assert len(embedding.calls) <= 1
     return result, http, embedding
+
+
+class _ObjectSessionFactory:
+    def __call__(self) -> object:
+        return object()
+
+
+class _QueryDiscovery:
+    def __init__(self, pages: dict[str, DiscoveredPage]) -> None:
+        self.pages = pages
+        self.calls: list[str] = []
+        self._guard = threading.Lock()
+
+    def discover(
+        self,
+        plan: SearchPlan,
+        *,
+        max_items: int,
+        deadline: SearchDeadline,
+    ) -> tuple[DiscoveredPage, ...]:
+        del max_items
+        deadline.raise_if_expired()
+        with self._guard:
+            self.calls.append(plan.query)
+        return (self.pages[plan.query],)
+
+
+class _InterleavingEmbeddingProvider:
+    def __init__(self, queries: tuple[str, str]) -> None:
+        self.queries = queries
+        self.barrier = threading.Barrier(len(queries))
+        self.calls: list[tuple[int, list[str]]] = []
+        self._guard = threading.Lock()
+
+    def embed(
+        self,
+        texts: list[str],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> list[list[float]]:
+        del timeout_seconds
+        if texts and any(query in texts[0] for query in self.queries):
+            self.barrier.wait(timeout=5)
+        with self._guard:
+            self.calls.append((threading.get_ident(), list(texts)))
+
+        def vector(value: str) -> list[float]:
+            if self.queries[0] in value:
+                return [1.0, 0.0]
+            if self.queries[1] in value:
+                return [0.0, 1.0]
+            return [0.0, 0.0]
+
+        return [vector(text) for text in texts]
+
+
+def test_shared_scorer_isolates_different_query_execution_contexts() -> None:
+    query_a = "學生宿舍冷氣費"
+    query_b = "研究所推甄報名"
+    url_a = "https://www.nptu.edu.tw/dormitory"
+    url_b = "https://www.nptu.edu.tw/graduate"
+    pages = {
+        url_a: f"<main><h1>{query_a}</h1><p>{query_a} 完整說明。</p></main>",
+        url_b: f"<main><h1>{query_b}</h1><p>{query_b} 完整說明。</p></main>",
+    }
+    current_config = config(
+        seed_urls=[url_a],
+        max_pages=1,
+        max_items=1,
+        max_candidate_urls=4,
+        max_depth=0,
+        early_stop_min_results=1,
+        cache_ttl_seconds=0,
+        relevance_threshold=0.0,
+    )
+    embedding = _InterleavingEmbeddingProvider((query_a, query_b))
+    scorer = HybridCandidateScorer(current_config.weights, embedding)
+    discovery = _QueryDiscovery(
+        {
+            query_a: DiscoveredPage(url_a, query_a, 1.0),
+            query_b: DiscoveredPage(url_b, query_b, 1.0),
+        }
+    )
+    service = NptuSiteSearchService(
+        current_config,
+        MappingHttpClient(pages),
+        scorer=scorer,
+        discovery=discovery,
+        single_flight=SingleFlightSearchRunner(_ObjectSessionFactory()),
+    )
+    contexts = {
+        query_a: RetrievalExecutionContext(),
+        query_b: RetrievalExecutionContext(),
+    }
+    results: dict[str, SiteSearchResult] = {}
+    errors: list[BaseException] = []
+    result_guard = threading.Lock()
+
+    def run(query: str) -> None:
+        try:
+            result = service.search(
+                plan(query, variants=[query], concepts=[query]),
+                execution_context=contexts[query],
+            )
+            with result_guard:
+                results[query] = result
+        except BaseException as error:
+            with result_guard:
+                errors.append(error)
+
+    threads = [
+        threading.Thread(target=run, args=(query,)) for query in (query_a, query_b)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert not errors
+    assert all(not thread.is_alive() for thread in threads)
+    assert results[query_a].pages[0].title == query_a
+    assert results[query_b].pages[0].title == query_b
+    assert sorted(discovery.calls) == sorted((query_a, query_b))
+    assert not hasattr(scorer, "_execution" + "_context")
+    assert not hasattr(scorer, "set_" + "execution_context")
+
+    query_a_keys = {key[1] for key in contexts[query_a].query_vectors}
+    query_b_keys = {key[1] for key in contexts[query_b].query_vectors}
+    assert any(search_query_key(query_a) in key for key in query_a_keys)
+    assert any(search_query_key(query_b) in key for key in query_b_keys)
+    assert all(search_query_key(query_b) not in key for key in query_a_keys)
+    assert all(search_query_key(query_a) not in key for key in query_b_keys)
+    assert len(embedding.calls) == 2
+    assert all(
+        sum(query in texts[0] for query in (query_a, query_b)) == 1
+        for _thread_id, texts in embedding.calls
+    )
 
 
 @pytest.mark.parametrize(

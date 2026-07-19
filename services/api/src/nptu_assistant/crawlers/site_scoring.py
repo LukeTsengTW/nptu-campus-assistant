@@ -98,6 +98,7 @@ class CandidateScorer(Protocol):
         pages: Sequence[NptuSitePage],
         *,
         deadline: SearchDeadline | None = None,
+        execution_context: RetrievalExecutionContext | None = None,
     ) -> list[float]: ...
 
 
@@ -114,13 +115,6 @@ class HybridCandidateScorer:
         self._weights = weights
         self._embedding_provider = embedding_provider
         self._batch_size = batch_size
-        self._execution_context: RetrievalExecutionContext | None = None
-
-    def set_execution_context(
-        self,
-        execution_context: RetrievalExecutionContext | None,
-    ) -> None:
-        self._execution_context = execution_context
 
     def score_candidate(self, plan: SearchPlan, candidate: CandidatePage) -> float:
         queries = plan.retrieval_queries
@@ -158,10 +152,16 @@ class HybridCandidateScorer:
         pages: Sequence[NptuSitePage],
         *,
         deadline: SearchDeadline | None = None,
+        execution_context: RetrievalExecutionContext | None = None,
     ) -> list[float]:
         if len(candidates) != len(pages):
             raise ValueError("候選頁面與已擷取頁面數量不一致")
-        semantic_scores = self._semantic_scores(plan, pages, deadline=deadline)
+        semantic_scores = self._semantic_scores(
+            plan,
+            pages,
+            deadline=deadline,
+            execution_context=execution_context,
+        )
         queries = plan.retrieval_queries
         positive_weight = (
             self._weights.phrase
@@ -230,6 +230,7 @@ class HybridCandidateScorer:
         pages: Sequence[NptuSitePage],
         *,
         deadline: SearchDeadline | None = None,
+        execution_context: RetrievalExecutionContext | None = None,
     ) -> list[float]:
         if not pages:
             return []
@@ -243,12 +244,12 @@ class HybridCandidateScorer:
             first_page_count = max(0, self._batch_size - 1)
             texts = [plan.semantic_text, *page_texts[:first_page_count]]
             first_vectors = (
-                self._execution_context.embed(
+                execution_context.embed(
                     self._embedding_provider,
                     texts,
                     deadline=deadline,
                 )
-                if self._execution_context is not None
+                if execution_context is not None
                 else self._embedding_provider.embed(
                     texts,
                     timeout_seconds=(

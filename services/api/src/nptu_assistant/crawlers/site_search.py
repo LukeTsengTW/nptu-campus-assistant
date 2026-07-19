@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone
+import hashlib
 import heapq
 import json
 import logging
@@ -51,9 +52,20 @@ SITE_SEARCH_PARTIAL_WARNING = "NPTU 網域搜尋有部分頁面無法取得，�
 SITE_SEARCH_FAILURE_WARNING = (
     "NPTU 網域搜尋目前無法取得頁面，以下內容來自資料庫既有資料。"
 )
-SITE_SEARCH_SCORING_VERSION = "p1-v1"
+SITE_SEARCH_SCORING_VERSION = "p1.1-v1"
+SITE_SEARCH_WAITER_BACKOFF_SECONDS = (0.05, 0.1, 0.2, 0.4, 0.5)
 
 logger = logging.getLogger(__name__)
+
+
+def site_search_cache_key(payload: Mapping[str, object]) -> str:
+    canonical_json = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
 
 
 class SiteSearchHttpClient(Protocol):
@@ -105,6 +117,7 @@ class NptuSiteSearchService:
         scorer: CandidateScorer | None = None,
         discovery: SiteDiscovery | None = None,
         clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
         cache: SiteSearchCache | None = None,
         single_flight: SingleFlightRunner | None = None,
     ) -> None:
@@ -119,6 +132,7 @@ class NptuSiteSearchService:
         )
         self._discovery = discovery
         self._clock = clock
+        self._sleep = sleep
         self._result_cache = cache or InMemorySiteSearchCache(clock=clock)
         self._single_flight = single_flight
         self._page_cache: dict[str, tuple[float, NptuSitePage]] = {}
@@ -169,6 +183,34 @@ class NptuSiteSearchService:
             self._page_cache[canonical_url] = (self._clock(), page)
         return page
 
+    def _cache_payload(
+        self,
+        search_plan: SearchPlan,
+        *,
+        limit: int,
+        use_discovery: bool,
+        scope: DocumentSearchScope | None,
+    ) -> dict[str, object]:
+        allowed_hosts = (
+            scope.allowed_hosts if scope is not None else self._config.allowed_hosts
+        )
+        seed_urls = scope.seed_urls if scope is not None else self._config.seed_urls
+        effective_discovery = use_discovery and scope is None
+        return {
+            "schema": SITE_SEARCH_SCORING_VERSION,
+            "query": search_plan.query,
+            "variants": list(search_plan.retrieval_queries[1:]),
+            "concepts": list(search_plan.concepts),
+            "limit": limit,
+            "canonical_unit": scope.canonical_unit if scope is not None else None,
+            "homepage_url": scope.homepage_url if scope is not None else None,
+            "allowed_hosts": list(allowed_hosts),
+            "preferred_hosts": list(scope.preferred_hosts if scope is not None else ()),
+            "seed_urls": list(seed_urls),
+            "discovery_enabled": effective_discovery,
+            "scoring_version": SITE_SEARCH_SCORING_VERSION,
+        }
+
     def _cache_key(
         self,
         search_plan: SearchPlan,
@@ -177,25 +219,14 @@ class NptuSiteSearchService:
         use_discovery: bool,
         scope: DocumentSearchScope | None,
     ) -> str:
-        allowed_hosts = (
-            scope.allowed_hosts if scope is not None else self._config.allowed_hosts
+        return site_search_cache_key(
+            self._cache_payload(
+                search_plan,
+                limit=limit,
+                use_discovery=use_discovery,
+                scope=scope,
+            )
         )
-        seed_urls = scope.seed_urls if scope is not None else self._config.seed_urls
-        effective_discovery = use_discovery and scope is None
-        payload = {
-            "schema": SITE_SEARCH_SCORING_VERSION,
-            "query": search_plan.query,
-            "variants": list(search_plan.retrieval_queries[1:]),
-            "concepts": list(search_plan.concepts),
-            "limit": limit,
-            "canonical_unit": scope.canonical_unit if scope is not None else None,
-            "allowed_hosts": list(allowed_hosts),
-            "preferred_hosts": list(scope.preferred_hosts if scope is not None else ()),
-            "seed_urls": list(seed_urls),
-            "discovery_enabled": effective_discovery,
-            "scoring_version": SITE_SEARCH_SCORING_VERSION,
-        }
-        return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
     def search(
         self,
@@ -222,31 +253,39 @@ class NptuSiteSearchService:
             use_discovery=use_discovery,
             scope=scope,
         )
-        cached_result = self._result_cache.get(cache_key)
-        if cached_result is not None:
-            return cached_result
+        cached_entry = self._result_cache.get(cache_key)
+        if cached_entry is not None:
+            return cached_entry.result
 
         lease: SingleFlightLease | None = None
         if self._single_flight is not None:
             lease = self._single_flight.acquire(cache_key)
             if lease is None:
+                backoff_index = 0
                 while not search_deadline.expired():
-                    cached_result = self._result_cache.get(cache_key)
-                    if cached_result is not None:
-                        return cached_result
+                    cached_entry = self._result_cache.get(cache_key)
+                    if cached_entry is not None:
+                        return cached_entry.result
                     lease = self._single_flight.acquire(cache_key)
                     if lease is not None:
                         break
-                    time.sleep(min(0.05, search_deadline.remaining_seconds()))
+                    delay = SITE_SEARCH_WAITER_BACKOFF_SECONDS[
+                        min(
+                            backoff_index,
+                            len(SITE_SEARCH_WAITER_BACKOFF_SECONDS) - 1,
+                        )
+                    ]
+                    self._sleep(min(delay, search_deadline.remaining_seconds()))
+                    backoff_index += 1
                 if lease is None:
                     return SiteSearchResult(
                         (),
                         SearchDiagnostics(query_timed_out=True),
                     )
             try:
-                cached_result = self._result_cache.get(cache_key)
-                if cached_result is not None:
-                    return cached_result
+                cached_entry = self._result_cache.get(cache_key)
+                if cached_entry is not None:
+                    return cached_entry.result
                 result = self._search_uncached(
                     search_plan,
                     limit=limit,
@@ -455,9 +494,6 @@ class NptuSiteSearchService:
 
         if queue and not query_timed_out:
             skipped_candidate_count += len(queued_scores)
-        set_execution_context = getattr(self._scorer, "set_execution_context", None)
-        if callable(set_execution_context):
-            set_execution_context(execution_context)
         try:
             search_deadline.raise_if_expired()
             scores = self._scorer.score_pages(
@@ -465,14 +501,12 @@ class NptuSiteSearchService:
                 candidates,
                 pages,
                 deadline=search_deadline,
+                execution_context=execution_context,
             )
             search_deadline.raise_if_expired()
         except SearchDeadlineExceeded:
             query_timed_out = True
             scores = preliminary_scores
-        finally:
-            if callable(set_execution_context):
-                set_execution_context(None)
         scored_pages = []
         for page, score in zip(pages, scores, strict=True):
             if scope is not None:

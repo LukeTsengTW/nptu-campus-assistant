@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 import logging
 import threading
@@ -24,14 +25,21 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
-SITE_SEARCH_CACHE_SCHEMA_VERSION = "p1-v1"
+SITE_SEARCH_CACHE_SCHEMA_VERSION = "p1.1-v1"
+
+
+@dataclass(frozen=True, slots=True)
+class SiteSearchCacheEntry:
+    result: SiteSearchResult
+    expires_at: datetime | None = None
+    remaining_ttl_seconds: float | None = None
 
 
 class SiteSearchCache(Protocol):
-    def get(self, cache_key: str) -> SiteSearchResult | None: ...
+    def get(self, cache_key: str) -> SiteSearchCacheEntry | None: ...
 
     def set(
-        self, cache_key: str, result: SiteSearchResult, ttl_seconds: int
+        self, cache_key: str, result: SiteSearchResult, ttl_seconds: float
     ) -> None: ...
 
 
@@ -189,17 +197,26 @@ class InMemorySiteSearchCache:
         self._items: dict[str, tuple[float, SiteSearchResult]] = {}
         self._lock = threading.Lock()
 
-    def get(self, cache_key: str) -> SiteSearchResult | None:
+    def get(self, cache_key: str) -> SiteSearchCacheEntry | None:
         with self._lock:
             item = self._items.get(cache_key)
             if item is None:
                 return None
-            if item[0] <= self._clock():
+            remaining = item[0] - self._clock()
+            if remaining <= 0:
                 self._items.pop(cache_key, None)
                 return None
-            return item[1]
+            return SiteSearchCacheEntry(
+                result=item[1],
+                remaining_ttl_seconds=remaining,
+            )
 
-    def set(self, cache_key: str, result: SiteSearchResult, ttl_seconds: int) -> None:
+    def set(
+        self,
+        cache_key: str,
+        result: SiteSearchResult,
+        ttl_seconds: float,
+    ) -> None:
         if ttl_seconds <= 0:
             return
         with self._lock:
@@ -210,25 +227,41 @@ class PostgresSiteSearchCache:
     def __init__(self, factory: sessionmaker[Session]) -> None:
         self._factory = factory
 
-    def get(self, cache_key: str) -> SiteSearchResult | None:
+    def get(self, cache_key: str) -> SiteSearchCacheEntry | None:
         try:
+            now = datetime.now(timezone.utc)
             with self._factory() as session:
                 record = session.scalar(
                     select(SiteSearchCacheRecord).where(
                         SiteSearchCacheRecord.cache_key == cache_key,
                         SiteSearchCacheRecord.schema_version
                         == SITE_SEARCH_CACHE_SCHEMA_VERSION,
-                        SiteSearchCacheRecord.expires_at > datetime.now(timezone.utc),
+                        SiteSearchCacheRecord.expires_at > now,
                     )
                 )
             if record is None:
                 return None
-            return deserialize_site_search_result(record.payload)
+            expires_at = record.expires_at
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            remaining = max(0.0, (expires_at - now).total_seconds())
+            if remaining <= 0:
+                return None
+            return SiteSearchCacheEntry(
+                result=deserialize_site_search_result(record.payload),
+                expires_at=expires_at,
+                remaining_ttl_seconds=remaining,
+            )
         except Exception:
             logger.exception("持久化網站搜尋快取讀取失敗")
             return None
 
-    def set(self, cache_key: str, result: SiteSearchResult, ttl_seconds: int) -> None:
+    def set(
+        self,
+        cache_key: str,
+        result: SiteSearchResult,
+        ttl_seconds: float,
+    ) -> None:
         if ttl_seconds <= 0:
             return
         try:
@@ -288,16 +321,26 @@ class LayeredSiteSearchCache:
         self._l2 = l2
         self._ttl_seconds = ttl_seconds
 
-    def get(self, cache_key: str) -> SiteSearchResult | None:
-        result = self._l1.get(cache_key)
-        if result is not None:
-            return result
-        result = self._l2.get(cache_key)
-        if result is not None:
-            self._l1.set(cache_key, result, self._ttl_seconds)
-        return result
+    def get(self, cache_key: str) -> SiteSearchCacheEntry | None:
+        entry = self._l1.get(cache_key)
+        if entry is not None:
+            return entry
+        entry = self._l2.get(cache_key)
+        if entry is not None:
+            remaining = entry.remaining_ttl_seconds
+            if remaining is not None:
+                remaining = min(float(self._ttl_seconds), remaining)
+            else:
+                remaining = float(self._ttl_seconds)
+            self._l1.set(cache_key, entry.result, remaining)
+        return entry
 
-    def set(self, cache_key: str, result: SiteSearchResult, ttl_seconds: int) -> None:
+    def set(
+        self,
+        cache_key: str,
+        result: SiteSearchResult,
+        ttl_seconds: float,
+    ) -> None:
         self._l1.set(cache_key, result, ttl_seconds)
         self._l2.set(cache_key, result, ttl_seconds)
 
@@ -333,14 +376,30 @@ class _PostgresLease:
     def __init__(self, session: Session, key: int) -> None:
         self._session = session
         self._key = key
+        self._release_guard = threading.Lock()
+        self._released = False
 
     def release(self) -> None:
+        with self._release_guard:
+            if self._released:
+                return
+            self._released = True
         try:
             self._session.scalar(select(func.pg_advisory_unlock(self._key)))
         except Exception:
             logger.exception("PostgreSQL single-flight lock 釋放失敗")
         finally:
-            self._session.close()
+            _close_session(self._session)
+
+
+def _close_session(session: object) -> None:
+    close = getattr(session, "close", None)
+    if not callable(close):
+        return
+    try:
+        close()
+    except Exception:
+        logger.exception("PostgreSQL single-flight session 關閉失敗")
 
 
 class SingleFlightCoordinator:
@@ -351,22 +410,24 @@ class SingleFlightCoordinator:
 
     def try_acquire(self, cache_key: str) -> SingleFlightLease | None:
         session = self._factory()
-        get_bind = getattr(session, "get_bind", None)
-        if get_bind is not None and get_bind().dialect.name == "postgresql":
-            key = _lock_key(cache_key)
-            acquired = bool(session.scalar(select(func.pg_try_advisory_lock(key))))
-            if acquired:
-                return _PostgresLease(session, key)
-            session.close()
+        transferred = False
+        try:
+            get_bind = getattr(session, "get_bind", None)
+            if get_bind is not None and get_bind().dialect.name == "postgresql":
+                key = _lock_key(cache_key)
+                acquired = bool(session.scalar(select(func.pg_try_advisory_lock(key))))
+                if acquired:
+                    transferred = True
+                    return _PostgresLease(session, key)
+                return None
+            with self._local_guard:
+                lock = self._local_locks.setdefault(cache_key, threading.Lock())
+            if lock.acquire(blocking=False):
+                return _LocalLease(lock)
             return None
-        close = getattr(session, "close", None)
-        if callable(close):
-            close()
-        with self._local_guard:
-            lock = self._local_locks.setdefault(cache_key, threading.Lock())
-        if lock.acquire(blocking=False):
-            return _LocalLease(lock)
-        return None
+        finally:
+            if not transferred:
+                _close_session(session)
 
 
 class SingleFlightSearchRunner:
