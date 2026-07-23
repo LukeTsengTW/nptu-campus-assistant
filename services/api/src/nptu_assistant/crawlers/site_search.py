@@ -26,7 +26,7 @@ from nptu_assistant.crawlers.adapters.nptu_search import AnnouncementSearchResul
 from nptu_assistant.crawlers.config import SiteSearchConfig
 from nptu_assistant.crawlers.official_units import DocumentSearchScope
 from nptu_assistant.crawlers.site_discovery import SiteDiscovery
-from nptu_assistant.crawlers.site_map import SiteMapService
+from nptu_assistant.crawlers.site_map import SiteMapDiscoveryPolicy, SiteMapService
 from nptu_assistant.crawlers.site_models import (
     CandidatePage,
     SearchDeadline,
@@ -403,9 +403,12 @@ class NptuSiteSearchService:
                     scope=scope,
                     allowed_hosts=allowed_hosts,
                     limit=self._config.max_candidate_urls,
+                    deadline=search_deadline,
                 )
                 site_map_sufficient = self._site_map.has_sufficient_candidates(
+                    search_plan,
                     site_map_candidates,
+                    scope=scope,
                     minimum=min(self._config.early_stop_min_results, limit),
                 )
                 logger.info(
@@ -416,7 +419,22 @@ class NptuSiteSearchService:
                             (self._clock() - map_started) * 1000,
                             2,
                         ),
+                        "site_map_lexical_strong_count": sum(
+                            candidate.lexical_relevance
+                            >= SiteMapDiscoveryPolicy.lexical_threshold
+                            for candidate in site_map_candidates
+                        ),
+                        "site_map_discovery_skip_reason": (
+                            "relevant_candidates"
+                            if site_map_sufficient
+                            else "insufficient_relevance"
+                        ),
                     },
+                )
+            except SearchDeadlineExceeded:
+                logger.warning(
+                    "site map candidate lookup timed out; continue live discovery",
+                    extra={"site_map_statement_timed_out": True},
                 )
             except Exception:
                 logger.exception("site map candidate lookup 失敗")

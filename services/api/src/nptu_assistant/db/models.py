@@ -247,6 +247,12 @@ class SiteLink(TimestampMixin, Base):
         ),
         Index("ix_site_links_source_page_id", "source_page_id"),
         Index("ix_site_links_target_page_id", "target_page_id"),
+        Index(
+            "ix_site_links_anchor_text_trgm",
+            "anchor_text",
+            postgresql_using="gin",
+            postgresql_ops={"anchor_text": "gin_trgm_ops"},
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(

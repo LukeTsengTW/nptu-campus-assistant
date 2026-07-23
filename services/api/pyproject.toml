@@ -40,7 +40,7 @@ build-backend = "hatchling.build"
 packages = ["src/nptu_assistant"]
 
 [tool.pytest.ini_options]
-addopts = "-q --strict-markers"
+addopts = "-q --strict-markers --import-mode=importlib"
 testpaths = ["tests", "../../tests/integration"]
 
 [tool.coverage.run]

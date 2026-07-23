@@ -1,11 +1,28 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Collection, Mapping
+from collections.abc import Callable, Collection, Mapping, Sequence
 from datetime import datetime, timezone
+import math
+import uuid
 from typing import Any
 from urllib.parse import urlsplit
 
-from sqlalchemy import and_, case, false, func, literal, or_, select
+from sqlalchemy import (
+    and_,
+    case,
+    column,
+    false,
+    Float,
+    func,
+    literal,
+    literal_column,
+    or_,
+    select,
+    String,
+    text,
+    update,
+    values,
+)
 from sqlalchemy.dialects.postgresql import insert as postgres_insert
 from sqlalchemy.orm import Session, selectinload, sessionmaker
 
@@ -17,6 +34,8 @@ from nptu_assistant.crawlers.site_map import (
     SiteCrawlStatus,
     SiteDiscoverySource,
     SiteLinkType,
+    SiteLinkUpsert,
+    SiteMapBatchWriteResult,
     SiteMapCandidate,
     SiteMapRepository,
     SiteMapSyncSummary,
@@ -25,7 +44,11 @@ from nptu_assistant.crawlers.site_map import (
     SitePageUpsert,
     source_priority,
 )
-from nptu_assistant.crawlers.site_models import SearchPlan
+from nptu_assistant.crawlers.site_models import (
+    SearchDeadline,
+    SearchDeadlineExceeded,
+    SearchPlan,
+)
 from nptu_assistant.db.models import Announcement, Document, SiteLink, SitePage, Source
 
 
@@ -81,13 +104,8 @@ class SqlSiteMapRepository(SiteMapRepository):
     def upsert_page(self, page: SitePageUpsert) -> SiteMapWriteResult:
         now = self._clock()
         with self._factory.begin() as session:
-            existing = session.scalar(
-                select(SitePage.id).where(SitePage.canonical_url == page.canonical_url)
-            )
-            self._upsert_page_in_session(session, page, now=now)
-            return SiteMapWriteResult(
-                created=existing is None, updated=existing is not None
-            )
+            outcome = self._upsert_pages_in_session(session, (page,), now=now)[0]
+            return SiteMapWriteResult(created=outcome[1], updated=outcome[2])
 
     def upsert_link(
         self,
@@ -99,77 +117,89 @@ class SqlSiteMapRepository(SiteMapRepository):
     ) -> SiteMapWriteResult:
         now = self._clock()
         with self._factory.begin() as session:
-            self._upsert_page_in_session(session, source, now=now)
-            self._upsert_page_in_session(session, target, now=now)
+            self._upsert_pages_in_session(session, (source, target), now=now)
+            page_ids = self._page_ids_in_session(
+                session, (source.canonical_url, target.canonical_url)
+            )
+            link_outcomes = self._upsert_links_in_session(
+                session,
+                (
+                    (
+                        page_ids[source.canonical_url],
+                        page_ids[target.canonical_url],
+                        anchor_text,
+                        link_type,
+                    ),
+                ),
+                now=now,
+            )
+            created = bool(link_outcomes and link_outcomes[0])
+            return SiteMapWriteResult(created=created, updated=not created)
+
+    def persist_fetched_page(
+        self,
+        source: SitePageUpsert,
+        *,
+        title: str | None,
+        content_hash: str,
+        http_status: int | None,
+        etag: str | None = None,
+        last_modified: str | None = None,
+        links: Sequence[SiteLinkUpsert] = (),
+    ) -> SiteMapBatchWriteResult:
+        """在單一 transaction 批次寫入 source、targets、edges、crawl state。"""
+        now = self._clock()
+        targets: dict[str, SitePageUpsert] = {}
+        for link in links:
+            if link.target.canonical_url != source.canonical_url:
+                targets.setdefault(link.target.canonical_url, link.target)
+        with self._factory.begin() as session:
+            source_outcome = self._upsert_pages_in_session(session, (source,), now=now)[
+                0
+            ]
             source_page = session.scalar(
                 select(SitePage).where(SitePage.canonical_url == source.canonical_url)
             )
-            target_page = session.scalar(
-                select(SitePage).where(SitePage.canonical_url == target.canonical_url)
+            if source_page is None:
+                raise RuntimeError("site map fetched source page 建立失敗")
+            self._apply_crawl_success(
+                source_page,
+                title=title,
+                content_hash=content_hash,
+                http_status=http_status,
+                etag=etag,
+                last_modified=last_modified,
+                now=now,
             )
-            if source_page is None or target_page is None:
-                raise RuntimeError("site map link 的 source/target page 建立失敗")
-            existing = session.scalar(
-                select(SiteLink.id).where(
-                    SiteLink.source_page_id == source_page.id,
-                    SiteLink.target_page_id == target_page.id,
-                )
+            target_pages = tuple(targets.values())
+            target_outcomes = self._upsert_pages_in_session(
+                session, target_pages, now=now
             )
-            if session.bind is not None and session.bind.dialect.name == "postgresql":
-                statement = postgres_insert(SiteLink).values(
-                    id=SiteLink.id.default.arg(),  # type: ignore[union-attr]
-                    source_page_id=source_page.id,
-                    target_page_id=target_page.id,
-                    anchor_text=anchor_text,
-                    link_type=link_type.value,
-                    first_discovered_at=now,
-                    last_discovered_at=now,
+            page_ids = self._page_ids_in_session(
+                session,
+                (source.canonical_url, *targets),
+            )
+            edge_values = tuple(
+                (
+                    page_ids[source.canonical_url],
+                    page_ids[link.target.canonical_url],
+                    link.anchor_text,
+                    link.link_type,
                 )
-                excluded = statement.excluded
-                statement = statement.on_conflict_do_update(
-                    constraint="uq_site_links_source_target",
-                    set_={
-                        "anchor_text": case(
-                            (excluded.anchor_text != "", excluded.anchor_text),
-                            else_=SiteLink.anchor_text,
-                        ),
-                        "link_type": case(
-                            (
-                                SiteLink.link_type == SiteLinkType.UNKNOWN.value,
-                                excluded.link_type,
-                            ),
-                            else_=SiteLink.link_type,
-                        ),
-                        "last_discovered_at": func.greatest(
-                            SiteLink.last_discovered_at,
-                            excluded.last_discovered_at,
-                        ),
-                        "updated_at": func.now(),
-                    },
-                )
-                session.execute(statement)
-            else:
-                if existing is None:
-                    session.add(
-                        SiteLink(
-                            source_page_id=source_page.id,
-                            target_page_id=target_page.id,
-                            anchor_text=anchor_text,
-                            link_type=link_type.value,
-                            first_discovered_at=now,
-                            last_discovered_at=now,
-                        )
-                    )
-                else:
-                    link = session.get(SiteLink, existing)
-                    if link is not None:
-                        if anchor_text:
-                            link.anchor_text = anchor_text
-                        if link.link_type == SiteLinkType.UNKNOWN.value:
-                            link.link_type = link_type.value
-                        link.last_discovered_at = now
-            return SiteMapWriteResult(
-                created=existing is None, updated=existing is not None
+                for link in links
+                if link.target.canonical_url in page_ids
+            )
+            edge_outcomes = self._upsert_links_in_session(session, edge_values, now=now)
+            return SiteMapBatchWriteResult(
+                source_created=source_outcome[1],
+                source_updated=source_outcome[2],
+                target_created=sum(1 for item in target_outcomes if item[1]),
+                target_updated=sum(1 for item in target_outcomes if item[2]),
+                links_created=sum(1 for item in edge_outcomes if item),
+                links_updated=sum(1 for item in edge_outcomes if not item),
+                statement_count=3
+                + int(bool(target_pages))
+                + 2 * int(bool(edge_values)),
             )
 
     def record_crawl_success(
@@ -184,39 +214,26 @@ class SqlSiteMapRepository(SiteMapRepository):
     ) -> SiteMapWriteResult:
         now = self._clock()
         with self._factory.begin() as session:
+            outcome = self._upsert_pages_in_session(
+                session,
+                (SitePageUpsert(canonical_url=canonical_url),),
+                now=now,
+            )[0]
             page = session.scalar(
                 select(SitePage).where(SitePage.canonical_url == canonical_url)
             )
-            created = page is None
-            if page is None:
-                self._upsert_page_in_session(
-                    session,
-                    SitePageUpsert(canonical_url=canonical_url),
-                    now=now,
-                )
-                page = session.scalar(
-                    select(SitePage).where(SitePage.canonical_url == canonical_url)
-                )
             if page is None:
                 raise RuntimeError("site map crawl success page 建立失敗")
-            changed = page.content_hash != content_hash
-            page.crawl_status = (
-                SiteCrawlStatus.SUCCESS.value
-                if changed
-                else SiteCrawlStatus.UNCHANGED.value
+            self._apply_crawl_success(
+                page,
+                title=title,
+                content_hash=content_hash,
+                http_status=http_status,
+                etag=etag,
+                last_modified=last_modified,
+                now=now,
             )
-            page.http_status = http_status
-            page.etag = etag
-            page.last_modified = last_modified
-            page.last_crawled_at = now
-            page.last_successful_crawl_at = now
-            page.failure_count = 0
-            if changed:
-                page.last_changed_at = now
-            page.content_hash = content_hash
-            if title and title.strip():
-                page.title = title.strip()
-            return SiteMapWriteResult(created=created, updated=not created)
+            return SiteMapWriteResult(created=outcome[1], updated=outcome[2])
 
     def record_crawl_failure(
         self,
@@ -227,26 +244,21 @@ class SqlSiteMapRepository(SiteMapRepository):
     ) -> SiteMapWriteResult:
         now = self._clock()
         with self._factory.begin() as session:
+            outcome = self._upsert_pages_in_session(
+                session,
+                (SitePageUpsert(canonical_url=canonical_url),),
+                now=now,
+            )[0]
             page = session.scalar(
                 select(SitePage).where(SitePage.canonical_url == canonical_url)
             )
-            created = page is None
-            if page is None:
-                self._upsert_page_in_session(
-                    session,
-                    SitePageUpsert(canonical_url=canonical_url),
-                    now=now,
-                )
-                page = session.scalar(
-                    select(SitePage).where(SitePage.canonical_url == canonical_url)
-                )
             if page is None:
                 raise RuntimeError("site map crawl failure page 建立失敗")
             page.crawl_status = status.value
             page.http_status = http_status
             page.last_crawled_at = now
             page.failure_count += 1
-            return SiteMapWriteResult(created=created, updated=not created)
+            return SiteMapWriteResult(created=outcome[1], updated=outcome[2])
 
     def find_candidates(
         self,
@@ -255,15 +267,12 @@ class SqlSiteMapRepository(SiteMapRepository):
         scope: DocumentSearchScope | None,
         allowed_hosts: Collection[str],
         limit: int,
+        deadline: SearchDeadline | None = None,
     ) -> tuple[SiteMapCandidate, ...]:
         if limit <= 0 or not allowed_hosts:
             return ()
-        query_text = plan.query[:500]
-        pattern = f"%{query_text}%"
-        text_match = or_(
-            SitePage.title.ilike(pattern),
-            SitePage.path.ilike(pattern),
-        )
+        if deadline is not None:
+            deadline.raise_if_expired()
         unit_match = (
             SitePage.unit == scope.canonical_unit
             if scope is not None and scope.canonical_unit
@@ -274,11 +283,14 @@ class SqlSiteMapRepository(SiteMapRepository):
             if scope is not None and scope.preferred_hosts
             else literal(False)
         )
-        intent = " ".join((plan.query, *plan.concepts)).casefold()
+        intent = " ".join(
+            (plan.query, *plan.retrieval_queries[1:3], *plan.concepts)
+        ).casefold()
         announcement_intent = any(token in intent for token in ("公告", "通知", "訊息"))
         document_intent = any(
-            token in intent for token in ("文件", "辦法", "表單", "規章")
+            token in intent for token in ("文件", "辦法", "表單", "規章", "申請表")
         )
+        homepage_intent = any(token in intent for token in ("首頁", "主頁", "home"))
         page_type_score = case(
             (
                 and_(
@@ -301,40 +313,109 @@ class SqlSiteMapRepository(SiteMapRepository):
                 ),
                 0.34,
             ),
-            (SitePage.page_type == SitePageType.UNIT_HOMEPAGE.value, 0.24),
+            (
+                and_(
+                    literal(homepage_intent),
+                    SitePage.page_type == SitePageType.UNIT_HOMEPAGE.value,
+                ),
+                0.25,
+            ),
             else_=0.0,
         )
-        relevance = (
-            case((unit_match, 0.42), else_=0.0)
-            + case((preferred_match, 0.18), else_=0.0)
-            + case((text_match, 0.34), else_=0.06)
-            + page_type_score
-            + (func.least(SitePage.crawl_priority, 100) / 1_000.0)
-            - (func.least(SitePage.failure_count, 5) * 0.04)
-        )
-        query = (
-            select(SitePage, relevance.label("relevance"))
-            .where(
-                SitePage.is_active.is_(True),
-                SitePage.is_indexable.is_(True),
-                SitePage.crawl_status.not_in(
-                    [SiteCrawlStatus.BLOCKED.value, SiteCrawlStatus.EXCLUDED.value]
+        query_terms = self._query_terms(plan)
+        with self._factory.begin() as session:
+            if deadline is not None:
+                timeout_ms = max(1, math.ceil(deadline.remaining_seconds() * 1000))
+                session.execute(
+                    text("SELECT set_config('statement_timeout', :timeout, true)"),
+                    {"timeout": f"{timeout_ms}ms"},
+                )
+                deadline.raise_if_expired()
+            if session.bind is not None and session.bind.dialect.name == "postgresql":
+                lexical_relevance, anchor_relevance, lexical_match = (
+                    self._postgres_lexical_expressions(query_terms)
+                )
+            else:
+                lexical_relevance, anchor_relevance, lexical_match = (
+                    self._fallback_lexical_expressions(query_terms)
+                )
+            structural_score = func.greatest(
+                literal(0.0),
+                func.least(
+                    literal(1.0),
+                    case((unit_match, 0.35), else_=0.0)
+                    + case((preferred_match, 0.25), else_=0.0)
+                    + case(
+                        (
+                            and_(
+                                literal(scope is not None and bool(scope.homepage_url)),
+                                SitePage.canonical_url
+                                == (scope.homepage_url if scope else ""),
+                            ),
+                            0.25,
+                        ),
+                        else_=0.0,
+                    )
+                    + page_type_score
+                    + func.least(SitePage.crawl_priority, 100) / 1_000.0
+                    + case(
+                        (SitePage.last_successful_crawl_at.is_not(None), 0.05),
+                        else_=0.0,
+                    )
+                    - func.least(SitePage.failure_count, 5) * 0.04,
                 ),
-                _host_scope(allowed_hosts),
             )
-            .order_by(
-                unit_match.desc(),
-                preferred_match.desc(),
-                relevance.desc(),
-                SitePage.crawl_priority.desc(),
-                SitePage.minimum_depth.asc(),
-                SitePage.failure_count.asc(),
-                SitePage.last_successful_crawl_at.desc().nulls_last(),
+            final_score = lexical_relevance * 0.75 + structural_score * 0.25
+            query = (
+                select(
+                    SitePage,
+                    lexical_relevance.label("lexical_relevance"),
+                    structural_score.label("structural_score"),
+                    final_score.label("final_score"),
+                    anchor_relevance.label("anchor_relevance"),
+                )
+                .where(
+                    SitePage.is_active.is_(True),
+                    SitePage.is_indexable.is_(True),
+                    SitePage.crawl_status.not_in(
+                        [
+                            SiteCrawlStatus.BLOCKED.value,
+                            SiteCrawlStatus.EXCLUDED.value,
+                        ]
+                    ),
+                    _host_scope(allowed_hosts),
+                    or_(
+                        lexical_match,
+                        SitePage.page_type.in_(
+                            [
+                                SitePageType.UNIT_HOMEPAGE.value,
+                                SitePageType.ANNOUNCEMENT_LISTING.value,
+                            ]
+                        ),
+                    ),
+                )
+                .order_by(
+                    final_score.desc(),
+                    lexical_relevance.desc(),
+                    structural_score.desc(),
+                    SitePage.minimum_depth.asc(),
+                    SitePage.failure_count.asc(),
+                    SitePage.last_successful_crawl_at.desc().nulls_last(),
+                )
+                .limit(limit)
             )
-            .limit(limit)
-        )
-        with self._factory() as session:
-            rows = session.execute(query).all()
+            try:
+                rows = session.execute(query).all()
+            except Exception as exc:
+                if deadline is not None and (
+                    deadline.expired() or "statement timeout" in str(exc).casefold()
+                ):
+                    raise SearchDeadlineExceeded(
+                        "site map candidate SQL 已逾時"
+                    ) from exc
+                raise
+            if deadline is not None:
+                deadline.raise_if_expired()
         return tuple(
             SiteMapCandidate(
                 canonical_url=row[0].canonical_url,
@@ -345,10 +426,123 @@ class SqlSiteMapRepository(SiteMapRepository):
                 crawl_priority=row[0].crawl_priority,
                 minimum_depth=row[0].minimum_depth,
                 failure_count=row[0].failure_count,
-                relevance=float(row[1]),
+                lexical_relevance=float(row[1] or 0.0),
+                structural_score=float(row[2] or 0.0),
+                final_score=float(row[3] or 0.0),
             )
             for row in rows
         )
+
+    @staticmethod
+    def _query_terms(plan: SearchPlan) -> tuple[tuple[str, float], ...]:
+        terms: list[tuple[str, float]] = []
+        seen: set[str] = set()
+        weighted_values = [
+            (plan.query, 1.0),
+            *((item, 0.85) for item in plan.retrieval_queries[1:3]),
+            *((item, 0.70) for item in plan.concepts),
+        ]
+        for value, weight in weighted_values:
+            normalized = " ".join(value.split()).casefold()
+            if normalized and normalized not in seen:
+                terms.append((value[:200], weight))
+                seen.add(normalized)
+        return tuple(terms)
+
+    @staticmethod
+    def _postgres_lexical_expressions(
+        query_terms: Sequence[tuple[str, float]],
+    ) -> tuple[Any, Any, Any]:
+        term_values = (
+            values(
+                column("query_text", String),
+                column("query_weight", Float),
+                name="site_map_query_terms",
+            )
+            .data(query_terms)
+            .alias("site_map_query_terms")
+        )
+        qtext = term_values.c.query_text
+        qweight = term_values.c.query_weight
+        title_similarity = (
+            select(
+                func.max(
+                    func.similarity(func.coalesce(SitePage.title, ""), qtext) * qweight
+                )
+            )
+            .select_from(term_values)
+            .scalar_subquery()
+        )
+        path_similarity = (
+            select(
+                func.max(
+                    func.similarity(func.coalesce(SitePage.path, ""), qtext) * qweight
+                )
+            )
+            .select_from(term_values)
+            .scalar_subquery()
+        )
+        anchor_similarity = (
+            select(
+                func.max(
+                    func.similarity(func.coalesce(SiteLink.anchor_text, ""), qtext)
+                    * qweight
+                )
+            )
+            .select_from(SiteLink, term_values)
+            .where(SiteLink.target_page_id == SitePage.id)
+            .correlate(SitePage)
+            .scalar_subquery()
+        )
+        contains_terms = tuple(term for term, _weight in query_terms)
+        title_contains = or_(
+            *(SitePage.title.ilike(f"%{term}%") for term in contains_terms)
+        )
+        path_contains = or_(
+            *(SitePage.path.ilike(f"%{term}%") for term in contains_terms)
+        )
+        anchor_match = (
+            select(SiteLink.id)
+            .where(
+                SiteLink.target_page_id == SitePage.id,
+                or_(*(SiteLink.anchor_text.op("%")(term) for term in contains_terms)),
+            )
+            .exists()
+        )
+        lexical = func.least(
+            literal(1.0),
+            func.greatest(
+                func.coalesce(title_similarity, 0.0),
+                func.coalesce(path_similarity, 0.0),
+                func.coalesce(anchor_similarity, 0.0),
+            )
+            * 0.65
+            + case((title_contains, 0.28), else_=0.0)
+            + case((path_contains, 0.12), else_=0.0),
+        )
+        return (
+            lexical,
+            func.coalesce(anchor_similarity, 0.0),
+            or_(
+                title_contains,
+                path_contains,
+                anchor_match,
+            ),
+        )
+
+    @staticmethod
+    def _fallback_lexical_expressions(
+        query_terms: Sequence[tuple[str, float]],
+    ) -> tuple[Any, Any, Any]:
+        terms = tuple(term for term, _weight in query_terms)
+        title_contains = or_(*(SitePage.title.ilike(f"%{term}%") for term in terms))
+        path_contains = or_(*(SitePage.path.ilike(f"%{term}%") for term in terms))
+        lexical = case(
+            (title_contains, 0.70),
+            (path_contains, 0.45),
+            else_=0.0,
+        )
+        return lexical, literal(0.0), or_(title_contains, path_contains)
 
     def import_existing_urls(self) -> Mapping[str, SiteMapSyncSummary]:
         with self._factory() as session:
@@ -364,7 +558,9 @@ class SqlSiteMapRepository(SiteMapRepository):
             documents = [
                 (item.canonical_url, item.title, item.source.unit, item.content_hash)
                 for item in session.scalars(
-                    select(Document).options(selectinload(Document.source))
+                    select(Document)
+                    .where(Document.is_current.is_(True))
+                    .options(selectinload(Document.source))
                 ).all()
                 if item.source is not None
             ]
@@ -379,6 +575,21 @@ class SqlSiteMapRepository(SiteMapRepository):
                     select(Announcement).options(selectinload(Announcement.source))
                 ).all()
             ]
+
+        current_document_urls = {item[0] for item in documents}
+        with self._factory.begin() as session:
+            stale_conditions = [
+                SitePage.discovery_source == SiteDiscoverySource.EXISTING_DOCUMENT.value
+            ]
+            if current_document_urls:
+                stale_conditions.append(
+                    SitePage.canonical_url.not_in(current_document_urls)
+                )
+            session.execute(
+                update(SitePage)
+                .where(*stale_conditions)
+                .values(is_active=False, is_indexable=False, updated_at=func.now())
+            )
 
         result: dict[str, SiteMapSyncSummary] = {}
         for base_url, canonical_urls, unit, source_type in sources:
@@ -465,32 +676,21 @@ class SqlSiteMapRepository(SiteMapRepository):
     ) -> None:
         summary.add(result)
 
-    def _upsert_page_in_session(
+    def _upsert_pages_in_session(
         self,
         session: Session,
-        page: SitePageUpsert,
+        pages: Sequence[SitePageUpsert],
         *,
         now: datetime,
-    ) -> None:
-        parsed = urlsplit(page.canonical_url)
-        values = {
-            "canonical_url": page.canonical_url,
-            "host": (parsed.hostname or "").lower(),
-            "path": parsed.path or "/",
-            "title": page.title,
-            "unit": page.unit,
-            "content_hash": page.content_hash,
-            "page_type": page.page_type.value,
-            "discovery_source": page.discovery_source.value,
-            "crawl_status": SiteCrawlStatus.DISCOVERED.value,
-            "last_discovered_at": now,
-            "crawl_priority": page.crawl_priority,
-            "minimum_depth": page.minimum_depth,
-            "is_indexable": page.is_indexable,
-            "is_active": True,
-        }
+    ) -> list[tuple[SitePageUpsert, bool, bool]]:
+        unique_pages = tuple({page.canonical_url: page for page in pages}.values())
+        if not unique_pages:
+            return []
         if session.bind is not None and session.bind.dialect.name == "postgresql":
-            statement = postgres_insert(SitePage).values(values)
+            values_to_insert = [
+                self._page_values(page, now=now) for page in unique_pages
+            ]
+            statement = postgres_insert(SitePage).values(values_to_insert)
             excluded = statement.excluded
             existing_source_rank = _source_rank_expression(SitePage.discovery_source)
             incoming_source_rank = _source_rank_expression(excluded.discovery_source)
@@ -551,28 +751,78 @@ class SqlSiteMapRepository(SiteMapRepository):
                         SitePage.minimum_depth,
                         excluded.minimum_depth,
                     ),
+                    "is_active": case(
+                        (
+                            incoming_source_rank >= existing_source_rank,
+                            excluded.is_active,
+                        ),
+                        else_=SitePage.is_active,
+                    ),
                     "is_indexable": case(
-                        (SitePage.is_indexable.is_(False), False),
+                        (
+                            incoming_source_rank >= existing_source_rank,
+                            excluded.is_indexable,
+                        ),
+                        (SitePage.is_indexable.is_(False), false()),
                         else_=excluded.is_indexable,
                     ),
                     "updated_at": func.now(),
                 },
+            ).returning(
+                SitePage.canonical_url,
+                literal_column("xmax = 0").label("inserted"),
             )
-            session.execute(statement)
-            return
+            rows = session.execute(statement).all()
+            inserted = {row[0]: bool(row[1]) for row in rows}
+            return [
+                (
+                    page,
+                    inserted.get(page.canonical_url, False),
+                    not inserted.get(page.canonical_url, False),
+                )
+                for page in unique_pages
+            ]
 
-        existing = session.scalar(
-            select(SitePage).where(SitePage.canonical_url == page.canonical_url)
-        )
-        if existing is None:
-            session.add(SitePage(**values))
-            return
+        outcomes: list[tuple[SitePageUpsert, bool, bool]] = []
+        for page in unique_pages:
+            existing = session.scalar(
+                select(SitePage).where(SitePage.canonical_url == page.canonical_url)
+            )
+            if existing is None:
+                session.add(SitePage(**self._page_values(page, now=now)))
+                outcomes.append((page, True, False))
+            else:
+                self._merge_page(existing, page, now=now)
+                outcomes.append((page, False, True))
+        session.flush()
+        return outcomes
+
+    @staticmethod
+    def _page_values(page: SitePageUpsert, *, now: datetime) -> dict[str, Any]:
+        parsed = urlsplit(page.canonical_url)
+        return {
+            "id": uuid.uuid4(),
+            "canonical_url": page.canonical_url,
+            "host": (parsed.hostname or "").lower(),
+            "path": parsed.path or "/",
+            "title": page.title,
+            "unit": page.unit,
+            "content_hash": page.content_hash,
+            "page_type": page.page_type.value,
+            "discovery_source": page.discovery_source.value,
+            "crawl_status": SiteCrawlStatus.DISCOVERED.value,
+            "last_discovered_at": now,
+            "crawl_priority": page.crawl_priority,
+            "minimum_depth": page.minimum_depth,
+            "is_indexable": page.is_indexable,
+            "is_active": True,
+        }
+
+    @staticmethod
+    def _merge_page(existing: SitePage, page: SitePageUpsert, *, now: datetime) -> None:
         if not existing.title or (
             existing.crawl_status
-            not in {
-                SiteCrawlStatus.SUCCESS.value,
-                SiteCrawlStatus.UNCHANGED.value,
-            }
+            not in {SiteCrawlStatus.SUCCESS.value, SiteCrawlStatus.UNCHANGED.value}
             and source_priority(page.discovery_source)
             >= source_priority(_source(existing.discovery_source))
         ):
@@ -597,7 +847,148 @@ class SqlSiteMapRepository(SiteMapRepository):
         existing.last_discovered_at = max(existing.last_discovered_at, now)
         existing.crawl_priority = max(existing.crawl_priority, page.crawl_priority)
         existing.minimum_depth = min(existing.minimum_depth, page.minimum_depth)
-        existing.is_indexable = existing.is_indexable and page.is_indexable
+        incoming_is_trusted = source_priority(page.discovery_source) >= source_priority(
+            _source(existing.discovery_source)
+        )
+        if incoming_is_trusted:
+            existing.is_active = True
+            existing.is_indexable = page.is_indexable
+        else:
+            existing.is_indexable = existing.is_indexable and page.is_indexable
+
+    @staticmethod
+    def _page_ids_in_session(
+        session: Session,
+        urls: Sequence[str],
+    ) -> dict[str, uuid.UUID]:
+        unique_urls = tuple(dict.fromkeys(urls))
+        if not unique_urls:
+            return {}
+        rows = session.execute(
+            select(SitePage.canonical_url, SitePage.id).where(
+                SitePage.canonical_url.in_(unique_urls)
+            )
+        ).all()
+        return {row[0]: row[1] for row in rows}
+
+    def _upsert_links_in_session(
+        self,
+        session: Session,
+        links: Sequence[tuple[uuid.UUID, uuid.UUID, str, SiteLinkType]],
+        *,
+        now: datetime,
+    ) -> tuple[bool, ...]:
+        unique: dict[
+            tuple[uuid.UUID, uuid.UUID], tuple[uuid.UUID, uuid.UUID, str, SiteLinkType]
+        ] = {}
+        for link in links:
+            key = (link[0], link[1])
+            previous = unique.get(key)
+            if previous is None or (not previous[2] and link[2]):
+                unique[key] = link
+        if not unique:
+            return ()
+        entries = tuple(unique.values())
+        if session.bind is not None and session.bind.dialect.name == "postgresql":
+            statement = postgres_insert(SiteLink).values(
+                [
+                    {
+                        "id": uuid.uuid4(),
+                        "source_page_id": source_id,
+                        "target_page_id": target_id,
+                        "anchor_text": anchor,
+                        "link_type": link_type.value,
+                        "first_discovered_at": now,
+                        "last_discovered_at": now,
+                    }
+                    for source_id, target_id, anchor, link_type in entries
+                ]
+            )
+            excluded = statement.excluded
+            statement = statement.on_conflict_do_update(
+                constraint="uq_site_links_source_target",
+                set_={
+                    "anchor_text": case(
+                        (excluded.anchor_text != "", excluded.anchor_text),
+                        else_=SiteLink.anchor_text,
+                    ),
+                    "link_type": case(
+                        (
+                            SiteLink.link_type == SiteLinkType.UNKNOWN.value,
+                            excluded.link_type,
+                        ),
+                        else_=SiteLink.link_type,
+                    ),
+                    "last_discovered_at": func.greatest(
+                        SiteLink.last_discovered_at,
+                        excluded.last_discovered_at,
+                    ),
+                    "updated_at": func.now(),
+                },
+            ).returning(literal_column("xmax = 0").label("inserted"))
+            return tuple(bool(row[0]) for row in session.execute(statement).all())
+
+        outcomes: list[bool] = []
+        for source_id, target_id, anchor, link_type in entries:
+            existing = session.scalar(
+                select(SiteLink).where(
+                    SiteLink.source_page_id == source_id,
+                    SiteLink.target_page_id == target_id,
+                )
+            )
+            if existing is None:
+                session.add(
+                    SiteLink(
+                        id=uuid.uuid4(),
+                        source_page_id=source_id,
+                        target_page_id=target_id,
+                        anchor_text=anchor,
+                        link_type=link_type.value,
+                        first_discovered_at=now,
+                        last_discovered_at=now,
+                    )
+                )
+                outcomes.append(True)
+            else:
+                if anchor:
+                    existing.anchor_text = anchor
+                if existing.link_type == SiteLinkType.UNKNOWN.value:
+                    existing.link_type = link_type.value
+                existing.last_discovered_at = now
+                outcomes.append(False)
+        session.flush()
+        return tuple(outcomes)
+
+    @staticmethod
+    def _apply_crawl_success(
+        page: SitePage,
+        *,
+        title: str | None,
+        content_hash: str,
+        http_status: int | None,
+        etag: str | None,
+        last_modified: str | None,
+        now: datetime,
+    ) -> None:
+        changed = page.content_hash != content_hash
+        page.crawl_status = (
+            SiteCrawlStatus.SUCCESS.value
+            if changed
+            else SiteCrawlStatus.UNCHANGED.value
+        )
+        page.http_status = http_status
+        if etag is not None:
+            page.etag = etag
+        if last_modified is not None:
+            page.last_modified = last_modified
+        page.last_crawled_at = now
+        page.last_successful_crawl_at = now
+        page.failure_count = 0
+        if changed:
+            page.last_changed_at = now
+        page.content_hash = content_hash
+        if title and title.strip():
+            page.title = title.strip()
 
 
 def _source(value: str) -> SiteDiscoverySource:

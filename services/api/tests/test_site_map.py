@@ -16,6 +16,8 @@ from nptu_assistant.crawlers.site_map import (
     SiteCrawlStatus,
     SiteLinkType,
     SiteMapCandidate,
+    SiteMapBatchWriteResult,
+    SiteLinkUpsert,
     SiteMapService,
     SiteMapSyncSummary,
     SiteMapWriteResult,
@@ -24,7 +26,11 @@ from nptu_assistant.crawlers.site_map import (
     classify_link_type,
     classify_page_type,
 )
-from nptu_assistant.crawlers.site_models import SearchPlan
+from nptu_assistant.crawlers.site_models import (
+    DiscoveredPage,
+    SearchDeadlineExceeded,
+    SearchPlan,
+)
 from nptu_assistant.crawlers.site_search import NptuSiteSearchService
 from nptu_assistant.crawlers.site_models import SearchDeadline
 
@@ -36,6 +42,7 @@ class MemorySiteMapRepository:
         self.successes: list[tuple[str, str]] = []
         self.failures: list[tuple[str, SiteCrawlStatus]] = []
         self.candidates: tuple[SiteMapCandidate, ...] = ()
+        self.batch_calls = 0
 
     def upsert_page(self, page: SitePageUpsert) -> SiteMapWriteResult:
         created = page.canonical_url not in self.pages
@@ -83,6 +90,50 @@ class MemorySiteMapRepository:
         self.failures.append((canonical_url, status))
         return SiteMapWriteResult(updated=True)
 
+    def persist_fetched_page(
+        self,
+        source: SitePageUpsert,
+        *,
+        title: str | None,
+        content_hash: str,
+        http_status: int | None,
+        etag: str | None = None,
+        last_modified: str | None = None,
+        links: tuple[SiteLinkUpsert, ...] = (),
+    ) -> SiteMapBatchWriteResult:
+        del title, http_status, etag, last_modified
+        self.batch_calls += 1
+        self.upsert_page(source)
+        self.successes.append((source.canonical_url, content_hash))
+        created_targets = 0
+        updated_targets = 0
+        created_links = 0
+        updated_links = 0
+        for link in links:
+            target_created = link.target.canonical_url not in self.pages
+            result = self.upsert_link(
+                source,
+                link.target,
+                anchor_text=link.anchor_text,
+                link_type=link.link_type,
+            )
+            if result.created:
+                created_links += 1
+            elif result.updated:
+                updated_links += 1
+            if target_created:
+                created_targets += 1
+            else:
+                updated_targets += 1
+        return SiteMapBatchWriteResult(
+            source_created=False,
+            source_updated=True,
+            target_created=created_targets,
+            target_updated=updated_targets,
+            links_created=created_links,
+            links_updated=updated_links,
+        )
+
     def find_candidates(
         self,
         plan: SearchPlan,
@@ -90,8 +141,9 @@ class MemorySiteMapRepository:
         scope: DocumentSearchScope | None,
         allowed_hosts: Collection[str],
         limit: int,
+        deadline: SearchDeadline | None = None,
     ) -> tuple[SiteMapCandidate, ...]:
-        del plan, scope, allowed_hosts
+        del plan, scope, allowed_hosts, deadline
         return self.candidates[:limit]
 
     def import_existing_urls(self) -> Mapping[str, SiteMapSyncSummary]:
@@ -107,6 +159,17 @@ class RecordingDiscovery:
         self.calls += 1
         deadline.raise_if_expired()
         raise AssertionError("site map 已有足夠候選時不應執行 live discovery")
+
+
+class SuccessfulDiscovery:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def discover(self, plan: SearchPlan, *, max_items: int, deadline: SearchDeadline):
+        del plan, max_items
+        self.calls += 1
+        deadline.raise_if_expired()
+        return (DiscoveredPage("https://www.nptu.edu.tw/discovered", "相關頁面", 1.0),)
 
 
 class MappingHttpClient:
@@ -210,47 +273,130 @@ def test_fetched_page_persists_internal_links_and_rejects_external_urls() -> Non
     assert link_type is SiteLinkType.ANNOUNCEMENT
     assert repository.pages[target].page_type is SitePageType.ANNOUNCEMENT_DETAIL
     assert summary.links_created == 1
+    assert repository.batch_calls == 1
 
 
-def test_site_map_candidates_require_quality_not_row_count() -> None:
-    repository = MemorySiteMapRepository()
-    service = make_service(repository)
-    weak = SiteMapCandidate(
-        canonical_url="https://www.nptu.edu.tw/weak",
-        title=None,
+def candidate(
+    url: str,
+    *,
+    title: str | None = None,
+    unit: str | None = None,
+    page_type: SitePageType = SitePageType.GENERAL_PAGE,
+    lexical: float = 0.0,
+    structural: float = 0.0,
+) -> SiteMapCandidate:
+    return SiteMapCandidate(
+        canonical_url=url,
+        title=title,
         host="www.nptu.edu.tw",
-        unit=None,
-        page_type=SitePageType.UNKNOWN,
-        crawl_priority=0,
+        unit=unit,
+        page_type=page_type,
+        crawl_priority=40,
         minimum_depth=0,
         failure_count=0,
-        relevance=0.05,
+        lexical_relevance=lexical,
+        structural_score=structural,
+        final_score=lexical + structural,
     )
-    homepage = weak.__class__(
-        canonical_url="https://www.nptu.edu.tw/",
-        title="NPTU",
-        host="www.nptu.edu.tw",
+
+
+def test_unrelated_global_homepages_do_not_skip_discovery() -> None:
+    service = make_service(MemorySiteMapRepository())
+    candidates = tuple(
+        candidate(
+            f"https://unit-{index}.nptu.edu.tw/",
+            title=f"第 {index} 學系首頁",
+            page_type=SitePageType.UNIT_HOMEPAGE,
+            lexical=0.01,
+            structural=0.9,
+        )
+        for index in range(10)
+    )
+    plan = SearchPlan.from_query("低收入戶獎學金申請期限", limit=4)
+    assert not service.has_sufficient_candidates(
+        plan, candidates, scope=None, minimum=4
+    )
+
+
+def test_unrelated_announcement_listings_do_not_skip_discovery() -> None:
+    service = make_service(MemorySiteMapRepository())
+    candidates = tuple(
+        candidate(
+            f"https://unit-{index}.nptu.edu.tw/announcements",
+            title=f"第 {index} 學系公告",
+            page_type=SitePageType.ANNOUNCEMENT_LISTING,
+            lexical=0.02,
+            structural=0.9,
+        )
+        for index in range(5)
+    )
+    plan = SearchPlan.from_query("宿舍冷氣費計算", limit=4)
+    assert not service.has_sufficient_candidates(
+        plan, candidates, scope=None, minimum=4
+    )
+
+
+def test_scoped_relevant_unit_pages_can_skip_discovery() -> None:
+    service = make_service(MemorySiteMapRepository())
+    scope = DocumentSearchScope(
+        canonical_unit="資訊工程學系",
+        homepage_url="https://csie.nptu.edu.tw/",
+        preferred_hosts=("csie.nptu.edu.tw",),
+        allowed_hosts=("csie.nptu.edu.tw",),
+        seed_urls=("https://csie.nptu.edu.tw/",),
+    )
+    candidates = (
+        candidate(
+            "https://csie.nptu.edu.tw/",
+            title="資訊工程學系首頁",
+            unit="資訊工程學系",
+            page_type=SitePageType.UNIT_HOMEPAGE,
+            lexical=0.72,
+            structural=0.8,
+        ),
+        candidate(
+            "https://csie.nptu.edu.tw/news",
+            title="資訊工程學系公告",
+            unit="資訊工程學系",
+            page_type=SitePageType.ANNOUNCEMENT_LISTING,
+            lexical=0.75,
+            structural=0.8,
+        ),
+    )
+    plan = SearchPlan.from_query("資訊工程學系最新公告", limit=2)
+    assert service.has_sufficient_candidates(plan, candidates, scope=scope, minimum=2)
+
+
+def test_global_homepage_intent_can_skip_for_exact_official_homepage() -> None:
+    service = make_service(MemorySiteMapRepository())
+    homepage = candidate(
+        "https://www.nptu.edu.tw/",
+        title="國立屏東大學首頁",
         unit="國立屏東大學",
         page_type=SitePageType.UNIT_HOMEPAGE,
-        crawl_priority=100,
-        minimum_depth=0,
-        failure_count=0,
-        relevance=0.05,
+        lexical=0.66,
+        structural=0.9,
     )
-    assert not service.has_sufficient_candidates((weak,), minimum=2)
-    strong = homepage.__class__(
-        canonical_url="https://www.nptu.edu.tw/announcements",
-        title="公告列表",
-        host="www.nptu.edu.tw",
-        unit="國立屏東大學",
-        page_type=SitePageType.ANNOUNCEMENT_LISTING,
-        crawl_priority=90,
-        minimum_depth=0,
-        failure_count=0,
-        relevance=0.40,
+    plan = SearchPlan.from_query("屏東大學首頁", limit=1)
+    assert service.has_sufficient_candidates(plan, (homepage,), scope=None, minimum=1)
+
+
+def test_anchor_and_concept_relevance_is_distinct_from_structure() -> None:
+    relevant = candidate(
+        "https://www.nptu.edu.tw/aid",
+        title="弱勢學生助學計畫",
+        lexical=0.78,
+        structural=0.1,
     )
-    assert service.has_sufficient_candidates((weak, homepage), minimum=1)
-    assert service.has_sufficient_candidates((weak, homepage, strong), minimum=2)
+    unrelated = candidate(
+        "https://www.nptu.edu.tw/",
+        title="行政單位首頁",
+        page_type=SitePageType.UNIT_HOMEPAGE,
+        lexical=0.02,
+        structural=1.0,
+    )
+    assert relevant.lexical_relevance > unrelated.lexical_relevance
+    assert relevant.final_score < unrelated.final_score
 
 
 def test_search_uses_sufficient_site_map_before_live_discovery() -> None:
@@ -265,7 +411,9 @@ def test_search_uses_sufficient_site_map_before_live_discovery() -> None:
             crawl_priority=40,
             minimum_depth=0,
             failure_count=0,
-            relevance=0.80,
+            lexical_relevance=0.80,
+            structural_score=0.20,
+            final_score=0.90,
         ),
     )
     site_map = make_service(repository)
@@ -293,3 +441,49 @@ def test_search_uses_sufficient_site_map_before_live_discovery() -> None:
     assert discovery.calls == 0
     assert result.pages
     assert result.pages[0].canonical_url == "https://www.nptu.edu.tw/"
+
+
+def test_site_map_timeout_fails_open_to_official_discovery() -> None:
+    class TimeoutRepository(MemorySiteMapRepository):
+        def find_candidates(
+            self,
+            plan: SearchPlan,
+            *,
+            scope: DocumentSearchScope | None,
+            allowed_hosts: Collection[str],
+            limit: int,
+            deadline: SearchDeadline | None = None,
+        ) -> tuple[SiteMapCandidate, ...]:
+            del plan, scope, allowed_hosts, limit, deadline
+            raise SearchDeadlineExceeded("test site map timeout")
+
+    discovery = SuccessfulDiscovery()
+    service = NptuSiteSearchService(
+        SiteSearchConfig(
+            enabled=True,
+            seed_urls=["https://www.nptu.edu.tw/"],
+            allowed_hosts=["nptu.edu.tw"],
+            max_pages=1,
+            max_items=1,
+            max_candidate_urls=5,
+            max_depth=0,
+            max_pages_per_host=2,
+            early_stop_min_results=1,
+        ),
+        MappingHttpClient(),
+        scorer=DeterministicScorer(),  # type: ignore[arg-type]
+        discovery=discovery,
+        site_map=SiteMapService(
+            TimeoutRepository(),
+            official_units=load_default_official_unit_directory(),
+            source_configs=(),
+            site_config=SiteSearchConfig(
+                enabled=True,
+                seed_urls=["https://www.nptu.edu.tw/"],
+                allowed_hosts=["nptu.edu.tw"],
+            ),
+        ),
+    )
+    result = service.search(SearchPlan.from_query("宿舍冷氣費", limit=1))
+    assert discovery.calls == 1
+    assert result.diagnostics.query_timed_out is False

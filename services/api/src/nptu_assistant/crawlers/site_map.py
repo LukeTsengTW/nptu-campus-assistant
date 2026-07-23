@@ -21,7 +21,7 @@ from nptu_assistant.crawlers.official_units import (
     DocumentSearchScope,
     OfficialUnitDirectory,
 )
-from nptu_assistant.crawlers.site_models import SearchPlan
+from nptu_assistant.crawlers.site_models import SearchDeadline, SearchPlan
 
 
 class SitePageType(StrEnum):
@@ -100,6 +100,13 @@ class SitePageUpsert:
 
 
 @dataclass(frozen=True, slots=True)
+class SiteLinkUpsert:
+    target: SitePageUpsert
+    anchor_text: str
+    link_type: SiteLinkType
+
+
+@dataclass(frozen=True, slots=True)
 class SiteMapCandidate:
     canonical_url: str
     title: str | None
@@ -109,7 +116,26 @@ class SiteMapCandidate:
     crawl_priority: int
     minimum_depth: int
     failure_count: int
-    relevance: float
+    lexical_relevance: float
+    structural_score: float
+    final_score: float
+    is_crawlable: bool = True
+
+    @property
+    def relevance(self) -> float:
+        """Compatibility alias for crawler queue priority."""
+        return self.final_score
+
+
+@dataclass(frozen=True, slots=True)
+class SiteMapBatchWriteResult:
+    source_created: bool = False
+    source_updated: bool = False
+    target_created: int = 0
+    target_updated: int = 0
+    links_created: int = 0
+    links_updated: int = 0
+    statement_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,6 +162,12 @@ class SiteMapSyncSummary:
         else:
             self.skipped += 1
 
+    def add_batch(self, result: SiteMapBatchWriteResult) -> None:
+        self.seen += 1 + result.target_created + result.target_updated
+        self.created += int(result.source_created) + result.target_created
+        self.updated += int(result.source_updated) + result.target_updated
+        self.links_created += result.links_created
+
     def merge(self, other: "SiteMapSyncSummary") -> None:
         self.seen += other.seen
         self.created += other.created
@@ -156,6 +188,18 @@ class SiteMapRepository(Protocol):
         anchor_text: str,
         link_type: SiteLinkType,
     ) -> SiteMapWriteResult: ...
+
+    def persist_fetched_page(
+        self,
+        source: SitePageUpsert,
+        *,
+        title: str | None,
+        content_hash: str,
+        http_status: int | None,
+        etag: str | None = None,
+        last_modified: str | None = None,
+        links: Sequence[SiteLinkUpsert] = (),
+    ) -> SiteMapBatchWriteResult: ...
 
     def record_crawl_success(
         self,
@@ -183,6 +227,7 @@ class SiteMapRepository(Protocol):
         scope: DocumentSearchScope | None,
         allowed_hosts: Collection[str],
         limit: int,
+        deadline: SearchDeadline | None = None,
     ) -> tuple[SiteMapCandidate, ...]: ...
 
     def import_existing_urls(self) -> Mapping[str, SiteMapSyncSummary]: ...
@@ -208,6 +253,84 @@ def classify_link_type(anchor_text: str, target_url: str) -> SiteLinkType:
     return SiteLinkType.UNKNOWN
 
 
+class SiteMapDiscoveryPolicy:
+    """決定網頁地圖是否已具備足夠查詢相關候選。"""
+
+    lexical_threshold = 0.25
+
+    @staticmethod
+    def _intent(plan: SearchPlan) -> str:
+        return " ".join(
+            (plan.query, *plan.retrieval_queries[1:3], *plan.concepts)
+        ).casefold()
+
+    @classmethod
+    def _scope_correct(
+        cls,
+        candidate: SiteMapCandidate,
+        scope: DocumentSearchScope | None,
+    ) -> bool:
+        if scope is None:
+            return True
+        host = candidate.host.casefold().rstrip(".")
+        preferred_hosts = {
+            value.casefold().rstrip(".") for value in scope.preferred_hosts
+        }
+        return bool(
+            (scope.canonical_unit and candidate.unit == scope.canonical_unit)
+            or host in preferred_hosts
+            or (scope.homepage_url and candidate.canonical_url == scope.homepage_url)
+        )
+
+    @classmethod
+    def _is_strong(
+        cls,
+        plan: SearchPlan,
+        candidate: SiteMapCandidate,
+        *,
+        scope: DocumentSearchScope | None,
+    ) -> bool:
+        if candidate.lexical_relevance < cls.lexical_threshold:
+            return False
+        if candidate.failure_count >= 5:
+            return False
+        if not cls._scope_correct(candidate, scope):
+            return False
+
+        intent = cls._intent(plan)
+        announcement_intent = any(
+            token in intent for token in ("公告", "通知", "訊息", "最新消息")
+        )
+        document_intent = any(
+            token in intent for token in ("文件", "辦法", "表單", "規章", "申請表")
+        )
+        homepage_intent = any(token in intent for token in ("首頁", "主頁", "home"))
+        if candidate.page_type is SitePageType.UNIT_HOMEPAGE:
+            return homepage_intent or scope is not None
+        if candidate.page_type is SitePageType.ANNOUNCEMENT_LISTING:
+            return announcement_intent or scope is not None
+        if candidate.page_type is SitePageType.OFFICIAL_DOCUMENT:
+            return document_intent or candidate.lexical_relevance >= 0.45
+        return True
+
+    def has_sufficient_candidates(
+        self,
+        plan: SearchPlan,
+        candidates: Collection[SiteMapCandidate],
+        *,
+        scope: DocumentSearchScope | None,
+        minimum: int,
+    ) -> bool:
+        if minimum <= 0:
+            return True
+        strong_urls = {
+            candidate.canonical_url
+            for candidate in candidates
+            if candidate.is_crawlable and self._is_strong(plan, candidate, scope=scope)
+        }
+        return len(strong_urls) >= minimum
+
+
 class SiteMapService:
     def __init__(
         self,
@@ -229,31 +352,30 @@ class SiteMapService:
         scope: DocumentSearchScope | None,
         allowed_hosts: Collection[str],
         limit: int,
+        deadline: SearchDeadline | None = None,
     ) -> tuple[SiteMapCandidate, ...]:
         return self._repository.find_candidates(
             plan,
             scope=scope,
             allowed_hosts=allowed_hosts,
             limit=limit,
+            deadline=deadline,
         )
 
     @staticmethod
     def has_sufficient_candidates(
+        plan: SearchPlan,
         candidates: Collection[SiteMapCandidate],
         *,
+        scope: DocumentSearchScope | None,
         minimum: int,
     ) -> bool:
-        strong = [
-            item
-            for item in candidates
-            if item.relevance >= 0.30
-            or item.page_type
-            in {
-                SitePageType.UNIT_HOMEPAGE,
-                SitePageType.ANNOUNCEMENT_LISTING,
-            }
-        ]
-        return len(strong) >= minimum
+        return SiteMapDiscoveryPolicy().has_sufficient_candidates(
+            plan,
+            candidates,
+            scope=scope,
+            minimum=minimum,
+        )
 
     def record_discovery(
         self,
@@ -296,35 +418,23 @@ class SiteMapService:
 
         page_type = classify_page_type(page)
         source = SiteDiscoverySource.INTERNAL_LINK
-        page_result = self.record_discovery(
-            page.canonical_url,
-            title=page.title,
+        source_page = SitePageUpsert(
+            canonical_url=page.canonical_url,
+            title=page.title.strip() if page.title.strip() else None,
             unit=unit,
-            source=source,
             page_type=page_type,
-            depth=depth,
-            allowed_hosts=allowed_hosts,
+            discovery_source=source,
+            crawl_priority=PAGE_TYPE_PRIORITY[page_type],
+            minimum_depth=max(0, depth),
         )
-        crawl_result = self._repository.record_crawl_success(
-            page.canonical_url,
-            title=page.title,
-            content_hash=content_hash(page.body),
-            http_status=http_status,
-            etag=etag,
-            last_modified=last_modified,
-        )
-        summary = SiteMapSyncSummary(seen=1)
-        summary.add(page_result)
-        if crawl_result.updated:
-            summary.updated += 1
-        elif crawl_result.created:
-            summary.created += 1
+        links_by_target: dict[str, SiteLinkUpsert] = {}
+        skipped_links = 0
         for link, anchor_text in page.link_texts or tuple(
             (link, "") for link in page.links
         ):
             target = self._normalize_url(link)
             if target is None or not is_allowed_source_url(target, allowed_hosts):
-                summary.skipped += 1
+                skipped_links += 1
                 continue
             is_announcement = target in {
                 item.canonical_url for item in page.announcement_items
@@ -347,30 +457,45 @@ class SiteMapService:
                     (".pdf", ".doc", ".docx", ".xls", ".xlsx")
                 ),
             )
-            try:
-                link_result = self._repository.upsert_link(
-                    SitePageUpsert(
-                        canonical_url=page.canonical_url,
-                        unit=unit,
-                        page_type=page_type,
-                        discovery_source=source,
-                        crawl_priority=PAGE_TYPE_PRIORITY[page_type],
-                        minimum_depth=max(0, depth),
-                    ),
-                    target_page,
-                    anchor_text=anchor_text,
-                    link_type=(
-                        SiteLinkType.ANNOUNCEMENT
-                        if is_announcement
-                        else classify_link_type(anchor_text, target)
-                    ),
-                )
-            except Exception:
-                summary.failed += 1
+            incoming_link = SiteLinkUpsert(
+                target=target_page,
+                anchor_text=anchor_text.strip(),
+                link_type=(
+                    SiteLinkType.ANNOUNCEMENT
+                    if is_announcement
+                    else classify_link_type(anchor_text, target)
+                ),
+            )
+            previous_link = links_by_target.get(target)
+            if previous_link is not None:
+                skipped_links += 1
+                if not previous_link.anchor_text and incoming_link.anchor_text:
+                    links_by_target[target] = incoming_link
+                elif (
+                    previous_link.link_type is SiteLinkType.UNKNOWN
+                    and incoming_link.link_type is not SiteLinkType.UNKNOWN
+                ):
+                    links_by_target[target] = SiteLinkUpsert(
+                        target=previous_link.target,
+                        anchor_text=previous_link.anchor_text,
+                        link_type=incoming_link.link_type,
+                    )
                 continue
-            summary.add(link_result)
-            if link_result.created:
-                summary.links_created += 1
+            links_by_target[target] = incoming_link
+        links = tuple(links_by_target.values())
+        result = self._repository.persist_fetched_page(
+            source_page,
+            title=page.title,
+            content_hash=content_hash(page.body),
+            http_status=http_status,
+            etag=etag,
+            last_modified=last_modified,
+            links=links,
+        )
+        summary = SiteMapSyncSummary()
+        summary.add_batch(result)
+        summary.seen += skipped_links
+        summary.skipped += skipped_links
         return summary
 
     def record_crawl_failure(

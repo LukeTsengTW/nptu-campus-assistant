@@ -53,6 +53,7 @@ jobs:
       - name: Migrate and seed twice
         run: |
           uv run --project services/api alembic -c alembic.ini upgrade head
+          uv run --project services/api alembic -c alembic.ini downgrade 20260719_0004
           uv run --project services/api alembic -c alembic.ini upgrade head
           uv run --project services/api nptu-assistant seed
           uv run --project services/api nptu-assistant seed
