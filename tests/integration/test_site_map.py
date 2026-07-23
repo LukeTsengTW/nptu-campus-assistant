@@ -205,6 +205,7 @@ def test_batch_persistence_100_links_uses_one_transaction_and_fixed_sql() -> Non
 
     event.listen(engine, "before_cursor_execute", capture_sql)
     try:
+        started = perf_counter()
         result = SqlSiteMapRepository(factory).persist_fetched_page(
             source,
             title=source.title,
@@ -212,6 +213,8 @@ def test_batch_persistence_100_links_uses_one_transaction_and_fixed_sql() -> Non
             http_status=200,
             links=links,
         )
+        batch_ms = (perf_counter() - started) * 1000
+        batch_statement_count = len(statements)
         assert result.links_created == 100
         assert result.statement_count <= 8
         with factory() as session:
@@ -233,6 +236,11 @@ def test_batch_persistence_100_links_uses_one_transaction_and_fixed_sql() -> Non
                 == 100
             )
         assert len(statements) <= 8
+        print(
+            "site_map_batch_benchmark "
+            f"links=100 transactions=1 statements={batch_statement_count} "
+            f"elapsed_ms={batch_ms:.2f}"
+        )
     finally:
         event.remove(engine, "before_cursor_execute", capture_sql)
         cleanup(factory, prefix)
