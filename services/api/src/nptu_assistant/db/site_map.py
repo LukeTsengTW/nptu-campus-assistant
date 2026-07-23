@@ -20,6 +20,7 @@ from sqlalchemy import (
     select,
     String,
     text,
+    true,
     update,
     values,
 )
@@ -489,7 +490,8 @@ class SqlSiteMapRepository(SiteMapRepository):
                     * qweight
                 )
             )
-            .select_from(SiteLink, term_values)
+            .select_from(SiteLink)
+            .join(term_values, true())
             .where(SiteLink.target_page_id == SitePage.id)
             .correlate(SitePage)
             .scalar_subquery()

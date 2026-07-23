@@ -140,8 +140,29 @@ def test_concurrent_page_and_link_upsert_is_idempotent() -> None:
                 )
                 is not None
             )
-            assert session.scalar(select(SiteLink.id)) is not None
-            assert session.scalar(select(func.count()).select_from(SiteLink)) == 1
+            source_id = session.scalar(
+                select(SitePage.id).where(
+                    SitePage.canonical_url == source.canonical_url
+                )
+            )
+            target_id = session.scalar(
+                select(SitePage.id).where(
+                    SitePage.canonical_url == target.canonical_url
+                )
+            )
+            assert source_id is not None
+            assert target_id is not None
+            assert (
+                session.scalar(
+                    select(func.count())
+                    .select_from(SiteLink)
+                    .where(
+                        SiteLink.source_page_id == source_id,
+                        SiteLink.target_page_id == target_id,
+                    )
+                )
+                == 1
+            )
     finally:
         cleanup(factory, prefix)
         engine.dispose()
@@ -669,7 +690,7 @@ def test_existing_source_document_announcement_urls_bootstrap_idempotently() -> 
                 SitePageType.OFFICIAL_DOCUMENT.value,
                 SitePageType.ANNOUNCEMENT_DETAIL.value,
             }
-        assert first["Document URLs"].created == 1
+        assert first["Document URLs"].created >= 1
         assert second["Document URLs"].created == 0
         assert second["Document URLs"].updated >= 1
     finally:

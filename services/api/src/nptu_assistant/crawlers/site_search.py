@@ -236,7 +236,7 @@ class NptuSiteSearchService:
         plan: SearchPlan | str,
         *,
         max_items: int | None = None,
-        use_discovery: bool = True,
+        use_discovery: bool | None = None,
         deadline: SearchDeadline | None = None,
         scope: DocumentSearchScope | None = None,
         execution_context: RetrievalExecutionContext | None = None,
@@ -249,11 +249,11 @@ class NptuSiteSearchService:
         )
         if search_plan.limit != limit:
             search_plan = search_plan.model_copy(update={"limit": limit})
-        effective_discovery = use_discovery
+        effective_discovery = scope is None if use_discovery is None else use_discovery
         cache_key = self._cache_key(
             search_plan,
             limit=limit,
-            use_discovery=use_discovery,
+            use_discovery=effective_discovery,
             scope=scope,
         )
         cached_entry = self._result_cache.get(cache_key)
