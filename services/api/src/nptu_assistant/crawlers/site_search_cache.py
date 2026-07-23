@@ -25,7 +25,7 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
-SITE_SEARCH_CACHE_SCHEMA_VERSION = "p1.1-v1"
+SITE_SEARCH_CACHE_SCHEMA_VERSION = "p2-v1"
 
 
 @dataclass(frozen=True, slots=True)

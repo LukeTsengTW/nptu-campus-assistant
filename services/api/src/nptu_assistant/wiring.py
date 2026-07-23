@@ -11,6 +11,7 @@ from nptu_assistant.core.settings import (
 )
 from nptu_assistant.crawlers.http import CrawlHttpClient
 from nptu_assistant.crawlers.config import (
+    SiteSearchConfig,
     load_keyword_search_config,
     load_source_configs,
 )
@@ -25,6 +26,7 @@ from nptu_assistant.crawlers.resolution import UnitSourceResolver
 from nptu_assistant.crawlers.service import CrawlerService
 from nptu_assistant.crawlers.search import KeywordAnnouncementSearchService
 from nptu_assistant.crawlers.site_discovery import NptuOfficialSearchDiscovery
+from nptu_assistant.crawlers.site_map import SiteMapService
 from nptu_assistant.crawlers.site_search import (
     NptuSiteSearchService,
     SitePageIngestionService,
@@ -41,6 +43,7 @@ from nptu_assistant.db.repositories import (
     SqlAnnouncementRepository,
     SqlDocumentRepository,
 )
+from nptu_assistant.db.site_map import SqlSiteMapRepository
 from nptu_assistant.db.session import create_session_factory
 from nptu_assistant.ingestion.service import DocumentIngestionService
 from nptu_assistant.providers.fake import FakeEmbeddingProvider, FakeLlmProvider
@@ -104,7 +107,14 @@ def build_services(settings: Settings) -> dict[str, object]:
         llm = None
     document_repository = SqlDocumentRepository(factory)
     announcement_repository = SqlAnnouncementRepository(factory)
+    site_map_repository = SqlSiteMapRepository(factory)
     site_config = keyword_search_config.site_search
+    site_map_service = SiteMapService(
+        site_map_repository,
+        official_units=official_units,
+        source_configs=source_configs,
+        site_config=site_config or SiteSearchConfig(),
+    )
     progressive_policy = ProgressiveRetrievalPolicy(
         min_results=site_config.database_min_results if site_config else 2,
         min_score=site_config.database_min_score if site_config else 0.58,
@@ -147,6 +157,7 @@ def build_services(settings: Settings) -> dict[str, object]:
                 ttl_seconds=site_config.cache_ttl_seconds,
             ),
             single_flight=SingleFlightSearchRunner(factory),
+            site_map=site_map_service,
         )
         if site_config and site_config.enabled
         else None
@@ -206,5 +217,6 @@ def build_services(settings: Settings) -> dict[str, object]:
         ),
         "crawler_service": crawler_service,
         "refresh_scheduler": refresh_scheduler,
+        "site_map_service": site_map_service,
         "session_factory": factory,
     }

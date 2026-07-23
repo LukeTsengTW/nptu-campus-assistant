@@ -11,6 +11,7 @@ from nptu_assistant.api.schemas import (
     Confidence,
     CrawlSummary,
     IngestionSummary,
+    SiteMapSyncResponse,
 )
 from nptu_assistant.core.settings import Settings
 from nptu_assistant.main import create_app
@@ -75,6 +76,11 @@ class StubOperation:
         return CrawlSummary(created=1)
 
 
+class StubSiteMap:
+    def sync(self) -> SiteMapSyncResponse:
+        return SiteMapSyncResponse(seen=2, created=2)
+
+
 class StubScheduler:
     def __init__(self) -> None:
         self.started = False
@@ -90,7 +96,13 @@ class StubScheduler:
         self._stop.set()
 
 
-def make_client(*, chat_service=None, rate_limiter=None, raise_server_exceptions: bool = True) -> TestClient:
+def make_client(
+    *,
+    chat_service=None,
+    site_map_service=None,
+    rate_limiter=None,
+    raise_server_exceptions: bool = True,
+) -> TestClient:
     settings = Settings(
         _env_file=None,
         admin_api_enabled=True,
@@ -105,6 +117,7 @@ def make_client(*, chat_service=None, rate_limiter=None, raise_server_exceptions
         announcement_service=StubAnnouncements(),
         ingestion_service=StubOperation(),
         crawler_service=StubOperation(),
+        site_map_service=site_map_service or StubSiteMap(),
         rate_limiter=rate_limiter,
     )
     return TestClient(app, raise_server_exceptions=raise_server_exceptions)
@@ -202,6 +215,27 @@ def test_crawl_endpoint_uses_crawl_summary_contract() -> None:
 
     assert response.status_code == 200
     assert set(response.json()) == {"created", "updated", "unchanged", "failed", "errors"}
+
+
+def test_site_map_sync_endpoint_uses_admin_auth_and_summary_contract() -> None:
+    client = make_client()
+
+    denied = client.post("/v1/admin/site-map/sync")
+    allowed = client.post(
+        "/v1/admin/site-map/sync",
+        headers={"X-Admin-Key": "test-admin-key"},
+    )
+
+    assert denied.status_code == 401
+    assert allowed.status_code == 200
+    assert allowed.json() == {
+        "seen": 2,
+        "created": 2,
+        "updated": 0,
+        "skipped": 0,
+        "failed": 0,
+        "links_created": 0,
+    }
 
 
 def test_cors_only_allows_configured_origin() -> None:

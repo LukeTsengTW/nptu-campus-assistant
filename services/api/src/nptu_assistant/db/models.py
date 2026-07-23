@@ -134,6 +134,129 @@ class SiteSearchCacheRecord(Base):
     schema_version: Mapped[str] = mapped_column(String(32), nullable=False)
 
 
+class SitePage(TimestampMixin, Base):
+    __tablename__ = "site_pages"
+    __table_args__ = (
+        Index("ix_site_pages_host", "host"),
+        Index("ix_site_pages_unit", "unit"),
+        Index("ix_site_pages_page_type", "page_type"),
+        Index("ix_site_pages_crawl_status", "crawl_status"),
+        Index("ix_site_pages_next_crawl_at", "next_crawl_at"),
+        Index("ix_site_pages_active_indexable", "is_active", "is_indexable"),
+        Index("ix_site_pages_host_priority", "host", "crawl_priority"),
+        Index(
+            "ix_site_pages_title_trgm",
+            "title",
+            postgresql_using="gin",
+            postgresql_ops={"title": "gin_trgm_ops"},
+        ),
+        Index(
+            "ix_site_pages_path_trgm",
+            "path",
+            postgresql_using="gin",
+            postgresql_ops={"path": "gin_trgm_ops"},
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    canonical_url: Mapped[str] = mapped_column(
+        String(2048), unique=True, nullable=False
+    )
+    host: Mapped[str] = mapped_column(String(255), nullable=False)
+    path: Mapped[str] = mapped_column(String(2048), nullable=False)
+    title: Mapped[str | None] = mapped_column(String(500))
+    unit: Mapped[str | None] = mapped_column(String(200))
+    page_type: Mapped[str] = mapped_column(
+        String(50), nullable=False, default="unknown", server_default="unknown"
+    )
+    discovery_source: Mapped[str] = mapped_column(
+        String(50), nullable=False, default="manual", server_default="manual"
+    )
+    crawl_status: Mapped[str] = mapped_column(
+        String(30), nullable=False, default="discovered", server_default="discovered"
+    )
+    http_status: Mapped[int | None] = mapped_column(Integer)
+    content_hash: Mapped[str | None] = mapped_column(String(64))
+    etag: Mapped[str | None] = mapped_column(String(500))
+    last_modified: Mapped[str | None] = mapped_column(String(500))
+    last_discovered_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    last_crawled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_successful_crawl_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    last_changed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    next_crawl_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    failure_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    crawl_priority: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    minimum_depth: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    is_indexable: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="true"
+    )
+    is_active: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="true"
+    )
+
+    outgoing_links: Mapped[list[SiteLink]] = relationship(
+        foreign_keys="SiteLink.source_page_id",
+        back_populates="source_page",
+        cascade="all, delete-orphan",
+    )
+    incoming_links: Mapped[list[SiteLink]] = relationship(
+        foreign_keys="SiteLink.target_page_id",
+        back_populates="target_page",
+    )
+
+
+class SiteLink(TimestampMixin, Base):
+    __tablename__ = "site_links"
+    __table_args__ = (
+        UniqueConstraint(
+            "source_page_id",
+            "target_page_id",
+            name="uq_site_links_source_target",
+        ),
+        Index("ix_site_links_source_page_id", "source_page_id"),
+        Index("ix_site_links_target_page_id", "target_page_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    source_page_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("site_pages.id", ondelete="CASCADE"), nullable=False
+    )
+    target_page_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("site_pages.id", ondelete="CASCADE"), nullable=False
+    )
+    anchor_text: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    link_type: Mapped[str] = mapped_column(
+        String(30), nullable=False, default="unknown", server_default="unknown"
+    )
+    first_discovered_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    last_discovered_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    source_page: Mapped[SitePage] = relationship(
+        foreign_keys=[source_page_id], back_populates="outgoing_links"
+    )
+    target_page: Mapped[SitePage] = relationship(
+        foreign_keys=[target_page_id], back_populates="incoming_links"
+    )
+
+
 class Announcement(TimestampMixin, Base):
     __tablename__ = "announcements"
     __table_args__ = (

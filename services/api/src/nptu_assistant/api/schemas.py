@@ -102,6 +102,15 @@ class CrawlSummary(BaseModel):
     errors: list[str] = Field(default_factory=list)
 
 
+class SiteMapSyncResponse(BaseModel):
+    seen: int = 0
+    created: int = 0
+    updated: int = 0
+    skipped: int = 0
+    failed: int = 0
+    links_created: int = 0
+
+
 class ErrorBody(BaseModel):
     code: str
     message: str

@@ -26,6 +26,7 @@ from nptu_assistant.crawlers.adapters.nptu_search import AnnouncementSearchResul
 from nptu_assistant.crawlers.config import SiteSearchConfig
 from nptu_assistant.crawlers.official_units import DocumentSearchScope
 from nptu_assistant.crawlers.site_discovery import SiteDiscovery
+from nptu_assistant.crawlers.site_map import SiteMapService
 from nptu_assistant.crawlers.site_models import (
     CandidatePage,
     SearchDeadline,
@@ -52,7 +53,7 @@ SITE_SEARCH_PARTIAL_WARNING = "NPTU 網域搜尋有部分頁面無法取得，�
 SITE_SEARCH_FAILURE_WARNING = (
     "NPTU 網域搜尋目前無法取得頁面，以下內容來自資料庫既有資料。"
 )
-SITE_SEARCH_SCORING_VERSION = "p1.1-v1"
+SITE_SEARCH_SCORING_VERSION = "p2-v1"
 SITE_SEARCH_WAITER_BACKOFF_SECONDS = (0.05, 0.1, 0.2, 0.4, 0.5)
 
 logger = logging.getLogger(__name__)
@@ -120,6 +121,7 @@ class NptuSiteSearchService:
         sleep: Callable[[float], None] = time.sleep,
         cache: SiteSearchCache | None = None,
         single_flight: SingleFlightRunner | None = None,
+        site_map: SiteMapService | None = None,
     ) -> None:
         if not config.enabled:
             raise ValueError("NPTU 網域搜尋設定尚未啟用")
@@ -135,6 +137,7 @@ class NptuSiteSearchService:
         self._sleep = sleep
         self._result_cache = cache or InMemorySiteSearchCache(clock=clock)
         self._single_flight = single_flight
+        self._site_map = site_map
         self._page_cache: dict[str, tuple[float, NptuSitePage]] = {}
 
     @property
@@ -195,7 +198,7 @@ class NptuSiteSearchService:
             scope.allowed_hosts if scope is not None else self._config.allowed_hosts
         )
         seed_urls = scope.seed_urls if scope is not None else self._config.seed_urls
-        effective_discovery = use_discovery and scope is None
+        effective_discovery = use_discovery
         return {
             "schema": SITE_SEARCH_SCORING_VERSION,
             "query": search_plan.query,
@@ -246,7 +249,7 @@ class NptuSiteSearchService:
         )
         if search_plan.limit != limit:
             search_plan = search_plan.model_copy(update={"limit": limit})
-        effective_discovery = use_discovery and scope is None
+        effective_discovery = use_discovery
         cache_key = self._cache_key(
             search_plan,
             limit=limit,
@@ -339,7 +342,7 @@ class NptuSiteSearchService:
             scope.allowed_hosts if scope is not None else self._config.allowed_hosts
         )
         seed_urls = scope.seed_urls if scope is not None else self._config.seed_urls
-        effective_discovery = use_discovery and scope is None
+        effective_discovery = use_discovery
 
         queue: list[tuple[float, int, CandidatePage]] = []
         queued_scores: dict[str, float] = {}
@@ -390,7 +393,46 @@ class NptuSiteSearchService:
             )
             sequence += 1
 
-        if effective_discovery and self._discovery is not None:
+        site_map_candidates = ()
+        site_map_sufficient = False
+        if self._site_map is not None:
+            map_started = self._clock()
+            try:
+                site_map_candidates = self._site_map.find_candidates(
+                    search_plan,
+                    scope=scope,
+                    allowed_hosts=allowed_hosts,
+                    limit=self._config.max_candidate_urls,
+                )
+                site_map_sufficient = self._site_map.has_sufficient_candidates(
+                    site_map_candidates,
+                    minimum=min(self._config.early_stop_min_results, limit),
+                )
+                logger.info(
+                    "site map candidates loaded",
+                    extra={
+                        "site_map_candidate_count": len(site_map_candidates),
+                        "site_map_candidate_query_ms": round(
+                            (self._clock() - map_started) * 1000,
+                            2,
+                        ),
+                    },
+                )
+            except Exception:
+                logger.exception("site map candidate lookup 失敗")
+        for item in site_map_candidates:
+            enqueue(
+                CandidatePage(
+                    item.canonical_url,
+                    anchor_text=item.title or "",
+                    depth=item.minimum_depth,
+                    discovery_relevance=item.relevance,
+                )
+            )
+        for seed_url in seed_urls:
+            enqueue(CandidatePage(seed_url))
+
+        if effective_discovery and self._discovery is not None and not site_map_sufficient:
             try:
                 search_deadline.raise_if_expired()
                 for item in self._discovery.discover(
@@ -405,12 +447,27 @@ class NptuSiteSearchService:
                             discovery_relevance=item.relevance,
                         )
                     )
+                    if self._site_map is not None:
+                        try:
+                            self._site_map.record_discovery(
+                                item.url,
+                                title=item.label,
+                                unit=(scope.canonical_unit if scope is not None else None),
+                            )
+                        except Exception:
+                            logger.exception("官方搜尋結果寫入 site map 失敗")
             except SearchDeadlineExceeded:
                 query_timed_out = True
             except Exception:
                 logger.exception("NPTU 官方網站 discovery 失敗")
-        for seed_url in seed_urls:
-            enqueue(CandidatePage(seed_url))
+        elif effective_discovery and site_map_sufficient:
+            logger.info(
+                "official search skipped due to site map",
+                extra={
+                    "official_search_skipped_due_to_site_map": True,
+                    "site_map_candidate_count": len(site_map_candidates),
+                },
+            )
 
         while queue and len(visited) < self._config.max_pages:
             if search_deadline.expired():
@@ -445,6 +502,11 @@ class NptuSiteSearchService:
                 break
             except Exception:
                 fetch_failure_scores.append(relevance)
+                if self._site_map is not None and not search_deadline.expired():
+                    try:
+                        self._site_map.record_crawl_failure(url)
+                    except Exception:
+                        logger.exception("site map crawl failure state 寫入失敗")
                 logger.exception(
                     "NPTU 官方網站頁面取得失敗",
                     extra={"url": url},
@@ -453,6 +515,16 @@ class NptuSiteSearchService:
 
             pages.append(page)
             candidates.append(candidate)
+            if self._site_map is not None:
+                try:
+                    self._site_map.record_fetched_page(
+                        page,
+                        unit=(scope.canonical_unit if scope is not None else None),
+                        depth=candidate.depth,
+                        allowed_hosts=allowed_hosts,
+                    )
+                except Exception:
+                    logger.exception("site map page/link persistence 失敗")
             preliminary = self._scorer.score_candidate(
                 search_plan,
                 replace(

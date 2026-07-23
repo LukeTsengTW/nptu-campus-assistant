@@ -23,6 +23,7 @@ from nptu_assistant.api.schemas import (
     CrawlRequest,
     ErrorResponse,
     IngestionSummary,
+    SiteMapSyncResponse,
 )
 from nptu_assistant.core.logging import configure_logging
 from nptu_assistant.core.rate_limit import InMemoryRateLimiter, RateLimiter
@@ -34,7 +35,7 @@ logger = logging.getLogger(__name__)
 _SAFE_REQUEST_ID = re.compile(r"^[A-Za-z0-9._:-]{1,100}$")
 
 
-def _error_responses(*status_codes: int) -> dict[int, dict[str, object]]:
+def _error_responses(*status_codes: int) -> dict[int | str, dict[str, Any]]:
     return {
         status_code: {"model": ErrorResponse, "description": "統一錯誤 envelope"}
         for status_code in status_codes
@@ -56,17 +57,32 @@ class _UnavailableChat:
 
 
 class _EmptyAnnouncements:
-    def list(self, **kwargs: object) -> AnnouncementListResponse:
+    def list(
+        self,
+        *,
+        q: str | None = None,
+        unit: str | None = None,
+        date_from: date | None = None,
+        date_to: date | None = None,
+        page: int = 1,
+        page_size: int = 20,
+    ) -> AnnouncementListResponse:
+        del q, unit, date_from, date_to
         return AnnouncementListResponse(
             items=[],
-            page=int(kwargs.get("page", 1)),
-            page_size=int(kwargs.get("page_size", 20)),
+            page=page,
+            page_size=page_size,
             total=0,
         )
 
 
 class _UnavailableOperation:
     def run(self, source_names: list[str] | None = None) -> IngestionSummary | CrawlSummary:
+        raise AppError("service_unavailable", "管理服務尚未初始化。", status_code=503)
+
+
+class _UnavailableSiteMap:
+    def sync(self) -> SiteMapSyncResponse:
         raise AppError("service_unavailable", "管理服務尚未初始化。", status_code=503)
 
 
@@ -96,6 +112,7 @@ def create_app(
     announcement_service: Any | None = None,
     ingestion_service: Any | None = None,
     crawler_service: Any | None = None,
+    site_map_service: Any | None = None,
     refresh_scheduler: Any | None = None,
     rate_limiter: RateLimiter | None = None,
 ) -> FastAPI:
@@ -119,7 +136,10 @@ def create_app(
         announcement_service = announcement_service or defaults["announcement_service"]
         ingestion_service = ingestion_service or defaults["ingestion_service"]
         crawler_service = crawler_service or defaults["crawler_service"]
+        site_map_service = site_map_service or defaults["site_map_service"]
         refresh_scheduler = refresh_scheduler or defaults["refresh_scheduler"]
+    site_map_service = site_map_service or _UnavailableSiteMap()
+    assert site_map_service is not None
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -151,6 +171,11 @@ def create_app(
     announcement_service = announcement_service or _EmptyAnnouncements()
     ingestion_service = ingestion_service or _UnavailableOperation()
     crawler_service = crawler_service or _UnavailableOperation()
+    assert health_service is not None
+    assert chat_service is not None
+    assert announcement_service is not None
+    assert ingestion_service is not None
+    assert crawler_service is not None
 
     @app.middleware("http")
     async def request_id_middleware(request: Request, call_next: Any) -> Any:
@@ -296,6 +321,16 @@ def create_app(
     )
     def crawl_announcements(payload: CrawlRequest | None = None) -> CrawlSummary:
         return crawler_service.run(payload.source_names if payload else None)
+
+    @app.post(
+        "/v1/admin/site-map/sync",
+        response_model=SiteMapSyncResponse,
+        responses=_error_responses(401, 404, 429, 500, 503),
+        dependencies=[Depends(rate_limit("admin", 5)), Depends(require_admin)],
+    )
+    def sync_site_map() -> SiteMapSyncResponse:
+        summary = site_map_service.sync()
+        return SiteMapSyncResponse.model_validate(summary.__dict__)
 
     return app
 
