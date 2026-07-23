@@ -26,7 +26,11 @@ from nptu_assistant.crawlers.adapters.nptu_search import AnnouncementSearchResul
 from nptu_assistant.crawlers.config import SiteSearchConfig
 from nptu_assistant.crawlers.official_units import DocumentSearchScope
 from nptu_assistant.crawlers.site_discovery import SiteDiscovery
-from nptu_assistant.crawlers.site_map import SiteMapDiscoveryPolicy, SiteMapService
+from nptu_assistant.crawlers.site_map import (
+    SiteMapDiscoveryPolicy,
+    SiteMapQueryTimeout,
+    SiteMapService,
+)
 from nptu_assistant.crawlers.site_models import (
     CandidatePage,
     SearchDeadline,
@@ -431,10 +435,22 @@ class NptuSiteSearchService:
                         ),
                     },
                 )
+            except SiteMapQueryTimeout:
+                logger.warning(
+                    "site map candidate lookup exhausted its sub-budget; "
+                    "continue live discovery",
+                    extra={
+                        "site_map_statement_timed_out": True,
+                        "site_map_timeout_kind": "sub_budget",
+                    },
+                )
             except SearchDeadlineExceeded:
                 logger.warning(
-                    "site map candidate lookup timed out; continue live discovery",
-                    extra={"site_map_statement_timed_out": True},
+                    "shared search deadline expired during site map lookup",
+                    extra={
+                        "site_map_statement_timed_out": False,
+                        "site_map_timeout_kind": "shared_deadline",
+                    },
                 )
             except Exception:
                 logger.exception("site map candidate lookup 失敗")

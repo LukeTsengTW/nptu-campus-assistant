@@ -8,16 +8,29 @@ from time import perf_counter
 import uuid
 
 import pytest
-from sqlalchemy import create_engine, delete, event, func, inspect, select, text, update
+from sqlalchemy import (
+    create_engine,
+    delete,
+    event,
+    func,
+    inspect,
+    literal,
+    select,
+    text,
+    update,
+)
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.orm import Session, sessionmaker
 
 from nptu_assistant.crawlers.config import SiteSearchConfig
+from nptu_assistant.crawlers.crawl_policy import is_crawlable_url
 from nptu_assistant.crawlers.official_units import load_default_official_unit_directory
 from nptu_assistant.crawlers.site_map import (
     SiteDiscoverySource,
     SiteLinkType,
     SiteLinkUpsert,
     SiteMapService,
+    SiteMapQueryTimeout,
     SitePageType,
     SitePageUpsert,
 )
@@ -293,6 +306,123 @@ def test_candidate_lexical_relevance_uses_concepts_and_incoming_anchor() -> None
         engine.dispose()
 
 
+def test_candidate_title_fuzzy_match_expands_recall_without_containment() -> None:
+    factory, engine = make_factory()
+    token = uuid.uuid4().hex
+    prefix = f"https://www.nptu.edu.tw/p2-title-fuzzy-{token}"
+    try:
+        repository = SqlSiteMapRepository(factory)
+        repository.upsert_page(
+            SitePageUpsert(
+                canonical_url=f"{prefix}/aid",
+                title="住宿補助申請須知",
+                page_type=SitePageType.GENERAL_PAGE,
+                discovery_source=SiteDiscoverySource.INTERNAL_LINK,
+            )
+        )
+        candidates = repository.find_candidates(
+            SearchPlan(
+                query="住宿補助計畫",
+                search_queries=["低收入戶如何申請"],
+                concepts=["助學政策"],
+                limit=1,
+            ),
+            scope=None,
+            allowed_hosts=("nptu.edu.tw",),
+            limit=1,
+        )
+        assert candidates
+        assert candidates[0].title == "住宿補助申請須知"
+    finally:
+        cleanup(factory, prefix)
+        engine.dispose()
+
+
+def test_candidate_path_and_anchor_fuzzy_matches_expand_recall() -> None:
+    factory, engine = make_factory()
+    token = uuid.uuid4().hex
+    host = f"p2-fuzzy-{token}.nptu.edu.tw"
+    prefix = f"https://{host}/p2-fuzzy-fields-{token}"
+    try:
+        repository = SqlSiteMapRepository(factory)
+        source = SitePageUpsert(
+            canonical_url=f"{prefix}/source",
+            title="入口",
+            page_type=SitePageType.GENERAL_PAGE,
+            discovery_source=SiteDiscoverySource.INTERNAL_LINK,
+        )
+        target = SitePageUpsert(
+            canonical_url=f"{prefix}/student-aid-application-guide",
+            title="一般資訊頁面",
+            page_type=SitePageType.GENERAL_PAGE,
+            discovery_source=SiteDiscoverySource.INTERNAL_LINK,
+        )
+        repository.upsert_link(
+            source,
+            target,
+            anchor_text="低收入戶住宿補助申請辦法",
+            link_type=SiteLinkType.CONTENT,
+        )
+        candidates = repository.find_candidates(
+            SearchPlan(
+                query="student aid application",
+                search_queries=["student aid"],
+                concepts=["application guide"],
+                limit=2,
+            ),
+            scope=None,
+            allowed_hosts=(host,),
+            limit=2,
+        )
+        assert candidates
+        assert candidates[0].canonical_url == target.canonical_url
+
+        anchor_candidates = repository.find_candidates(
+            SearchPlan(
+                query="住宿補助期限",
+                search_queries=["補助申請"],
+                concepts=["學生福利"],
+                limit=2,
+            ),
+            scope=None,
+            allowed_hosts=(host,),
+            limit=2,
+        )
+        assert anchor_candidates
+        assert anchor_candidates[0].canonical_url == target.canonical_url
+    finally:
+        cleanup(factory, prefix)
+        engine.dispose()
+
+
+def test_non_crawlable_document_does_not_block_site_map_sufficiency() -> None:
+    factory, engine = make_factory()
+    token = uuid.uuid4().hex
+    prefix = f"https://www.nptu.edu.tw/p2-pdf-{token}"
+    try:
+        repository = SqlSiteMapRepository(factory)
+        repository.upsert_page(
+            SitePageUpsert(
+                canonical_url=f"{prefix}/rules.pdf",
+                title="學生請假辦法",
+                page_type=SitePageType.OFFICIAL_DOCUMENT,
+                discovery_source=SiteDiscoverySource.EXISTING_DOCUMENT,
+            )
+        )
+        candidates = repository.find_candidates(
+            SearchPlan.from_query("學生請假辦法", limit=1),
+            scope=None,
+            allowed_hosts=("nptu.edu.tw",),
+            limit=1,
+        )
+        assert candidates
+        assert candidates[0].is_crawlable is False
+        assert is_crawlable_url(candidates[0].canonical_url) is False
+    finally:
+        cleanup(factory, prefix)
+        engine.dispose()
+
+
 def test_expired_site_map_deadline_executes_no_sql() -> None:
     factory, engine = make_factory()
     statements: list[str] = []
@@ -356,9 +486,65 @@ def test_site_map_deadline_sets_transaction_local_statement_timeout() -> None:
             if "set_config" in statement
         ]
         assert len(timeout_calls) == 1
-        assert "12345ms" in repr(timeout_calls[0][1])
+        assert "750ms" in repr(timeout_calls[0][1])
     finally:
         event.remove(engine, "before_cursor_execute", capture_sql)
+        engine.dispose()
+
+
+def test_site_map_sub_budget_times_out_slow_postgres_sql_before_shared_deadline() -> (
+    None
+):
+    factory, engine = make_factory()
+    token = uuid.uuid4().hex
+    url = f"https://www.nptu.edu.tw/p2-slow-map-{token}"
+
+    class SlowRepository(SqlSiteMapRepository):
+        def build_candidate_query(
+            self,
+            plan: SearchPlan,
+            *,
+            scope: object,
+            allowed_hosts: Collection[str],
+            limit: int,
+            dialect_name: str = "postgresql",
+        ) -> object:
+            del plan, scope, allowed_hosts, limit, dialect_name
+            return select(
+                SitePage,
+                func.pg_sleep(1).label("lexical_relevance"),
+                literal(0).label("structural_score"),
+                literal(0).label("final_score"),
+                literal(0).label("anchor_relevance"),
+            ).where(SitePage.canonical_url == url)
+
+    try:
+        repository = SlowRepository(
+            factory,
+            site_map_query_budget_ratio=0.10,
+            site_map_query_min_seconds=0.05,
+            site_map_query_max_seconds=0.05,
+        )
+        repository.upsert_page(
+            SitePageUpsert(
+                canonical_url=url,
+                title="慢速測試頁",
+                page_type=SitePageType.GENERAL_PAGE,
+                discovery_source=SiteDiscoverySource.MANUAL,
+            )
+        )
+        deadline = SearchDeadline.after(5.0)
+        with pytest.raises(SiteMapQueryTimeout):
+            repository.find_candidates(
+                SearchPlan.from_query("慢速測試", limit=1),
+                scope=None,
+                allowed_hosts=("nptu.edu.tw",),
+                limit=1,
+                deadline=deadline,
+            )
+        assert not deadline.expired()
+    finally:
+        cleanup(factory, url)
         engine.dispose()
 
 
@@ -436,23 +622,56 @@ def test_candidate_lookup_benchmark_100_and_5000_pages() -> None:
         assert medium
 
         with factory() as session:
+            production_statement = repository.build_candidate_query(
+                plan,
+                scope=None,
+                allowed_hosts=("nptu.edu.tw",),
+                limit=5,
+                dialect_name="postgresql",
+            )
+            compiled = production_statement.compile(
+                dialect=postgresql.dialect(paramstyle="named"),
+                compile_kwargs={"render_postcompile": True},
+            )
+            # Keep the candidate statement identical to production while
+            # making the acceptance run expose whether the GIN trigram path is
+            # available even when the tiny fixture would favor a seq scan.
+            session.execute(text("SET LOCAL enable_seqscan = off"))
             explain_rows = session.execute(
                 text(
-                    "EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) "
-                    "SELECT id FROM site_pages "
-                    "WHERE title % CAST(:query AS text) "
-                    "OR path % CAST(:query AS text) "
-                    "LIMIT 5"
+                    "EXPLAIN (ANALYZE, BUFFERS, COSTS OFF, FORMAT JSON) "
+                    + compiled.string
                 ),
-                {"query": "宿舍冷氣費"},
+                compiled.params,
             ).scalars()
             explain = tuple(explain_rows)
         assert explain
+        explain_payload = explain[0][0]
+        plan_payload = explain_payload["Plan"]
+        plan_nodes: list[dict[str, object]] = []
+
+        def collect_plan_nodes(node: object) -> None:
+            if not isinstance(node, dict):
+                return
+            plan_nodes.append(node)
+            for child in node.get("Plans", []):
+                collect_plan_nodes(child)
+
+        collect_plan_nodes(plan_payload)
+        node_types = sorted(
+            {str(node["Node Type"]) for node in plan_nodes if "Node Type" in node}
+        )
+        index_names = sorted(
+            {str(node["Index Name"]) for node in plan_nodes if "Index Name" in node}
+        )
         print(
             "site_map_benchmark "
             f"small_pages=100 small_ms={small_ms:.2f} "
             f"medium_pages=5000 medium_links=20000 medium_ms={medium_ms:.2f} "
-            f"explain={explain[0]}"
+            f"planning_ms={explain_payload.get('Planning Time', 0):.3f} "
+            f"execution_ms={explain_payload.get('Execution Time', 0):.3f} "
+            f"returned_rows={plan_payload.get('Actual Rows', 0)} "
+            f"node_types={node_types} indexes={index_names}"
         )
     finally:
         cleanup(factory, prefix)

@@ -28,6 +28,7 @@ from sqlalchemy.dialects.postgresql import insert as postgres_insert
 from sqlalchemy.orm import Session, selectinload, sessionmaker
 
 from nptu_assistant.core.security import canonicalize_nptu_url, is_allowed_nptu_url
+from nptu_assistant.crawlers.crawl_policy import is_crawlable_url
 from nptu_assistant.crawlers.official_units import DocumentSearchScope
 from nptu_assistant.crawlers.site_map import (
     DISCOVERY_SOURCE_PRIORITY,
@@ -39,6 +40,7 @@ from nptu_assistant.crawlers.site_map import (
     SiteMapBatchWriteResult,
     SiteMapCandidate,
     SiteMapRepository,
+    SiteMapQueryTimeout,
     SiteMapSyncSummary,
     SiteMapWriteResult,
     SitePageType,
@@ -51,6 +53,16 @@ from nptu_assistant.crawlers.site_models import (
     SearchPlan,
 )
 from nptu_assistant.db.models import Announcement, Document, SiteLink, SitePage, Source
+
+
+TITLE_TRIGRAM_THRESHOLD = 0.18
+PATH_TRIGRAM_THRESHOLD = 0.22
+ANCHOR_TRIGRAM_THRESHOLD = 0.10
+PG_TRGM_PREFILTER_THRESHOLD = min(
+    TITLE_TRIGRAM_THRESHOLD,
+    PATH_TRIGRAM_THRESHOLD,
+    ANCHOR_TRIGRAM_THRESHOLD,
+)
 
 
 def _now() -> datetime:
@@ -98,9 +110,21 @@ class SqlSiteMapRepository(SiteMapRepository):
         factory: sessionmaker[Session],
         *,
         clock: Callable[[], datetime] = _now,
+        site_map_query_budget_ratio: float = 0.25,
+        site_map_query_min_seconds: float = 0.05,
+        site_map_query_max_seconds: float = 0.75,
     ) -> None:
+        if not 0 < site_map_query_budget_ratio <= 1:
+            raise ValueError("site map 查詢 budget ratio 必須介於 0 與 1 之間")
+        if site_map_query_min_seconds <= 0:
+            raise ValueError("site map 查詢最小時間必須大於零")
+        if site_map_query_max_seconds < site_map_query_min_seconds:
+            raise ValueError("site map 查詢最大時間不得小於最小時間")
         self._factory = factory
         self._clock = clock
+        self._site_map_query_budget_ratio = site_map_query_budget_ratio
+        self._site_map_query_min_seconds = site_map_query_min_seconds
+        self._site_map_query_max_seconds = site_map_query_max_seconds
 
     def upsert_page(self, page: SitePageUpsert) -> SiteMapWriteResult:
         now = self._clock()
@@ -274,6 +298,93 @@ class SqlSiteMapRepository(SiteMapRepository):
             return ()
         if deadline is not None:
             deadline.raise_if_expired()
+        with self._factory.begin() as session:
+            is_postgresql = (
+                session.bind is not None and session.bind.dialect.name == "postgresql"
+            )
+            if is_postgresql:
+                config_sql = (
+                    "SELECT set_config('pg_trgm.similarity_threshold', "
+                    ":trigram_threshold, true)"
+                )
+                config_parameters: dict[str, object] = {
+                    "trigram_threshold": str(PG_TRGM_PREFILTER_THRESHOLD)
+                }
+                if deadline is not None:
+                    budget_seconds = self._site_map_budget_seconds(deadline)
+                    timeout_ms = max(1, math.ceil(budget_seconds * 1000))
+                    config_sql = (
+                        "SELECT set_config('statement_timeout', :timeout, true), "
+                        "set_config('pg_trgm.similarity_threshold', "
+                        ":trigram_threshold, true)"
+                    )
+                    config_parameters["timeout"] = f"{timeout_ms}ms"
+                    deadline.raise_if_expired()
+                session.execute(
+                    text(config_sql),
+                    config_parameters,
+                )
+                if deadline is not None:
+                    deadline.raise_if_expired()
+            query = self.build_candidate_query(
+                plan,
+                scope=scope,
+                allowed_hosts=allowed_hosts,
+                limit=limit,
+                dialect_name="postgresql" if is_postgresql else "sqlite",
+            )
+            try:
+                rows = session.execute(query).all()
+            except Exception as exc:
+                error_text = str(exc).casefold()
+                if deadline is not None and deadline.expired():
+                    raise SearchDeadlineExceeded(
+                        "共同搜尋 deadline 已在 site map SQL 期間耗盡"
+                    ) from exc
+                if is_postgresql and any(
+                    marker in error_text
+                    for marker in ("statement timeout", "canceling statement")
+                ):
+                    raise SiteMapQueryTimeout(
+                        "site map candidate SQL 子預算已逾時"
+                    ) from exc
+                raise
+            if deadline is not None:
+                deadline.raise_if_expired()
+        return tuple(
+            SiteMapCandidate(
+                canonical_url=row[0].canonical_url,
+                title=row[0].title,
+                host=row[0].host,
+                unit=row[0].unit,
+                page_type=_page_type(row[0].page_type),
+                crawl_priority=row[0].crawl_priority,
+                minimum_depth=row[0].minimum_depth,
+                failure_count=row[0].failure_count,
+                lexical_relevance=float(row[1] or 0.0),
+                structural_score=float(row[2] or 0.0),
+                final_score=float(row[3] or 0.0),
+                is_crawlable=is_crawlable_url(row[0].canonical_url),
+            )
+            for row in rows
+        )
+
+    def build_candidate_query(
+        self,
+        plan: SearchPlan,
+        *,
+        scope: DocumentSearchScope | None,
+        allowed_hosts: Collection[str],
+        limit: int,
+        dialect_name: str = "postgresql",
+    ) -> Any:
+        """Build the exact candidate statement used by ``find_candidates``.
+
+        Keeping this statement construction reusable lets PostgreSQL acceptance
+        tests run EXPLAIN on the production query shape instead of a simplified
+        surrogate.
+        """
+
         unit_match = (
             SitePage.unit == scope.canonical_unit
             if scope is not None and scope.canonical_unit
@@ -287,7 +398,9 @@ class SqlSiteMapRepository(SiteMapRepository):
         intent = " ".join(
             (plan.query, *plan.retrieval_queries[1:3], *plan.concepts)
         ).casefold()
-        announcement_intent = any(token in intent for token in ("公告", "通知", "訊息"))
+        announcement_intent = any(
+            token in intent for token in ("公告", "通知", "訊息", "最新消息")
+        )
         document_intent = any(
             token in intent for token in ("文件", "辦法", "表單", "規章", "申請表")
         )
@@ -324,115 +437,87 @@ class SqlSiteMapRepository(SiteMapRepository):
             else_=0.0,
         )
         query_terms = self._query_terms(plan)
-        with self._factory.begin() as session:
-            if deadline is not None:
-                timeout_ms = max(1, math.ceil(deadline.remaining_seconds() * 1000))
-                session.execute(
-                    text("SELECT set_config('statement_timeout', :timeout, true)"),
-                    {"timeout": f"{timeout_ms}ms"},
-                )
-                deadline.raise_if_expired()
-            if session.bind is not None and session.bind.dialect.name == "postgresql":
-                lexical_relevance, anchor_relevance, lexical_match = (
-                    self._postgres_lexical_expressions(query_terms)
-                )
-            else:
-                lexical_relevance, anchor_relevance, lexical_match = (
-                    self._fallback_lexical_expressions(query_terms)
-                )
-            structural_score = func.greatest(
-                literal(0.0),
-                func.least(
-                    literal(1.0),
-                    case((unit_match, 0.35), else_=0.0)
-                    + case((preferred_match, 0.25), else_=0.0)
-                    + case(
-                        (
-                            and_(
-                                literal(scope is not None and bool(scope.homepage_url)),
-                                SitePage.canonical_url
-                                == (scope.homepage_url if scope else ""),
-                            ),
-                            0.25,
-                        ),
-                        else_=0.0,
-                    )
-                    + page_type_score
-                    + func.least(SitePage.crawl_priority, 100) / 1_000.0
-                    + case(
-                        (SitePage.last_successful_crawl_at.is_not(None), 0.05),
-                        else_=0.0,
-                    )
-                    - func.least(SitePage.failure_count, 5) * 0.04,
-                ),
+        if dialect_name == "postgresql":
+            lexical_relevance, anchor_relevance, lexical_match = (
+                self._postgres_lexical_expressions(query_terms)
             )
-            final_score = lexical_relevance * 0.75 + structural_score * 0.25
-            query = (
-                select(
-                    SitePage,
-                    lexical_relevance.label("lexical_relevance"),
-                    structural_score.label("structural_score"),
-                    final_score.label("final_score"),
-                    anchor_relevance.label("anchor_relevance"),
+        else:
+            lexical_relevance, anchor_relevance, lexical_match = (
+                self._fallback_lexical_expressions(query_terms)
+            )
+        structural_score = func.greatest(
+            literal(0.0),
+            func.least(
+                literal(1.0),
+                case((unit_match, 0.35), else_=0.0)
+                + case((preferred_match, 0.25), else_=0.0)
+                + case(
+                    (
+                        and_(
+                            literal(scope is not None and bool(scope.homepage_url)),
+                            SitePage.canonical_url
+                            == (scope.homepage_url if scope else ""),
+                        ),
+                        0.25,
+                    ),
+                    else_=0.0,
                 )
-                .where(
-                    SitePage.is_active.is_(True),
-                    SitePage.is_indexable.is_(True),
-                    SitePage.crawl_status.not_in(
+                + page_type_score
+                + func.least(SitePage.crawl_priority, 100) / 1_000.0
+                + case(
+                    (SitePage.last_successful_crawl_at.is_not(None), 0.05),
+                    else_=0.0,
+                )
+                - func.least(SitePage.failure_count, 5) * 0.04,
+            ),
+        )
+        final_score = lexical_relevance * 0.75 + structural_score * 0.25
+        return (
+            select(
+                SitePage,
+                lexical_relevance.label("lexical_relevance"),
+                structural_score.label("structural_score"),
+                final_score.label("final_score"),
+                anchor_relevance.label("anchor_relevance"),
+            )
+            .where(
+                SitePage.is_active.is_(True),
+                SitePage.is_indexable.is_(True),
+                SitePage.crawl_status.not_in(
+                    [
+                        SiteCrawlStatus.BLOCKED.value,
+                        SiteCrawlStatus.EXCLUDED.value,
+                    ]
+                ),
+                _host_scope(allowed_hosts),
+                or_(
+                    lexical_match,
+                    SitePage.page_type.in_(
                         [
-                            SiteCrawlStatus.BLOCKED.value,
-                            SiteCrawlStatus.EXCLUDED.value,
+                            SitePageType.UNIT_HOMEPAGE.value,
+                            SitePageType.ANNOUNCEMENT_LISTING.value,
                         ]
                     ),
-                    _host_scope(allowed_hosts),
-                    or_(
-                        lexical_match,
-                        SitePage.page_type.in_(
-                            [
-                                SitePageType.UNIT_HOMEPAGE.value,
-                                SitePageType.ANNOUNCEMENT_LISTING.value,
-                            ]
-                        ),
-                    ),
-                )
-                .order_by(
-                    final_score.desc(),
-                    lexical_relevance.desc(),
-                    structural_score.desc(),
-                    SitePage.minimum_depth.asc(),
-                    SitePage.failure_count.asc(),
-                    SitePage.last_successful_crawl_at.desc().nulls_last(),
-                )
-                .limit(limit)
+                ),
             )
-            try:
-                rows = session.execute(query).all()
-            except Exception as exc:
-                if deadline is not None and (
-                    deadline.expired() or "statement timeout" in str(exc).casefold()
-                ):
-                    raise SearchDeadlineExceeded(
-                        "site map candidate SQL 已逾時"
-                    ) from exc
-                raise
-            if deadline is not None:
-                deadline.raise_if_expired()
-        return tuple(
-            SiteMapCandidate(
-                canonical_url=row[0].canonical_url,
-                title=row[0].title,
-                host=row[0].host,
-                unit=row[0].unit,
-                page_type=_page_type(row[0].page_type),
-                crawl_priority=row[0].crawl_priority,
-                minimum_depth=row[0].minimum_depth,
-                failure_count=row[0].failure_count,
-                lexical_relevance=float(row[1] or 0.0),
-                structural_score=float(row[2] or 0.0),
-                final_score=float(row[3] or 0.0),
+            .order_by(
+                final_score.desc(),
+                lexical_relevance.desc(),
+                structural_score.desc(),
+                SitePage.minimum_depth.asc(),
+                SitePage.failure_count.asc(),
+                SitePage.last_successful_crawl_at.desc().nulls_last(),
             )
-            for row in rows
+            .limit(limit)
         )
+
+    def _site_map_budget_seconds(self, deadline: SearchDeadline) -> float:
+        remaining = deadline.remaining_seconds()
+        bounded = min(
+            self._site_map_query_max_seconds,
+            remaining * self._site_map_query_budget_ratio,
+        )
+        return min(remaining, max(self._site_map_query_min_seconds, bounded))
 
     @staticmethod
     def _query_terms(plan: SearchPlan) -> tuple[tuple[str, float], ...]:
@@ -511,6 +596,46 @@ class SqlSiteMapRepository(SiteMapRepository):
             )
             .exists()
         )
+        title_fuzzy_match = or_(
+            *(
+                and_(
+                    SitePage.title.op("%")(term),
+                    func.similarity(func.coalesce(SitePage.title, ""), term)
+                    >= TITLE_TRIGRAM_THRESHOLD,
+                )
+                for term in contains_terms
+            )
+        )
+        path_fuzzy_match = or_(
+            *(
+                and_(
+                    SitePage.path.op("%")(term),
+                    func.similarity(func.coalesce(SitePage.path, ""), term)
+                    >= PATH_TRIGRAM_THRESHOLD,
+                )
+                for term in contains_terms
+            )
+        )
+        anchor_fuzzy_match = (
+            select(SiteLink.id)
+            .where(
+                SiteLink.target_page_id == SitePage.id,
+                or_(
+                    *(
+                        and_(
+                            SiteLink.anchor_text.op("%")(term),
+                            func.similarity(SiteLink.anchor_text, term)
+                            >= ANCHOR_TRIGRAM_THRESHOLD,
+                        )
+                        for term in contains_terms
+                    )
+                ),
+            )
+            .exists()
+        )
+        unit_contains = or_(
+            *(SitePage.unit.ilike(f"%{term}%") for term in contains_terms)
+        )
         lexical = func.least(
             literal(1.0),
             func.greatest(
@@ -520,7 +645,9 @@ class SqlSiteMapRepository(SiteMapRepository):
             )
             * 0.65
             + case((title_contains, 0.28), else_=0.0)
-            + case((path_contains, 0.12), else_=0.0),
+            + case((path_contains, 0.12), else_=0.0)
+            + case((anchor_match, 0.10), else_=0.0)
+            + case((unit_contains, 0.12), else_=0.0),
         )
         return (
             lexical,
@@ -529,6 +656,10 @@ class SqlSiteMapRepository(SiteMapRepository):
                 title_contains,
                 path_contains,
                 anchor_match,
+                title_fuzzy_match,
+                path_fuzzy_match,
+                anchor_fuzzy_match,
+                unit_contains,
             ),
         )
 

@@ -14,44 +14,11 @@ from nptu_assistant.core.security import (
     is_allowed_source_url,
 )
 from nptu_assistant.crawlers.parsing import parse_published_at
+from nptu_assistant.crawlers.crawl_policy import is_crawlable_url
 from nptu_assistant.ingestion.cleaning import extract_clean_html, normalize_text
 
 
 _DATE_PATTERN = re.compile(r"(?:\d{3,4})[年\-/\.]\d{1,2}[月\-/\.]\d{1,2}日?")
-_RESOURCE_SUFFIXES = frozenset(
-    {
-        ".7z",
-        ".avi",
-        ".css",
-        ".csv",
-        ".doc",
-        ".docx",
-        ".gif",
-        ".gz",
-        ".ico",
-        ".jpeg",
-        ".jpg",
-        ".js",
-        ".mov",
-        ".mp3",
-        ".mp4",
-        ".pdf",
-        ".png",
-        ".ppt",
-        ".pptx",
-        ".rar",
-        ".svg",
-        ".tar",
-        ".tif",
-        ".tiff",
-        ".txt",
-        ".webp",
-        ".xls",
-        ".xlsx",
-        ".xml",
-        ".zip",
-    }
-)
 _MAX_PAGE_TEXT = 20_000
 
 
@@ -369,13 +336,20 @@ class NptuSitePageAdapter:
             target = urljoin(page_url, raw_href)
             if not is_allowed_nptu_url(target):
                 continue
-            if not is_allowed_source_url(
-                target, allowed_hosts
-            ) or not cls.is_crawlable_url(target):
+            target_parts = urlsplit(target)
+            if (
+                target_parts.fragment
+                and not target_parts.path
+                and not target_parts.query
+            ):
                 continue
             try:
                 canonical_url = canonicalize_nptu_url(target)
             except ValueError:
+                continue
+            if not is_allowed_source_url(
+                canonical_url, allowed_hosts
+            ) or not cls.is_crawlable_url(canonical_url):
                 continue
             if canonical_url not in labels:
                 links.append(canonical_url)
@@ -397,5 +371,4 @@ class NptuSitePageAdapter:
 
     @staticmethod
     def is_crawlable_url(url: str) -> bool:
-        path = urlsplit(url).path.lower()
-        return not any(path.endswith(suffix) for suffix in _RESOURCE_SUFFIXES)
+        return is_crawlable_url(url)

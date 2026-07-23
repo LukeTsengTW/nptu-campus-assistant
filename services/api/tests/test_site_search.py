@@ -45,6 +45,14 @@ def site_config(**overrides: object) -> SiteSearchConfig:
     return SiteSearchConfig.model_validate(values)
 
 
+def test_site_map_budget_defaults_are_bounded_and_validated() -> None:
+    config = site_config()
+    assert config.site_map_query_budget_ratio == 0.25
+    assert config.site_map_query_min_seconds < config.site_map_query_max_seconds
+    with pytest.raises(ValueError, match="site map 查詢最小時間"):
+        site_config(site_map_query_min_seconds=1.0, site_map_query_max_seconds=0.5)
+
+
 def test_project_site_search_is_enabled_and_root_scoped() -> None:
     config = load_keyword_search_config(
         WORKSPACE_ROOT / "data/sources/announcements.yaml"

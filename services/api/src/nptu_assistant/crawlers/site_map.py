@@ -12,6 +12,7 @@ from nptu_assistant.core.security import (
     is_allowed_nptu_url,
     is_allowed_source_url,
 )
+from nptu_assistant.crawlers.crawl_policy import DOCUMENT_RESOURCE_SUFFIXES
 from nptu_assistant.crawlers.adapters.nptu_site import (
     NptuSitePage,
     UnitAnnouncementPageRole,
@@ -21,7 +22,11 @@ from nptu_assistant.crawlers.official_units import (
     DocumentSearchScope,
     OfficialUnitDirectory,
 )
-from nptu_assistant.crawlers.site_models import SearchDeadline, SearchPlan
+from nptu_assistant.crawlers.site_models import (
+    SearchDeadline,
+    SearchDeadlineExceeded,
+    SearchPlan,
+)
 
 
 class SitePageType(StrEnum):
@@ -62,6 +67,15 @@ class SiteLinkType(StrEnum):
     ANNOUNCEMENT = "announcement"
     DOCUMENT = "document"
     UNKNOWN = "unknown"
+
+
+NPTU_CANONICAL_HOMEPAGE_URL = "https://www.nptu.edu.tw/"
+NPTU_ROOT_UNIT = "國立屏東大學"
+NPTU_ROOT_ALIASES = (NPTU_ROOT_UNIT, "屏東大學", "屏大", "nptu")
+
+
+class SiteMapQueryTimeout(SearchDeadlineExceeded):
+    """Site-map SQL exhausted its bounded sub-budget."""
 
 
 PAGE_TYPE_PRIORITY: Mapping[SitePageType, int] = {
@@ -246,7 +260,7 @@ def classify_link_type(anchor_text: str, target_url: str) -> SiteLinkType:
     path = urlsplit(target_url).path.casefold()
     if any(token in normalized_anchor for token in ("公告", "通知", "訊息")):
         return SiteLinkType.ANNOUNCEMENT
-    if path.endswith((".pdf", ".doc", ".docx", ".xls", ".xlsx", ".odt")):
+    if any(path.endswith(suffix) for suffix in DOCUMENT_RESOURCE_SUFFIXES):
         return SiteLinkType.DOCUMENT
     if anchor_text.strip():
         return SiteLinkType.CONTENT
@@ -306,7 +320,13 @@ class SiteMapDiscoveryPolicy:
         )
         homepage_intent = any(token in intent for token in ("首頁", "主頁", "home"))
         if candidate.page_type is SitePageType.UNIT_HOMEPAGE:
-            return homepage_intent or scope is not None
+            if scope is not None:
+                return True
+            if candidate.canonical_url != NPTU_CANONICAL_HOMEPAGE_URL:
+                return False
+            return homepage_intent or any(
+                alias.casefold() in intent for alias in NPTU_ROOT_ALIASES
+            )
         if candidate.page_type is SitePageType.ANNOUNCEMENT_LISTING:
             return announcement_intent or scope is not None
         if candidate.page_type is SitePageType.OFFICIAL_DOCUMENT:

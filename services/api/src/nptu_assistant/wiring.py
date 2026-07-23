@@ -105,10 +105,21 @@ def build_services(settings: Settings) -> dict[str, object]:
         )
     else:
         llm = None
+    site_config = keyword_search_config.site_search
     document_repository = SqlDocumentRepository(factory)
     announcement_repository = SqlAnnouncementRepository(factory)
-    site_map_repository = SqlSiteMapRepository(factory)
-    site_config = keyword_search_config.site_search
+    site_map_repository = SqlSiteMapRepository(
+        factory,
+        site_map_query_budget_ratio=(
+            site_config.site_map_query_budget_ratio if site_config else 0.25
+        ),
+        site_map_query_min_seconds=(
+            site_config.site_map_query_min_seconds if site_config else 0.05
+        ),
+        site_map_query_max_seconds=(
+            site_config.site_map_query_max_seconds if site_config else 0.75
+        ),
+    )
     site_map_service = SiteMapService(
         site_map_repository,
         official_units=official_units,

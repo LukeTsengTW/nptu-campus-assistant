@@ -8,6 +8,7 @@ from nptu_assistant.crawlers.adapters.nptu_site import (
     UnitAnnouncementPageRole,
 )
 from nptu_assistant.crawlers.config import SiteSearchConfig
+from nptu_assistant.crawlers.crawl_policy import is_crawlable_url
 from nptu_assistant.crawlers.official_units import (
     DocumentSearchScope,
     load_default_official_unit_directory,
@@ -379,6 +380,36 @@ def test_global_homepage_intent_can_skip_for_exact_official_homepage() -> None:
     )
     plan = SearchPlan.from_query("屏東大學首頁", limit=1)
     assert service.has_sufficient_candidates(plan, (homepage,), scope=None, minimum=1)
+
+
+def test_global_homepage_intent_does_not_accept_department_homepage() -> None:
+    service = make_service(MemorySiteMapRepository())
+    department_homepage = candidate(
+        "https://csie.nptu.edu.tw/",
+        title="資訊工程學系首頁",
+        unit="資訊工程學系",
+        page_type=SitePageType.UNIT_HOMEPAGE,
+        lexical=0.80,
+        structural=0.95,
+    )
+    plan = SearchPlan.from_query("屏東大學首頁", limit=1)
+    assert not service.has_sufficient_candidates(
+        plan, (department_homepage,), scope=None, minimum=1
+    )
+
+
+def test_crawlability_policy_rejects_non_html_resources_and_non_http_urls() -> None:
+    assert is_crawlable_url("https://www.nptu.edu.tw/index.html")
+    for url in (
+        "https://www.nptu.edu.tw/notice.pdf",
+        "https://www.nptu.edu.tw/form.docx",
+        "https://www.nptu.edu.tw/archive.zip",
+        "https://www.nptu.edu.tw/logo.jpg",
+        "javascript:void(0)",
+        "mailto:info@nptu.edu.tw",
+        "https://www.nptu.edu.tw/page#section",
+    ):
+        assert not is_crawlable_url(url)
 
 
 def test_anchor_and_concept_relevance_is_distinct_from_structure() -> None:

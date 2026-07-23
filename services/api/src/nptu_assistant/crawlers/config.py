@@ -192,6 +192,9 @@ class SiteSearchConfig(BaseModel):
     max_pages_per_host: int = Field(default=30, ge=1, le=200)
     request_timeout_seconds: float = Field(default=15.0, ge=1.0, le=60.0)
     query_timeout_seconds: float = Field(default=25.0, ge=1.0, le=120.0)
+    site_map_query_budget_ratio: float = Field(default=0.25, ge=0.05, le=0.80)
+    site_map_query_min_seconds: float = Field(default=0.05, ge=0.01, le=5.0)
+    site_map_query_max_seconds: float = Field(default=0.75, ge=0.05, le=10.0)
     max_response_bytes: int = Field(
         default=2 * 1024 * 1024, ge=1024, le=8 * 1024 * 1024
     )
@@ -232,6 +235,8 @@ class SiteSearchConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_scope(self) -> "SiteSearchConfig":
+        if self.site_map_query_min_seconds > self.site_map_query_max_seconds:
+            raise ValueError("site map 查詢最小時間不得大於最大時間")
         if not self.enabled:
             return self
         if not self.seed_urls:
