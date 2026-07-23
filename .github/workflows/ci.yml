@@ -60,7 +60,7 @@ jobs:
           uv run --project services/api nptu-assistant seed
 
       - name: Backend and PostgreSQL integration tests
-        run: uv run --project services/api pytest
+        run: uv run --project services/api pytest --import-mode=importlib
 
       - name: Verify generated API contracts
         run: |
