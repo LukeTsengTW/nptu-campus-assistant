@@ -713,14 +713,14 @@ def test_postgres_large_traditional_search_plan_writes_and_reads_l2_cache() -> N
     cache_key = first._cache_key(
         search_plan,
         limit=20,
-        use_discovery=True,
+        use_discovery=False,
         scope=scope,
     )
     canonical_json = json.dumps(
         first._cache_payload(
             search_plan,
             limit=20,
-            use_discovery=True,
+            use_discovery=False,
             scope=scope,
         ),
         ensure_ascii=False,
@@ -729,7 +729,7 @@ def test_postgres_large_traditional_search_plan_writes_and_reads_l2_cache() -> N
     )
 
     try:
-        first_result = first.search(search_plan, scope=scope)
+        first_result = first.search(search_plan, scope=scope, use_discovery=False)
         assert len(canonical_json.encode("utf-8")) > 4_096
         assert len(cache_key) == 64
         assert len(cache_key.encode("ascii")) == 64

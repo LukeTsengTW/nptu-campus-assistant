@@ -249,7 +249,7 @@ class NptuSiteSearchService:
         )
         if search_plan.limit != limit:
             search_plan = search_plan.model_copy(update={"limit": limit})
-        effective_discovery = scope is None if use_discovery is None else use_discovery
+        effective_discovery = True if use_discovery is None else use_discovery
         cache_key = self._cache_key(
             search_plan,
             limit=limit,
