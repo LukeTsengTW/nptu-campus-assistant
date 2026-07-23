@@ -85,7 +85,9 @@ class SqlSiteMapRepository(SiteMapRepository):
                 select(SitePage.id).where(SitePage.canonical_url == page.canonical_url)
             )
             self._upsert_page_in_session(session, page, now=now)
-            return SiteMapWriteResult(created=existing is None, updated=existing is not None)
+            return SiteMapWriteResult(
+                created=existing is None, updated=existing is not None
+            )
 
     def upsert_link(
         self,
@@ -166,7 +168,9 @@ class SqlSiteMapRepository(SiteMapRepository):
                         if link.link_type == SiteLinkType.UNKNOWN.value:
                             link.link_type = link_type.value
                         link.last_discovered_at = now
-            return SiteMapWriteResult(created=existing is None, updated=existing is not None)
+            return SiteMapWriteResult(
+                created=existing is None, updated=existing is not None
+            )
 
     def record_crawl_success(
         self,
@@ -272,11 +276,31 @@ class SqlSiteMapRepository(SiteMapRepository):
         )
         intent = " ".join((plan.query, *plan.concepts)).casefold()
         announcement_intent = any(token in intent for token in ("公告", "通知", "訊息"))
-        document_intent = any(token in intent for token in ("文件", "辦法", "表單", "規章"))
+        document_intent = any(
+            token in intent for token in ("文件", "辦法", "表單", "規章")
+        )
         page_type_score = case(
-            (and_(literal(announcement_intent), SitePage.page_type == SitePageType.ANNOUNCEMENT_LISTING.value), 0.34),
-            (and_(literal(announcement_intent), SitePage.page_type == SitePageType.ANNOUNCEMENT_DETAIL.value), 0.28),
-            (and_(literal(document_intent), SitePage.page_type == SitePageType.OFFICIAL_DOCUMENT.value), 0.34),
+            (
+                and_(
+                    literal(announcement_intent),
+                    SitePage.page_type == SitePageType.ANNOUNCEMENT_LISTING.value,
+                ),
+                0.34,
+            ),
+            (
+                and_(
+                    literal(announcement_intent),
+                    SitePage.page_type == SitePageType.ANNOUNCEMENT_DETAIL.value,
+                ),
+                0.28,
+            ),
+            (
+                and_(
+                    literal(document_intent),
+                    SitePage.page_type == SitePageType.OFFICIAL_DOCUMENT.value,
+                ),
+                0.34,
+            ),
             (SitePage.page_type == SitePageType.UNIT_HOMEPAGE.value, 0.24),
             else_=0.0,
         )
@@ -499,7 +523,8 @@ class SqlSiteMapRepository(SiteMapRepository):
                             or_(
                                 SitePage.page_type == SitePageType.UNKNOWN.value,
                                 and_(
-                                    SitePage.page_type == SitePageType.GENERAL_PAGE.value,
+                                    SitePage.page_type
+                                    == SitePageType.GENERAL_PAGE.value,
                                     _is_specific_page_type(excluded.page_type),
                                 ),
                             ),
@@ -508,7 +533,10 @@ class SqlSiteMapRepository(SiteMapRepository):
                         else_=SitePage.page_type,
                     ),
                     "discovery_source": case(
-                        (incoming_source_rank > existing_source_rank, excluded.discovery_source),
+                        (
+                            incoming_source_rank > existing_source_rank,
+                            excluded.discovery_source,
+                        ),
                         else_=SitePage.discovery_source,
                     ),
                     "last_discovered_at": func.greatest(
@@ -540,7 +568,8 @@ class SqlSiteMapRepository(SiteMapRepository):
             session.add(SitePage(**values))
             return
         if not existing.title or (
-            existing.crawl_status not in {
+            existing.crawl_status
+            not in {
                 SiteCrawlStatus.SUCCESS.value,
                 SiteCrawlStatus.UNCHANGED.value,
             }
@@ -552,7 +581,8 @@ class SqlSiteMapRepository(SiteMapRepository):
         existing.content_hash = existing.content_hash or page.content_hash
         if existing.page_type == SitePageType.UNKNOWN.value or (
             existing.page_type == SitePageType.GENERAL_PAGE.value
-            and page.page_type in {
+            and page.page_type
+            in {
                 SitePageType.UNIT_HOMEPAGE,
                 SitePageType.ANNOUNCEMENT_LISTING,
                 SitePageType.ANNOUNCEMENT_DETAIL,

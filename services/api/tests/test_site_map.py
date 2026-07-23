@@ -129,7 +129,9 @@ class DeterministicScorer:
         del plan, candidate
         return 1.0
 
-    def score_pages(self, plan: SearchPlan, candidates: object, pages: object, **kwargs: object) -> list[float]:
+    def score_pages(
+        self, plan: SearchPlan, candidates: object, pages: object, **kwargs: object
+    ) -> list[float]:
         del plan, candidates, kwargs
         return [1.0 for _page in pages]  # type: ignore[union-attr]
 
@@ -157,8 +159,14 @@ def test_page_and_link_classification_is_centralized() -> None:
         role=UnitAnnouncementPageRole.LISTING,
     )
     assert classify_page_type(listing) is SitePageType.ANNOUNCEMENT_LISTING
-    assert classify_link_type("最新公告", "https://www.nptu.edu.tw/a") is SiteLinkType.ANNOUNCEMENT
-    assert classify_link_type("下載辦法", "https://www.nptu.edu.tw/a.pdf") is SiteLinkType.DOCUMENT
+    assert (
+        classify_link_type("最新公告", "https://www.nptu.edu.tw/a")
+        is SiteLinkType.ANNOUNCEMENT
+    )
+    assert (
+        classify_link_type("下載辦法", "https://www.nptu.edu.tw/a.pdf")
+        is SiteLinkType.DOCUMENT
+    )
 
 
 def test_fetched_page_persists_internal_links_and_rejects_external_urls() -> None:

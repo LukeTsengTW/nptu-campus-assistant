@@ -19,7 +19,11 @@ from nptu_assistant.crawlers.site_map import (
     SitePageType,
     SitePageUpsert,
 )
-from nptu_assistant.crawlers.site_models import DiscoveredPage, SearchDeadline, SearchPlan
+from nptu_assistant.crawlers.site_models import (
+    DiscoveredPage,
+    SearchDeadline,
+    SearchPlan,
+)
 from nptu_assistant.crawlers.site_search import NptuSiteSearchService
 from nptu_assistant.crawlers.site_search_cache import InMemorySiteSearchCache
 from nptu_assistant.db.models import Announcement, Document, SiteLink, SitePage, Source
@@ -46,7 +50,9 @@ def cleanup(factory: sessionmaker[Session], prefix: str) -> None:
             delete(Document).where(Document.canonical_url.like(f"{prefix}%"))
         )
         session.execute(delete(Source).where(Source.name.like(f"{prefix}%")))
-        session.execute(delete(SitePage).where(SitePage.canonical_url.like(f"{prefix}%")))
+        session.execute(
+            delete(SitePage).where(SitePage.canonical_url.like(f"{prefix}%"))
+        )
 
 
 def test_site_map_schema_has_constraints_and_indexes() -> None:
@@ -69,9 +75,7 @@ def test_site_map_schema_has_constraints_and_indexes() -> None:
         foreign_keys = database_inspector.get_foreign_keys("site_links")
         assert {item["referred_table"] for item in foreign_keys} == {"site_pages"}
         uniques = database_inspector.get_unique_constraints("site_links")
-        assert any(
-            item["name"] == "uq_site_links_source_target" for item in uniques
-        )
+        assert any(item["name"] == "uq_site_links_source_target" for item in uniques)
     finally:
         engine.dispose()
 
@@ -110,11 +114,20 @@ def test_concurrent_page_and_link_upsert_is_idempotent() -> None:
         with factory() as session:
             assert (
                 session.scalar(
-                    select(SitePage.id).where(SitePage.canonical_url == source.canonical_url)
+                    select(SitePage.id).where(
+                        SitePage.canonical_url == source.canonical_url
+                    )
                 )
                 is not None
             )
-            assert session.scalar(select(SitePage.id).where(SitePage.canonical_url == target.canonical_url)) is not None
+            assert (
+                session.scalar(
+                    select(SitePage.id).where(
+                        SitePage.canonical_url == target.canonical_url
+                    )
+                )
+                is not None
+            )
             assert session.scalar(select(SiteLink.id)) is not None
             assert session.scalar(select(func.count()).select_from(SiteLink)) == 1
     finally:
@@ -166,7 +179,9 @@ class DeterministicScorer:
         del plan, candidate
         return 1.0
 
-    def score_pages(self, plan: SearchPlan, candidates: object, pages: object, **kwargs: object) -> list[float]:
+    def score_pages(
+        self, plan: SearchPlan, candidates: object, pages: object, **kwargs: object
+    ) -> list[float]:
         del plan, candidates, kwargs
         return [1.0 for _page in pages]  # type: ignore[union-attr]
 
@@ -240,7 +255,9 @@ def test_second_service_instance_uses_persisted_map_before_discovery() -> None:
         assert second_result.pages
         assert second_discovery.calls == 0
         assert second_http.calls == 1
-        assert second_result.pages[0].canonical_url == first_result.pages[0].canonical_url
+        assert (
+            second_result.pages[0].canonical_url == first_result.pages[0].canonical_url
+        )
     finally:
         cleanup(factory, prefix)
         engine.dispose()
@@ -262,7 +279,9 @@ def test_crawl_state_tracks_hash_changes_and_failure_recovery() -> None:
             last_modified="Wed, 01 Jan 2026 00:00:00 GMT",
         )
         with factory() as session:
-            first = session.scalar(select(SitePage).where(SitePage.canonical_url == url))
+            first = session.scalar(
+                select(SitePage).where(SitePage.canonical_url == url)
+            )
             assert first is not None
             first_changed_at = first.last_changed_at
             assert first.crawl_status == "success"
@@ -275,7 +294,9 @@ def test_crawl_state_tracks_hash_changes_and_failure_recovery() -> None:
             http_status=200,
         )
         with factory() as session:
-            unchanged = session.scalar(select(SitePage).where(SitePage.canonical_url == url))
+            unchanged = session.scalar(
+                select(SitePage).where(SitePage.canonical_url == url)
+            )
             assert unchanged is not None
             assert unchanged.crawl_status == "unchanged"
             assert unchanged.last_changed_at == first_changed_at
@@ -287,7 +308,9 @@ def test_crawl_state_tracks_hash_changes_and_failure_recovery() -> None:
             http_status=200,
         )
         with factory() as session:
-            recovered = session.scalar(select(SitePage).where(SitePage.canonical_url == url))
+            recovered = session.scalar(
+                select(SitePage).where(SitePage.canonical_url == url)
+            )
             assert recovered is not None
             assert recovered.crawl_status == "success"
             assert recovered.failure_count == 0

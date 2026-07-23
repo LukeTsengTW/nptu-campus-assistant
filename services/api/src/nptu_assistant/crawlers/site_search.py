@@ -432,7 +432,11 @@ class NptuSiteSearchService:
         for seed_url in seed_urls:
             enqueue(CandidatePage(seed_url))
 
-        if effective_discovery and self._discovery is not None and not site_map_sufficient:
+        if (
+            effective_discovery
+            and self._discovery is not None
+            and not site_map_sufficient
+        ):
             try:
                 search_deadline.raise_if_expired()
                 for item in self._discovery.discover(
@@ -452,7 +456,9 @@ class NptuSiteSearchService:
                             self._site_map.record_discovery(
                                 item.url,
                                 title=item.label,
-                                unit=(scope.canonical_unit if scope is not None else None),
+                                unit=(
+                                    scope.canonical_unit if scope is not None else None
+                                ),
                             )
                         except Exception:
                             logger.exception("官方搜尋結果寫入 site map 失敗")

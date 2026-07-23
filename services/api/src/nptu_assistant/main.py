@@ -77,7 +77,9 @@ class _EmptyAnnouncements:
 
 
 class _UnavailableOperation:
-    def run(self, source_names: list[str] | None = None) -> IngestionSummary | CrawlSummary:
+    def run(
+        self, source_names: list[str] | None = None
+    ) -> IngestionSummary | CrawlSummary:
         raise AppError("service_unavailable", "管理服務尚未初始化。", status_code=503)
 
 
@@ -92,8 +94,12 @@ class _DefaultHealth:
 
     def check(self) -> dict[str, object]:
         llm = "configured" if self.settings.is_llm_configured else "not_configured"
-        embeddings = "configured" if self.settings.is_embedding_configured else "not_configured"
-        status = "ok" if llm == "configured" and embeddings == "configured" else "degraded"
+        embeddings = (
+            "configured" if self.settings.is_embedding_configured else "not_configured"
+        )
+        status = (
+            "ok" if llm == "configured" and embeddings == "configured" else "degraded"
+        )
         return {
             "status": status,
             "checks": {
@@ -180,7 +186,9 @@ def create_app(
     @app.middleware("http")
     async def request_id_middleware(request: Request, call_next: Any) -> Any:
         incoming = request.headers.get("X-Request-ID", "")
-        request.state.request_id = incoming if _SAFE_REQUEST_ID.fullmatch(incoming) else str(uuid.uuid4())
+        request.state.request_id = (
+            incoming if _SAFE_REQUEST_ID.fullmatch(incoming) else str(uuid.uuid4())
+        )
         response = await call_next(request)
         response.headers["X-Request-ID"] = request.state.request_id
         logger.info(
@@ -194,7 +202,9 @@ def create_app(
         )
         return response
 
-    def error_payload(request: Request, code: str, message: str, details: object = None) -> dict[str, object]:
+    def error_payload(
+        request: Request, code: str, message: str, details: object = None
+    ) -> dict[str, object]:
         return {
             "error": {
                 "code": code,
@@ -212,14 +222,20 @@ def create_app(
         )
 
     @app.exception_handler(RequestValidationError)
-    async def handle_validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
+    async def handle_validation_error(
+        request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
         return JSONResponse(
             status_code=422,
-            content=error_payload(request, "validation_error", "輸入資料驗證失敗。", exc.errors()),
+            content=error_payload(
+                request, "validation_error", "輸入資料驗證失敗。", exc.errors()
+            ),
         )
 
     @app.exception_handler(StarletteHTTPException)
-    async def handle_http_error(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+    async def handle_http_error(
+        request: Request, exc: StarletteHTTPException
+    ) -> JSONResponse:
         code = "not_found" if exc.status_code == 404 else "http_error"
         message = "找不到指定資源" if exc.status_code == 404 else "HTTP 請求失敗"
         return JSONResponse(
@@ -247,11 +263,15 @@ def create_app(
         def dependency(request: Request) -> None:
             key = request.client.host if request.client else "unknown"
             if not limiter.allow(bucket, key, limit=limit, window_seconds=60):
-                raise AppError("rate_limit_exceeded", "請求過於頻繁，請稍後再試。", status_code=429)
+                raise AppError(
+                    "rate_limit_exceeded", "請求過於頻繁，請稍後再試。", status_code=429
+                )
 
         return dependency
 
-    def require_admin(x_admin_key: str | None = Header(default=None, alias="X-Admin-Key")) -> None:
+    def require_admin(
+        x_admin_key: str | None = Header(default=None, alias="X-Admin-Key"),
+    ) -> None:
         if not settings.is_admin_enabled:
             raise AppError("admin_disabled", "管理端點未啟用。", status_code=404)
         if not secrets_match(x_admin_key, settings.admin_api_key.get_secret_value()):
@@ -260,7 +280,10 @@ def create_app(
     @app.get("/health", responses=_error_responses(500, 503))
     def health() -> JSONResponse:
         result = health_service.check()
-        return JSONResponse(status_code=503 if result.get("status") == "unhealthy" else 200, content=result)
+        return JSONResponse(
+            status_code=503 if result.get("status") == "unhealthy" else 200,
+            content=result,
+        )
 
     @app.post(
         "/v1/chat",

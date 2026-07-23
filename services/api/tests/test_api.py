@@ -70,7 +70,9 @@ class StubAnnouncements:
 
 
 class StubOperation:
-    def run(self, source_names: list[str] | None = None) -> IngestionSummary | CrawlSummary:
+    def run(
+        self, source_names: list[str] | None = None
+    ) -> IngestionSummary | CrawlSummary:
         if source_names is None:
             return IngestionSummary(created=1)
         return CrawlSummary(created=1)
@@ -214,7 +216,13 @@ def test_crawl_endpoint_uses_crawl_summary_contract() -> None:
     )
 
     assert response.status_code == 200
-    assert set(response.json()) == {"created", "updated", "unchanged", "failed", "errors"}
+    assert set(response.json()) == {
+        "created",
+        "updated",
+        "unchanged",
+        "failed",
+        "errors",
+    }
 
 
 def test_site_map_sync_endpoint_uses_admin_auth_and_summary_contract() -> None:
@@ -243,11 +251,17 @@ def test_cors_only_allows_configured_origin() -> None:
 
     allowed = client.options(
         "/v1/chat",
-        headers={"Origin": "http://localhost:3000", "Access-Control-Request-Method": "POST"},
+        headers={
+            "Origin": "http://localhost:3000",
+            "Access-Control-Request-Method": "POST",
+        },
     )
     denied = client.options(
         "/v1/chat",
-        headers={"Origin": "https://example.com", "Access-Control-Request-Method": "POST"},
+        headers={
+            "Origin": "https://example.com",
+            "Access-Control-Request-Method": "POST",
+        },
     )
 
     assert allowed.headers["access-control-allow-origin"] == "http://localhost:3000"
@@ -319,7 +333,9 @@ def test_openapi_documents_the_unified_error_envelope() -> None:
     assert error_schema["$ref"].endswith("/ErrorResponse")
 
 
-def test_openapi_keeps_question_compatible_and_adds_conversation_source_identity() -> None:
+def test_openapi_keeps_question_compatible_and_adds_conversation_source_identity() -> (
+    None
+):
     schema = make_client().app.openapi()["components"]["schemas"]
 
     assert schema["ChatRequest"]["required"] == ["question"]
