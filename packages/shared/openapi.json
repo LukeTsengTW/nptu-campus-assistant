@@ -520,6 +520,102 @@
           }
         }
       }
+    },
+    "/v1/admin/site-map/sync": {
+      "post": {
+        "summary": "Sync Site Map",
+        "operationId": "sync_site_map_v1_admin_site_map_sync_post",
+        "parameters": [
+          {
+            "name": "X-Admin-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Admin-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SiteMapSyncResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "統一錯誤 envelope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "統一錯誤 envelope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "統一錯誤 envelope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "統一錯誤 envelope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "統一錯誤 envelope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -840,6 +936,42 @@
         },
         "type": "object",
         "title": "IngestionSummary"
+      },
+      "SiteMapSyncResponse": {
+        "properties": {
+          "seen": {
+            "type": "integer",
+            "title": "Seen",
+            "default": 0
+          },
+          "created": {
+            "type": "integer",
+            "title": "Created",
+            "default": 0
+          },
+          "updated": {
+            "type": "integer",
+            "title": "Updated",
+            "default": 0
+          },
+          "skipped": {
+            "type": "integer",
+            "title": "Skipped",
+            "default": 0
+          },
+          "failed": {
+            "type": "integer",
+            "title": "Failed",
+            "default": 0
+          },
+          "links_created": {
+            "type": "integer",
+            "title": "Links Created",
+            "default": 0
+          }
+        },
+        "type": "object",
+        "title": "SiteMapSyncResponse"
       },
       "SourceReference": {
         "properties": {
