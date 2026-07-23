@@ -751,7 +751,7 @@ def test_postgres_large_traditional_search_plan_writes_and_reads_l2_cache() -> N
             cache=cache_two,
             single_flight=SingleFlightSearchRunner(factory),
         )
-        second_result = second.search(search_plan, scope=scope)
+        second_result = second.search(search_plan, scope=scope, use_discovery=False)
 
         assert second_result == first_result
         assert discovery.calls == 0
