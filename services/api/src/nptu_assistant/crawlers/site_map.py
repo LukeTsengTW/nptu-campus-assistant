@@ -6,18 +6,19 @@ from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Protocol
 from urllib.parse import urlsplit
+from uuid import UUID
 
 from nptu_assistant.core.security import (
     canonicalize_nptu_url,
     is_allowed_nptu_url,
     is_allowed_source_url,
 )
-from nptu_assistant.crawlers.crawl_policy import DOCUMENT_RESOURCE_SUFFIXES
 from nptu_assistant.crawlers.adapters.nptu_site import (
     NptuSitePage,
     UnitAnnouncementPageRole,
 )
 from nptu_assistant.crawlers.config import CrawlerSourceConfig, SiteSearchConfig
+from nptu_assistant.crawlers.crawl_policy import DOCUMENT_RESOURCE_SUFFIXES
 from nptu_assistant.crawlers.official_units import (
     DocumentSearchScope,
     OfficialUnitDirectory,
@@ -166,7 +167,7 @@ class SiteMapSyncSummary:
     skipped: int = 0
     failed: int = 0
     links_created: int = 0
-    breakdown: dict[str, "SiteMapSyncSummary"] = field(default_factory=dict, repr=False)
+    breakdown: dict[str, SiteMapSyncSummary] = field(default_factory=dict, repr=False)
 
     def add(self, result: SiteMapWriteResult) -> None:
         if result.created:
@@ -182,7 +183,7 @@ class SiteMapSyncSummary:
         self.updated += int(result.source_updated) + result.target_updated
         self.links_created += result.links_created
 
-    def merge(self, other: "SiteMapSyncSummary") -> None:
+    def merge(self, other: SiteMapSyncSummary) -> None:
         self.seen += other.seen
         self.created += other.created
         self.updated += other.updated
@@ -213,6 +214,8 @@ class SiteMapRepository(Protocol):
         etag: str | None = None,
         last_modified: str | None = None,
         links: Sequence[SiteLinkUpsert] = (),
+        lease_owner: str | None = None,
+        lease_token: UUID | None = None,
     ) -> SiteMapBatchWriteResult: ...
 
     def record_crawl_success(
@@ -433,6 +436,8 @@ class SiteMapService:
         http_status: int | None = 200,
         etag: str | None = None,
         last_modified: str | None = None,
+        lease_owner: str | None = None,
+        lease_token: UUID | None = None,
     ) -> SiteMapSyncSummary:
         from nptu_assistant.ingestion.cleaning import content_hash
 
@@ -503,15 +508,28 @@ class SiteMapService:
                 continue
             links_by_target[target] = incoming_link
         links = tuple(links_by_target.values())
-        result = self._repository.persist_fetched_page(
-            source_page,
-            title=page.title,
-            content_hash=content_hash(page.body),
-            http_status=http_status,
-            etag=etag,
-            last_modified=last_modified,
-            links=links,
-        )
+        if lease_owner is not None or lease_token is not None:
+            result = self._repository.persist_fetched_page(
+                source_page,
+                title=page.title,
+                content_hash=content_hash(page.body),
+                http_status=http_status,
+                etag=etag,
+                last_modified=last_modified,
+                links=links,
+                lease_owner=lease_owner,
+                lease_token=lease_token,
+            )
+        else:
+            result = self._repository.persist_fetched_page(
+                source_page,
+                title=page.title,
+                content_hash=content_hash(page.body),
+                http_status=http_status,
+                etag=etag,
+                last_modified=last_modified,
+                links=links,
+            )
         summary = SiteMapSyncSummary()
         summary.add_batch(result)
         summary.seen += skipped_links
@@ -548,7 +566,7 @@ class SiteMapService:
             total.seen += 1
             try:
                 result = self.record_discovery(url, **kwargs)  # type: ignore[arg-type]
-            except Exception:
+            except Exception:  # noqa: BLE001 - bootstrap continues per source
                 bucket.failed += 1
                 total.failed += 1
                 return
@@ -596,7 +614,7 @@ class SiteMapService:
 
         try:
             existing = self._repository.import_existing_urls()
-        except Exception:
+        except Exception:  # noqa: BLE001 - existing URL import is fail-open
             total.failed += 1
         else:
             for category, bucket in existing.items():

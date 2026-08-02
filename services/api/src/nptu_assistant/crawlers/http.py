@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Collection, Mapping
+from dataclasses import dataclass
 from urllib.parse import urljoin, urlsplit
 from urllib.robotparser import RobotFileParser
 
@@ -12,6 +13,25 @@ from nptu_assistant.crawlers.site_models import (
     SearchDeadline,
     SearchDeadlineExceeded,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class CrawlHttpResponse:
+    """有限爬蟲請求的狀態、標頭與 body metadata。"""
+
+    status_code: int
+    url: str
+    headers: Mapping[str, str]
+    content: bytes
+    encoding: str = "utf-8"
+
+    @property
+    def text(self) -> str:
+        return self.content.decode(self.encoding or "utf-8", errors="replace")
+
+    @property
+    def content_type(self) -> str:
+        return self.headers.get("content-type", "").lower()
 
 
 class CrawlHttpClient:
@@ -65,6 +85,25 @@ class CrawlHttpClient:
         timeout_seconds: float | None = None,
         deadline: SearchDeadline | None = None,
     ) -> str:
+        return self.get_response(
+            url,
+            allowed_hosts=allowed_hosts,
+            timeout_seconds=timeout_seconds,
+            deadline=deadline,
+        ).text
+
+    def get_response(
+        self,
+        url: str,
+        *,
+        allowed_hosts: Collection[str] | None = None,
+        request_headers: Mapping[str, str] | None = None,
+        preserve_error_status: bool = False,
+        timeout_seconds: float | None = None,
+        deadline: SearchDeadline | None = None,
+    ) -> CrawlHttpResponse:
+        """取得保留 status/headers 的 response，支援條件式 GET。"""
+
         self._validate_url(url, allowed_hosts)
         self._ensure_allowed_by_robots(
             url,
@@ -72,10 +111,12 @@ class CrawlHttpClient:
             timeout_seconds=timeout_seconds,
             deadline=deadline,
         )
-        return self._request(
+        return self._request_response(
             "get",
             url,
             allowed_hosts=allowed_hosts,
+            request_headers=request_headers,
+            preserve_error_status=preserve_error_status,
             timeout_seconds=timeout_seconds,
             deadline=deadline,
         )
@@ -88,6 +129,22 @@ class CrawlHttpClient:
         timeout_seconds: float | None = None,
         deadline: SearchDeadline | None = None,
     ) -> str:
+        return self.get_html_response(
+            url,
+            allowed_hosts=allowed_hosts,
+            timeout_seconds=timeout_seconds,
+            deadline=deadline,
+        ).text
+
+    def get_html_response(
+        self,
+        url: str,
+        *,
+        allowed_hosts: Collection[str] | None = None,
+        request_headers: Mapping[str, str] | None = None,
+        timeout_seconds: float | None = None,
+        deadline: SearchDeadline | None = None,
+    ) -> CrawlHttpResponse:
         self._validate_url(url, allowed_hosts)
         self._ensure_allowed_by_robots(
             url,
@@ -95,10 +152,11 @@ class CrawlHttpClient:
             timeout_seconds=timeout_seconds,
             deadline=deadline,
         )
-        return self._request(
+        return self._request_response(
             "get",
             url,
             allowed_hosts=allowed_hosts,
+            request_headers=request_headers,
             allowed_content_types=("text/html", "application/xhtml+xml"),
             timeout_seconds=timeout_seconds,
             deadline=deadline,
@@ -145,6 +203,36 @@ class CrawlHttpClient:
         timeout_seconds: float | None = None,
         deadline: SearchDeadline | None = None,
     ) -> str:
+        return self._request_response(
+            method,
+            url,
+            fields,
+            allowed_hosts=allowed_hosts,
+            check_redirect_robots=check_redirect_robots,
+            allowed_content_types=allowed_content_types,
+            timeout_seconds=timeout_seconds,
+            deadline=deadline,
+        ).text
+
+    def _request_response(
+        self,
+        method: str,
+        url: str,
+        fields: Mapping[str, str] | None = None,
+        *,
+        allowed_hosts: Collection[str] | None = None,
+        check_redirect_robots: bool = True,
+        allowed_content_types: tuple[str, ...] | None = None,
+        request_headers: Mapping[str, str] | None = None,
+        preserve_error_status: bool = False,
+        timeout_seconds: float | None = None,
+        deadline: SearchDeadline | None = None,
+    ) -> CrawlHttpResponse:
+        safe_request_headers = {
+            key: value
+            for key, value in (request_headers or {}).items()
+            if key.casefold() in {"if-none-match", "if-modified-since"}
+        }
         last_error: Exception | None = None
         for attempt in range(3):
             if deadline is not None:
@@ -167,6 +255,7 @@ class CrawlHttpClient:
                         current_url,
                         params=current_fields if current_method == "get" else None,
                         data=current_fields if current_method == "post" else None,
+                        headers=safe_request_headers or None,
                         timeout=httpx.Timeout(
                             effective_timeout,
                             connect=min(5.0, effective_timeout),
@@ -175,6 +264,14 @@ class CrawlHttpClient:
                         self._last_request[urlsplit(current_url).netloc.lower()] = (
                             self._clock()
                         )
+                        if response.status_code == 304:
+                            return CrawlHttpResponse(
+                                status_code=304,
+                                url=current_url,
+                                headers=dict(response.headers.items()),
+                                content=b"",
+                                encoding=response.encoding or "utf-8",
+                            )
                         if response.is_redirect:
                             if redirect_count >= self._max_redirects:
                                 raise ValueError("redirect 次數超過安全上限")
@@ -201,7 +298,8 @@ class CrawlHttpClient:
                                 current_fields = None
                             continue
 
-                        response.raise_for_status()
+                        if not preserve_error_status:
+                            response.raise_for_status()
                         content_type = response.headers.get("content-type", "").lower()
                         if allowed_content_types and not any(
                             content_type.startswith(value)
@@ -224,7 +322,13 @@ class CrawlHttpClient:
                                 raise ValueError("官方來源回應超過大小上限")
                             chunks.append(chunk)
                         encoding = response.encoding or "utf-8"
-                        return b"".join(chunks).decode(encoding, errors="replace")
+                        return CrawlHttpResponse(
+                            status_code=response.status_code,
+                            url=current_url,
+                            headers=dict(response.headers.items()),
+                            content=b"".join(chunks),
+                            encoding=encoding,
+                        )
             except (
                 httpx.TimeoutException,
                 httpx.TransportError,

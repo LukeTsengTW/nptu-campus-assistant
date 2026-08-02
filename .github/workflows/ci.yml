@@ -62,6 +62,9 @@ jobs:
       - name: Backend and PostgreSQL integration tests
         run: uv run --project services/api pytest --import-mode=importlib -rP
 
+      - name: P3 PostgreSQL crawler acceptance
+        run: uv run --project services/api pytest tests/integration/test_crawl_acceptance.py --import-mode=importlib -q -rP
+
       - name: Verify generated API contracts
         run: |
           uv run --project services/api nptu-assistant export-openapi --output packages/shared/openapi.json

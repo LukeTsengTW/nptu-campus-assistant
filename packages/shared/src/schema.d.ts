@@ -123,6 +123,74 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/admin/crawl/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Crawl Status */
+        get: operations["crawl_status_v1_admin_crawl_status_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/site-map/crawl/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Crawl Status */
+        get: operations["crawl_status_v1_admin_site_map_crawl_status_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/crawl/schedule": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Schedule Crawl */
+        post: operations["schedule_crawl_v1_admin_crawl_schedule_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/site-map/crawl/schedule": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Schedule Crawl */
+        post: operations["schedule_crawl_v1_admin_site_map_crawl_schedule_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -192,6 +260,184 @@ export interface components {
         CrawlRequest: {
             /** Source Names */
             source_names?: string[] | null;
+        };
+        /** CrawlScheduleRequest */
+        CrawlScheduleRequest: {
+            /** Source Names */
+            source_names?: string[] | null;
+            /** Urls */
+            urls?: string[] | null;
+            /** Unit */
+            unit?: string | null;
+            /** Host */
+            host?: string | null;
+            /** Page Type */
+            page_type?: string | null;
+            /** Run At */
+            run_at?: string | null;
+            /**
+             * Delay Seconds
+             * @default 0
+             */
+            delay_seconds: number;
+            /**
+             * Dry Run
+             * @default false
+             */
+            dry_run: boolean;
+        };
+        /** CrawlScheduleResponse */
+        CrawlScheduleResponse: {
+            /**
+             * Status
+             * @default scheduled
+             */
+            status: string;
+            /** Schedule Id */
+            schedule_id: string;
+            /**
+             * Scheduled At
+             * Format: date-time
+             */
+            scheduled_at: string;
+            /**
+             * Run At
+             * Format: date-time
+             */
+            run_at: string;
+            /** Source Names */
+            source_names?: string[];
+            /**
+             * Dry Run
+             * @default false
+             */
+            dry_run: boolean;
+            /**
+             * Scheduled Pages
+             * @default 0
+             */
+            scheduled_pages: number;
+        };
+        /** CrawlStatusResponse */
+        CrawlStatusResponse: {
+            /** Status */
+            status: string;
+            /**
+             * Enabled
+             * @default true
+             */
+            enabled: boolean;
+            /** Interval Seconds */
+            interval_seconds?: number | null;
+            /** Run Id */
+            run_id?: string | null;
+            /** Last Run At */
+            last_run_at?: string | null;
+            /** Last Success At */
+            last_success_at?: string | null;
+            /** Last Error */
+            last_error?: string | null;
+            /**
+             * Runs Total
+             * @default 0
+             */
+            runs_total: number;
+            /**
+             * Successes Total
+             * @default 0
+             */
+            successes_total: number;
+            /**
+             * Failures Total
+             * @default 0
+             */
+            failures_total: number;
+            /**
+             * Schedules Total
+             * @default 0
+             */
+            schedules_total: number;
+            /**
+             * Queue Depth
+             * @default 0
+             */
+            queue_depth: number;
+            /** Last Run Status */
+            last_run_status?: string | null;
+            /**
+             * Last Sources Attempted
+             * @default 0
+             */
+            last_sources_attempted: number;
+            /**
+             * Last Sources Succeeded
+             * @default 0
+             */
+            last_sources_succeeded: number;
+            /**
+             * Last Sources Failed
+             * @default 0
+             */
+            last_sources_failed: number;
+            /**
+             * Last Created
+             * @default 0
+             */
+            last_created: number;
+            /**
+             * Last Updated
+             * @default 0
+             */
+            last_updated: number;
+            /**
+             * Last Unchanged
+             * @default 0
+             */
+            last_unchanged: number;
+            /**
+             * Last Failed
+             * @default 0
+             */
+            last_failed: number;
+            /** Last Errors */
+            last_errors?: string[];
+            /** Last Duration Ms */
+            last_duration_ms?: number | null;
+            /** Next Run At */
+            next_run_at?: string | null;
+            /** Pending Schedule Id */
+            pending_schedule_id?: string | null;
+            /**
+             * Dry Run
+             * @default false
+             */
+            dry_run: boolean;
+            /**
+             * Due
+             * @default 0
+             */
+            due: number;
+            /**
+             * Leased
+             * @default 0
+             */
+            leased: number;
+            /**
+             * Blocked
+             * @default 0
+             */
+            blocked: number;
+            /**
+             * Active Workers
+             * @default 0
+             */
+            active_workers: number;
+            /** Next Due At */
+            next_due_at?: string | null;
+            /** Recent Attempts */
+            recent_attempts?: {
+                [key: string]: number;
+            };
         };
         /** CrawlSummary */
         CrawlSummary: {
@@ -742,6 +988,318 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description 統一錯誤 envelope */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description 統一錯誤 envelope */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description 統一錯誤 envelope */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    crawl_status_v1_admin_crawl_status_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Admin-Key"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CrawlStatusResponse"];
+                };
+            };
+            /** @description 統一錯誤 envelope */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description 統一錯誤 envelope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description 統一錯誤 envelope */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description 統一錯誤 envelope */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description 統一錯誤 envelope */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    crawl_status_v1_admin_site_map_crawl_status_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Admin-Key"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CrawlStatusResponse"];
+                };
+            };
+            /** @description 統一錯誤 envelope */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description 統一錯誤 envelope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description 統一錯誤 envelope */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description 統一錯誤 envelope */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description 統一錯誤 envelope */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    schedule_crawl_v1_admin_crawl_schedule_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Admin-Key"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["CrawlScheduleRequest"] | null;
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CrawlScheduleResponse"];
+                };
+            };
+            /** @description 統一錯誤 envelope */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description 統一錯誤 envelope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description 統一錯誤 envelope */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description 統一錯誤 envelope */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description 統一錯誤 envelope */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description 統一錯誤 envelope */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    schedule_crawl_v1_admin_site_map_crawl_schedule_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Admin-Key"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["CrawlScheduleRequest"] | null;
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CrawlScheduleResponse"];
+                };
+            };
+            /** @description 統一錯誤 envelope */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description 統一錯誤 envelope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description 統一錯誤 envelope */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
                 };
             };
             /** @description 統一錯誤 envelope */

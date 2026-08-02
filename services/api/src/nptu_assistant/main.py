@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-import uuid
 import logging
 import re
+import uuid
 from contextlib import asynccontextmanager
 from datetime import date
 from typing import Any
@@ -14,13 +14,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from nptu_assistant.api.crawl_admin import UnavailableCrawlAdmin
 from nptu_assistant.api.errors import AppError
 from nptu_assistant.api.schemas import (
     AnnouncementListResponse,
     ChatRequest,
     ChatResponse,
-    CrawlSummary,
     CrawlRequest,
+    CrawlScheduleRequest,
+    CrawlScheduleResponse,
+    CrawlStatusResponse,
+    CrawlSummary,
     ErrorResponse,
     IngestionSummary,
     SiteMapSyncResponse,
@@ -29,7 +33,6 @@ from nptu_assistant.core.logging import configure_logging
 from nptu_assistant.core.rate_limit import InMemoryRateLimiter, RateLimiter
 from nptu_assistant.core.security import secrets_match
 from nptu_assistant.core.settings import Settings, get_settings
-
 
 logger = logging.getLogger(__name__)
 _SAFE_REQUEST_ID = re.compile(r"^[A-Za-z0-9._:-]{1,100}$")
@@ -120,6 +123,7 @@ def create_app(
     crawler_service: Any | None = None,
     site_map_service: Any | None = None,
     refresh_scheduler: Any | None = None,
+    crawl_admin_service: Any | None = None,
     rate_limiter: RateLimiter | None = None,
 ) -> FastAPI:
     settings = settings or get_settings()
@@ -144,8 +148,11 @@ def create_app(
         crawler_service = crawler_service or defaults["crawler_service"]
         site_map_service = site_map_service or defaults["site_map_service"]
         refresh_scheduler = refresh_scheduler or defaults["refresh_scheduler"]
+        crawl_admin_service = crawl_admin_service or defaults["crawl_admin_service"]
     site_map_service = site_map_service or _UnavailableSiteMap()
+    crawl_admin_service = crawl_admin_service or UnavailableCrawlAdmin()
     assert site_map_service is not None
+    assert crawl_admin_service is not None
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -354,6 +361,43 @@ def create_app(
     def sync_site_map() -> SiteMapSyncResponse:
         summary = site_map_service.sync()
         return SiteMapSyncResponse.model_validate(summary.__dict__)
+
+    @app.get(
+        "/v1/admin/site-map/crawl/status",
+        response_model=CrawlStatusResponse,
+        responses=_error_responses(401, 404, 429, 500, 503),
+        dependencies=[Depends(rate_limit("admin", 5)), Depends(require_admin)],
+    )
+    @app.get(
+        "/v1/admin/crawl/status",
+        response_model=CrawlStatusResponse,
+        responses=_error_responses(401, 404, 429, 500, 503),
+        dependencies=[Depends(rate_limit("admin", 5)), Depends(require_admin)],
+    )
+    def crawl_status() -> CrawlStatusResponse:
+        return CrawlStatusResponse.model_validate(crawl_admin_service.status())
+
+    @app.post(
+        "/v1/admin/site-map/crawl/schedule",
+        status_code=202,
+        response_model=CrawlScheduleResponse,
+        responses=_error_responses(401, 404, 422, 429, 500, 503),
+        dependencies=[Depends(rate_limit("admin", 5)), Depends(require_admin)],
+    )
+    @app.post(
+        "/v1/admin/crawl/schedule",
+        status_code=202,
+        response_model=CrawlScheduleResponse,
+        responses=_error_responses(401, 404, 422, 429, 500, 503),
+        dependencies=[Depends(rate_limit("admin", 5)), Depends(require_admin)],
+    )
+    def schedule_crawl(
+        payload: CrawlScheduleRequest | None = None,
+    ) -> CrawlScheduleResponse:
+        request = payload or CrawlScheduleRequest()
+        return CrawlScheduleResponse.model_validate(
+            crawl_admin_service.schedule(request)
+        )
 
     return app
 

@@ -1,24 +1,24 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Collection, Mapping, Sequence
-from datetime import datetime, timezone
 import math
 import uuid
-from typing import Any
+from collections.abc import Callable, Collection, Mapping, Sequence
+from datetime import datetime, timezone
+from typing import Any, cast
 from urllib.parse import urlsplit
 
 from sqlalchemy import (
+    Float,
+    String,
     and_,
     case,
     column,
     false,
-    Float,
     func,
     literal,
     literal_column,
     or_,
     select,
-    String,
     text,
     true,
     update,
@@ -39,8 +39,8 @@ from nptu_assistant.crawlers.site_map import (
     SiteLinkUpsert,
     SiteMapBatchWriteResult,
     SiteMapCandidate,
-    SiteMapRepository,
     SiteMapQueryTimeout,
+    SiteMapRepository,
     SiteMapSyncSummary,
     SiteMapWriteResult,
     SitePageType,
@@ -53,7 +53,6 @@ from nptu_assistant.crawlers.site_models import (
     SearchPlan,
 )
 from nptu_assistant.db.models import Announcement, Document, SiteLink, SitePage, Source
-
 
 TITLE_TRIGRAM_THRESHOLD = 0.18
 PATH_TRIGRAM_THRESHOLD = 0.22
@@ -171,6 +170,8 @@ class SqlSiteMapRepository(SiteMapRepository):
         etag: str | None = None,
         last_modified: str | None = None,
         links: Sequence[SiteLinkUpsert] = (),
+        lease_owner: str | None = None,
+        lease_token: uuid.UUID | None = None,
     ) -> SiteMapBatchWriteResult:
         """在單一 transaction 批次寫入 source、targets、edges、crawl state。"""
         now = self._clock()
@@ -183,10 +184,17 @@ class SqlSiteMapRepository(SiteMapRepository):
                 0
             ]
             source_page = session.scalar(
-                select(SitePage).where(SitePage.canonical_url == source.canonical_url)
+                select(SitePage)
+                .where(SitePage.canonical_url == source.canonical_url)
+                .with_for_update()
             )
             if source_page is None:
                 raise RuntimeError("site map fetched source page 建立失敗")
+            if lease_token is not None and (
+                source_page.crawl_lease_token != lease_token
+                or source_page.crawl_lease_owner != lease_owner
+            ):
+                raise RuntimeError("site map page lease 已失效，拒絕寫入")
             self._apply_crawl_success(
                 source_page,
                 title=title,
@@ -747,6 +755,25 @@ class SqlSiteMapRepository(SiteMapRepository):
                     ),
                 )
         bucket = result.setdefault("Document URLs", SiteMapSyncSummary())
+        current_document_urls = {url for url, *_ in documents}
+        stale_document_filter = SitePage.discovery_source == (
+            SiteDiscoverySource.EXISTING_DOCUMENT.value
+        )
+        stale_document_filter = and_(
+            stale_document_filter,
+            SitePage.is_active.is_(True),
+            (
+                SitePage.canonical_url.not_in(current_document_urls)
+                if current_document_urls
+                else true()
+            ),
+        )
+        stale_documents = session.execute(
+            update(SitePage)
+            .where(stale_document_filter)
+            .values(is_active=False, is_indexable=False, updated_at=func.now())
+        )
+        bucket.updated += max(0, int(cast(Any, stale_documents).rowcount or 0))
         for url, title, unit, digest in documents:
             self._import_one(
                 bucket,
@@ -799,7 +826,7 @@ class SqlSiteMapRepository(SiteMapRepository):
                     )
                 ),
             )
-        except Exception:
+        except Exception:  # noqa: BLE001 - one import row must not abort bootstrap
             summary.failed += 1
 
     @staticmethod

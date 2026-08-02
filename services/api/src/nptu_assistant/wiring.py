@@ -1,32 +1,43 @@
 from __future__ import annotations
 
+from typing import cast
+
 from openai import OpenAI
 
+from nptu_assistant.api.crawl_admin import CrawlWorkerController
 from nptu_assistant.api.errors import AppError
 from nptu_assistant.api.services import AnnouncementService, HealthService
 from nptu_assistant.core.settings import (
-    Settings,
     WORKSPACE_ROOT,
+    Settings,
     resolve_workspace_path,
 )
-from nptu_assistant.crawlers.http import CrawlHttpClient
 from nptu_assistant.crawlers.config import (
     SiteSearchConfig,
     load_keyword_search_config,
     load_source_configs,
 )
-from nptu_assistant.crawlers.refresh import (
-    AnnouncementRefreshCoordinator,
-    AnnouncementRefreshScheduler,
+from nptu_assistant.crawlers.crawl_ingestion import CrawlIngestionService
+from nptu_assistant.crawlers.crawl_scheduler import CrawlScheduler
+from nptu_assistant.crawlers.http import CrawlHttpClient
+from nptu_assistant.crawlers.incremental_crawler import (
+    IncrementalCrawler,
+    IncrementalCrawlScheduler,
 )
 from nptu_assistant.crawlers.official_units import (
     load_official_unit_directory_for_config,
 )
+from nptu_assistant.crawlers.refresh import (
+    AnnouncementRefreshCoordinator,
+    AnnouncementRefreshScheduler,
+)
 from nptu_assistant.crawlers.resolution import UnitSourceResolver
-from nptu_assistant.crawlers.service import CrawlerService
 from nptu_assistant.crawlers.search import KeywordAnnouncementSearchService
+from nptu_assistant.crawlers.service import CrawlerService
 from nptu_assistant.crawlers.site_discovery import NptuOfficialSearchDiscovery
 from nptu_assistant.crawlers.site_map import SiteMapService
+from nptu_assistant.crawlers.site_models import ProgressiveRetrievalPolicy
+from nptu_assistant.crawlers.site_scoring import HybridCandidateScorer
 from nptu_assistant.crawlers.site_search import (
     NptuSiteSearchService,
     SitePageIngestionService,
@@ -37,14 +48,13 @@ from nptu_assistant.crawlers.site_search_cache import (
     PostgresSiteSearchCache,
     SingleFlightSearchRunner,
 )
-from nptu_assistant.crawlers.site_scoring import HybridCandidateScorer
-from nptu_assistant.crawlers.site_models import ProgressiveRetrievalPolicy
+from nptu_assistant.db.crawl_scheduler import SqlCrawlSchedulerRepository
 from nptu_assistant.db.repositories import (
     SqlAnnouncementRepository,
     SqlDocumentRepository,
 )
-from nptu_assistant.db.site_map import SqlSiteMapRepository
 from nptu_assistant.db.session import create_session_factory
+from nptu_assistant.db.site_map import SqlSiteMapRepository
 from nptu_assistant.ingestion.service import DocumentIngestionService
 from nptu_assistant.providers.fake import FakeEmbeddingProvider, FakeLlmProvider
 from nptu_assistant.providers.openai import OpenAIEmbeddingProvider, OpenAILlmProvider
@@ -67,6 +77,20 @@ class UnavailableEmbeddingProvider:
             "目前未設定向量服務。",
             status_code=503,
         )
+
+
+class _IncrementalWorkerCoordinator:
+    """將頁面 worker 接到既有 admin control 的最小介面。"""
+
+    def __init__(self, worker: IncrementalCrawler) -> None:
+        self._worker = worker
+
+    def refresh_due_sources(self) -> list[object]:
+        return [self._worker.run_once()]
+
+    def ensure_fresh(self, source_name: str) -> object:
+        del source_name
+        return self._worker.run_once()
 
 
 def build_services(settings: Settings) -> dict[str, object]:
@@ -190,12 +214,36 @@ def build_services(settings: Settings) -> dict[str, object]:
         if site_searcher and site_config
         else None
     )
+    crawl_ingestion_service = CrawlIngestionService(
+        document_repository,
+        embedding,
+        default_unit="國立屏東大學",
+    )
+    crawl_lease_repository = SqlCrawlSchedulerRepository(factory)
+    crawl_scheduler = CrawlScheduler(crawl_lease_repository)
+    incremental_crawler = IncrementalCrawler(
+        http_client,
+        site_map_service,
+        scheduler=cast(IncrementalCrawlScheduler, crawl_scheduler),
+        state_store=site_map_repository,
+        ingestion_service=crawl_ingestion_service,
+        allowed_hosts=("nptu.edu.tw",),
+        host_interval_seconds=settings.crawler_request_interval_seconds,
+        worker_id=f"api-{settings.app_host}:{settings.app_port}",
+    )
     announcement_refresher = AnnouncementRefreshCoordinator(
         crawler_config_path,
         crawler_service,
         announcement_repository,
     )
-    refresh_scheduler = AnnouncementRefreshScheduler(announcement_refresher)
+    announcement_refresh_scheduler = AnnouncementRefreshScheduler(
+        announcement_refresher
+    )
+    crawl_worker = CrawlWorkerController(
+        _IncrementalWorkerCoordinator(incremental_crawler),
+        interval_seconds=60.0,
+        schedule_store=crawl_lease_repository,
+    )
     return {
         "health_service": HealthService(factory, settings),
         "chat_service": (
@@ -226,8 +274,14 @@ def build_services(settings: Settings) -> dict[str, object]:
             document_repository,
             embedding,
         ),
+        "crawl_ingestion_service": crawl_ingestion_service,
         "crawler_service": crawler_service,
-        "refresh_scheduler": refresh_scheduler,
+        "refresh_scheduler": announcement_refresh_scheduler,
+        "crawl_worker": crawl_worker,
+        "crawl_admin_service": crawl_worker,
+        "crawl_scheduler": crawl_scheduler,
+        "crawl_lease_repository": crawl_lease_repository,
+        "incremental_crawler": incremental_crawler,
         "site_map_service": site_map_service,
         "session_factory": factory,
     }

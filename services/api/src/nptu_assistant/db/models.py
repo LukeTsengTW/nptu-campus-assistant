@@ -21,6 +21,7 @@ from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from nptu_assistant.db.base import Base
+from nptu_assistant.db.crawl_models import SiteCrawlAttempt
 
 
 class TimestampMixin:
@@ -162,6 +163,22 @@ class SitePage(TimestampMixin, Base):
         Index("ix_site_pages_page_type", "page_type"),
         Index("ix_site_pages_crawl_status", "crawl_status"),
         Index("ix_site_pages_next_crawl_at", "next_crawl_at"),
+        Index(
+            "ix_site_pages_crawl_schedule",
+            "next_crawl_at",
+            "crawl_status",
+        ),
+        Index("ix_site_pages_crawl_lease_expires_at", "crawl_lease_expires_at"),
+        Index("ix_site_pages_host_next_crawl_at", "host", "next_crawl_at"),
+        Index(
+            "ix_site_pages_due_active_crawlable",
+            "next_crawl_at",
+            "crawl_priority",
+            postgresql_where=text(
+                "is_active = true AND is_indexable = true "
+                "AND crawl_status NOT IN ('blocked', 'excluded')"
+            ),
+        ),
         Index("ix_site_pages_active_indexable", "is_active", "is_indexable"),
         Index("ix_site_pages_host_priority", "host", "crawl_priority"),
         Index(
@@ -210,6 +227,23 @@ class SitePage(TimestampMixin, Base):
     )
     last_changed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     next_crawl_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_scheduled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    unchanged_streak: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    changed_streak: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    last_error_kind: Mapped[str | None] = mapped_column(String(100))
+    last_error_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_retry_after_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    crawl_lease_token: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    crawl_lease_owner: Mapped[str | None] = mapped_column(String(200))
+    crawl_lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
     failure_count: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0"
     )
@@ -234,6 +268,11 @@ class SitePage(TimestampMixin, Base):
     incoming_links: Mapped[list[SiteLink]] = relationship(
         foreign_keys="SiteLink.target_page_id",
         back_populates="target_page",
+    )
+    crawl_attempts: Mapped[list[SiteCrawlAttempt]] = relationship(
+        back_populates="site_page",
+        cascade="all, delete-orphan",
+        order_by="SiteCrawlAttempt.started_at",
     )
 
 
