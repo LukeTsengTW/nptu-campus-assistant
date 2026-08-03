@@ -874,6 +874,10 @@ def test_scoped_fixture_persists_then_returns_database_id_and_detail() -> None:
         source_unit="資訊工程學系",
         interval_minutes=60,
         crawled_at=datetime.now(timezone.utc),
+        # This fixture seeds a complete pre-existing source snapshot.  The
+        # following request-scoped live lookups may enrich announcement rows,
+        # but P4 must not let that bounded subset advance this snapshot.
+        advance_freshness=True,
     )
 
     latest = executor.execute(
@@ -942,10 +946,9 @@ def test_scoped_fixture_persists_then_returns_database_id_and_detail() -> None:
             ).all()
         )
     assert stored_count == 2
-    assert set(
-        announcement_repository.canonical_urls_for_source("unit-scoped:資訊工程學系")
-        or ()
-    ).issuperset({old_url, ai_url, general_url})
+    assert announcement_repository.canonical_urls_for_source(
+        "unit-scoped:資訊工程學系"
+    ) == (old_url,)
 
 
 def test_announcement_content_change_reports_updated_then_unchanged(

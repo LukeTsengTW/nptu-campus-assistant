@@ -460,7 +460,7 @@ def test_postgres_p4_insufficient_document_uses_bounded_fixture_live_fallback() 
     http = _FixtureSiteHttpClient(
         {
             root_url: (
-                f'<main><h1>P4 首頁</h1><a href="{target_url}">{query}</a></main>'
+                f'<main><h1>P4 首頁</h1><a href="{target_url}">官方詳細流程</a></main>'
             ),
             target_url: (
                 f"<main><h1>{query}</h1><p>{query} 的官方流程、期限與應備文件說明。"
