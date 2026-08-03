@@ -71,3 +71,19 @@ def test_ingestion_recovery_migration_is_append_only_and_reversible() -> None:
     assert 'down_revision: str | None = "20260802_0007"' in source
     assert 'op.add_column("site_pages", sa.Column("ingestion_content_hash"' in source
     assert 'op.drop_column("site_pages", "ingestion_content_hash")' in source
+
+
+def test_announcement_incomplete_migration_repairs_legacy_0008_shape() -> None:
+    migration = (
+        Path(__file__)
+        .resolve()
+        .parents[3]
+        .joinpath("database/migrations/versions/20260803_0009_announcement_incomplete.py")
+    )
+    source = migration.read_text(encoding="utf-8")
+
+    assert 'revision: str = "20260803_0009"' in source
+    assert 'down_revision: str | None = "20260803_0008"' in source
+    assert "ADD COLUMN IF NOT EXISTS announcement_ingestion_status" in source
+    assert "DROP CONSTRAINT IF EXISTS ck_site_pages_announcement_ingestion_status" in source
+    assert "CREATE INDEX IF NOT EXISTS ix_site_pages_host_crawl_lease_expires_at" in source

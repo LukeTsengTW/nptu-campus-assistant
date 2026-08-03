@@ -16,9 +16,42 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
-    op.add_column(
-        "site_pages",
-        sa.Column("ingestion_attempt_hash", sa.String(64), nullable=True),
+    # Some development databases were stamped at 0008 before the announcement
+    # ingestion columns and objects were added to that revision. Make 0009
+    # compatible with both that schema and a fresh database built from the
+    # current 0008 migration.
+    op.execute(
+        sa.text(
+            "ALTER TABLE site_pages "
+            "ADD COLUMN IF NOT EXISTS ingestion_attempt_hash VARCHAR(64)"
+        )
+    )
+    op.execute(
+        sa.text(
+            "ALTER TABLE site_pages "
+            "ADD COLUMN IF NOT EXISTS announcement_ingestion_status "
+            "VARCHAR(20) NOT NULL DEFAULT 'not_applicable'"
+        )
+    )
+    op.execute(
+        sa.text(
+            "ALTER TABLE site_pages "
+            "ADD COLUMN IF NOT EXISTS announcement_ingestion_error VARCHAR(1000)"
+        )
+    )
+    op.execute(
+        sa.text(
+            "UPDATE site_pages "
+            "SET announcement_ingestion_status = 'not_applicable' "
+            "WHERE announcement_ingestion_status IS NULL"
+        )
+    )
+    op.execute(
+        sa.text(
+            "ALTER TABLE site_pages "
+            "ALTER COLUMN announcement_ingestion_status SET DEFAULT 'not_applicable', "
+            "ALTER COLUMN announcement_ingestion_status SET NOT NULL"
+        )
     )
     # 0008 stored the attempted hash in ingestion_content_hash even when the
     # transaction failed. Preserve that recovery signal separately, while
@@ -35,10 +68,24 @@ def upgrade() -> None:
             "  AND ingestion_content_hash IS NOT NULL"
         )
     )
-    op.drop_constraint(
-        "ck_site_pages_announcement_ingestion_status",
+    # Recreate both checks so a database that came from the earlier 0008 shape
+    # also accepts the current partial and incomplete terminal states.
+    op.execute(
+        sa.text(
+            "ALTER TABLE site_pages "
+            "DROP CONSTRAINT IF EXISTS ck_site_pages_ingestion_status"
+        )
+    )
+    op.create_check_constraint(
+        "ck_site_pages_ingestion_status",
         "site_pages",
-        type_="check",
+        "ingestion_status IN ('pending', 'failed', 'partial', 'success')",
+    )
+    op.execute(
+        sa.text(
+            "ALTER TABLE site_pages "
+            "DROP CONSTRAINT IF EXISTS ck_site_pages_announcement_ingestion_status"
+        )
     )
     op.create_check_constraint(
         "ck_site_pages_announcement_ingestion_status",
@@ -59,6 +106,19 @@ def upgrade() -> None:
             "'公告項目缺少官方發布日期，已標記為 terminal incomplete') "
             "WHERE announcement_ingestion_status = 'pending' "
             "  AND announcement_ingestion_error LIKE 'terminal_incomplete:%'"
+        )
+    )
+    op.execute(
+        sa.text(
+            "CREATE INDEX IF NOT EXISTS "
+            "ix_site_pages_announcement_ingestion_status "
+            "ON site_pages (announcement_ingestion_status)"
+        )
+    )
+    op.execute(
+        sa.text(
+            "CREATE INDEX IF NOT EXISTS ix_site_pages_host_crawl_lease_expires_at "
+            "ON site_pages (host, crawl_lease_expires_at)"
         )
     )
 
@@ -91,10 +151,11 @@ def downgrade() -> None:
             "WHERE ingestion_status IN ('pending', 'failed')"
         )
     )
-    op.drop_constraint(
-        "ck_site_pages_announcement_ingestion_status",
-        "site_pages",
-        type_="check",
+    op.execute(
+        sa.text(
+            "ALTER TABLE site_pages "
+            "DROP CONSTRAINT IF EXISTS ck_site_pages_announcement_ingestion_status"
+        )
     )
     op.create_check_constraint(
         "ck_site_pages_announcement_ingestion_status",
@@ -102,4 +163,6 @@ def downgrade() -> None:
         "announcement_ingestion_status IN "
         "('not_applicable', 'pending', 'failed', 'success')",
     )
-    op.drop_column("site_pages", "ingestion_attempt_hash")
+    op.execute(
+        sa.text("ALTER TABLE site_pages DROP COLUMN IF EXISTS ingestion_attempt_hash")
+    )
