@@ -22,7 +22,7 @@ from sqlalchemy import (
     select,
     text,
     true,
-    union,
+    union_all,
     update,
     values,
 )
@@ -930,7 +930,7 @@ class SqlSiteMapRepository(SiteMapRepository):
                     branches.append(statement.where(*candidate_filters, predicate))
             if not branches:
                 return select(literal(None).label("page_id")).where(false())
-            return branches[0].union(*branches[1:])
+            return union_all(*branches)
 
         page_title_candidates = union_prefilter(SitePage.title, SitePage.id)
         page_path_candidates = union_prefilter(SitePage.path, SitePage.id)
@@ -950,12 +950,17 @@ class SqlSiteMapRepository(SiteMapRepository):
                 ]
             ),
         )
-        candidate_page_ids = union(
+        candidate_page_id_branches = union_all(
             page_title_candidates,
             page_path_candidates,
             anchor_term_candidates,
             priority_page_candidates,
-        ).cte("site_map_candidate_page_ids")
+        ).subquery("site_map_candidate_page_id_branches")
+        candidate_page_ids = (
+            select(candidate_page_id_branches.c.page_id)
+            .distinct()
+            .cte("site_map_candidate_page_ids")
+        )
         page_lexical_scores = (
             select(
                 SitePage.id.label("page_id"),
