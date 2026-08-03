@@ -177,18 +177,19 @@ def test_postgres_same_host_claim_is_one_active_and_recovers_expired_lease() -> 
 
         with ThreadPoolExecutor(max_workers=2) as pool:
             first, second = pool.map(claim, ("p3-host-worker-a", "p3-host-worker-b"))
-        assert len(first) == 1
-        assert len(second) == 0
+        assert len(first) + len(second) == 1
+        claimed = first[0] if first else second[0]
+        recovery_owner = "p3-host-worker-b" if first else "p3-host-worker-a"
 
         recovered = repository.claim_due(
-            owner="p3-host-worker-b",
+            owner=recovery_owner,
             limit=3,
             lease_duration=timedelta(minutes=5),
             now=now + timedelta(seconds=2),
             urls=claim_urls,
         )
         assert len(recovered) == 1
-        assert recovered[0].page_id == first[0].page_id
+        assert recovered[0].page_id == claimed.page_id
         with factory() as session:
             active = session.scalar(
                 select(func.count())
