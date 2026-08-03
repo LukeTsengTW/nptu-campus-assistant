@@ -113,7 +113,7 @@ class SqlSiteMapRepository(SiteMapRepository):
         clock: Callable[[], datetime] = _now,
         site_map_query_budget_ratio: float = 0.25,
         site_map_query_min_seconds: float = 0.05,
-        site_map_query_max_seconds: float = 0.75,
+        site_map_query_max_seconds: float = 2.0,
         frontier_policy: FrontierPolicy | None = None,
     ) -> None:
         if not 0 < site_map_query_budget_ratio <= 1:

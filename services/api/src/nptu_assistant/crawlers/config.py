@@ -194,7 +194,7 @@ class SiteSearchConfig(BaseModel):
     query_timeout_seconds: float = Field(default=25.0, ge=1.0, le=120.0)
     site_map_query_budget_ratio: float = Field(default=0.25, ge=0.05, le=0.80)
     site_map_query_min_seconds: float = Field(default=0.05, ge=0.01, le=5.0)
-    site_map_query_max_seconds: float = Field(default=0.75, ge=0.05, le=10.0)
+    site_map_query_max_seconds: float = Field(default=2.0, ge=0.05, le=10.0)
     max_response_bytes: int = Field(
         default=2 * 1024 * 1024, ge=1024, le=8 * 1024 * 1024
     )

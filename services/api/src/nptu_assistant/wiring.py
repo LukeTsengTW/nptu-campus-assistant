@@ -184,7 +184,7 @@ def build_services(settings: Settings) -> dict[str, object]:
             site_config.site_map_query_min_seconds if site_config else 0.05
         ),
         site_map_query_max_seconds=(
-            site_config.site_map_query_max_seconds if site_config else 0.75
+            site_config.site_map_query_max_seconds if site_config else 2.0
         ),
     )
     site_map_service = SiteMapService(

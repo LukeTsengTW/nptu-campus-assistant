@@ -300,7 +300,7 @@ def test_postgres_fetched_page_write_requires_unexpired_page_lease() -> None:
 def test_batch_persistence_100_links_uses_one_transaction_and_fixed_sql() -> None:
     factory, engine = make_factory()
     token = uuid.uuid4().hex
-    prefix = f"https://www.nptu.edu.tw/p2-batch-{token}"
+    prefix = f"https://p2-batch-{token}.nptu.edu.tw"
     source = SitePageUpsert(
         canonical_url=f"{prefix}/source",
         title="批次來源",
@@ -335,7 +335,14 @@ def test_batch_persistence_100_links_uses_one_transaction_and_fixed_sql() -> Non
     event.listen(engine, "before_cursor_execute", capture_sql)
     try:
         started = perf_counter()
-        result = SqlSiteMapRepository(factory).persist_fetched_page(
+        result = SqlSiteMapRepository(
+            factory,
+            frontier_policy=FrontierPolicy(
+                per_page_link_cap=100,
+                per_host_pending_cap=100,
+                max_pending_total=10_000,
+            ),
+        ).persist_fetched_page(
             source,
             title=source.title,
             content_hash="c" * 64,
@@ -715,6 +722,19 @@ def test_site_map_deadline_sets_transaction_local_statement_timeout() -> None:
     factory, engine = make_factory()
     statements: list[tuple[str, object]] = []
 
+    class FastRepository(SqlSiteMapRepository):
+        def build_candidate_query(
+            self,
+            plan: SearchPlan,
+            *,
+            scope: object,
+            allowed_hosts: Collection[str],
+            limit: int,
+            dialect_name: str = "postgresql",
+        ) -> object:
+            del plan, scope, allowed_hosts, limit, dialect_name
+            return select(SitePage).where(SitePage.id == uuid.UUID(int=0))
+
     def capture_sql(
         conn: object,
         cursor: object,
@@ -729,7 +749,7 @@ def test_site_map_deadline_sets_transaction_local_statement_timeout() -> None:
     event.listen(engine, "before_cursor_execute", capture_sql)
     try:
         deadline = SearchDeadline(expires_at=12.345, _clock=lambda: 0.0)
-        SqlSiteMapRepository(factory).find_candidates(
+        FastRepository(factory).find_candidates(
             SearchPlan.from_query("宿舍冷氣費", limit=1),
             scope=None,
             allowed_hosts=("nptu.edu.tw",),
@@ -742,7 +762,7 @@ def test_site_map_deadline_sets_transaction_local_statement_timeout() -> None:
             if "set_config" in statement
         ]
         assert len(timeout_calls) == 1
-        assert "750ms" in repr(timeout_calls[0][1])
+        assert "2000ms" in repr(timeout_calls[0][1])
     finally:
         event.remove(engine, "before_cursor_execute", capture_sql)
         engine.dispose()
