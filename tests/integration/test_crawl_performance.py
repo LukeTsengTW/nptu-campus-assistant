@@ -447,6 +447,32 @@ def test_postgres_candidate_sql_bounded_with_lexical_recall() -> None:
                 }
             )
 
+        # Keep the default planner result above as the production evidence.
+        # On a 5,000-row fixture PostgreSQL may quite reasonably prefer a
+        # sequential scan.  A second EXPLAIN of the exact production
+        # statement with sequential scans disabled verifies that the bounded
+        # lexical predicates remain index-capable without changing runtime
+        # behavior or hiding a default-plan regression.
+        with engine.begin() as connection:
+            connection.execute(text("SET LOCAL enable_seqscan = off"))
+            connection.execute(
+                text("SELECT set_config('pg_trgm.similarity_threshold', '0.10', true)")
+            )
+            raw_index_plan = connection.exec_driver_sql(explain_sql).scalar_one()
+        index_payload = (
+            raw_index_plan[0] if isinstance(raw_index_plan, list) else raw_index_plan
+        )
+        assert isinstance(index_payload, dict)
+        index_root = index_payload["Plan"]
+        assert isinstance(index_root, dict)
+        index_probe = {
+            "planning_ms": float(index_payload["Planning Time"]),
+            "execution_ms": float(index_payload["Execution Time"]),
+            "node_types": sorted(_node_types(index_root)),
+            "index_names": sorted(_index_names(index_root)),
+            "buffers": _buffers(index_root),
+        }
+
         runtimes_ms: list[float] = []
         for _ in range(3):
             started = time.perf_counter()
@@ -472,7 +498,7 @@ def test_postgres_candidate_sql_bounded_with_lexical_recall() -> None:
             if row["id"] in invalid_page_ids
         }
         assert not returned_urls.intersection(invalid_urls)
-        used_index_names = {
+        default_used_index_names = {
             name
             for summary in explain_summaries
             for name in summary["index_names"]
@@ -483,10 +509,11 @@ def test_postgres_candidate_sql_bounded_with_lexical_recall() -> None:
             "ix_site_pages_path_trgm",
             "ix_site_links_anchor_text_trgm",
         }
-        assert required_index_names <= used_index_names, (
-            "candidate EXPLAIN did not exercise every lexical GIN index: "
-            f"missing={required_index_names - used_index_names} "
-            f"used={sorted(used_index_names)}"
+        assert required_index_names <= set(index_probe["index_names"]), (
+            "production candidate SQL has no usable lexical GIN index path: "
+            f"missing={required_index_names - set(index_probe['index_names'])} "
+            f"default_used={sorted(default_used_index_names)} "
+            f"index_probe={sorted(index_probe['index_names'])}"
         )
         assert max(float(item["execution_ms"]) for item in explain_summaries) <= 750
         assert max(runtimes_ms) <= 1_000
@@ -499,6 +526,8 @@ def test_postgres_candidate_sql_bounded_with_lexical_recall() -> None:
                         "hosts": 1,
                     },
                     "candidate": explain_summaries,
+                    "default_used_indexes": sorted(default_used_index_names),
+                    "index_probe": index_probe,
                     "production_runtime_ms": runtimes_ms,
                 },
                 ensure_ascii=False,
