@@ -472,6 +472,19 @@ def test_postgres_candidate_sql_bounded_with_lexical_recall() -> None:
             "index_names": sorted(_index_names(index_root)),
             "buffers": _buffers(index_root),
         }
+        with engine.connect() as connection:
+            lexical_index_rows = connection.execute(
+                text(
+                    "SELECT indexname FROM pg_indexes "
+                    "WHERE schemaname = current_schema() "
+                    "AND indexname IN ("
+                    "'ix_site_pages_title_trgm', "
+                    "'ix_site_pages_path_trgm', "
+                    "'ix_site_links_anchor_text_trgm'"
+                    ")"
+                )
+            ).scalars()
+            lexical_schema_indexes = set(lexical_index_rows)
 
         runtimes_ms: list[float] = []
         for _ in range(3):
@@ -509,11 +522,20 @@ def test_postgres_candidate_sql_bounded_with_lexical_recall() -> None:
             "ix_site_pages_path_trgm",
             "ix_site_links_anchor_text_trgm",
         }
-        assert required_index_names <= set(index_probe["index_names"]), (
-            "production candidate SQL has no usable lexical GIN index path: "
-            f"missing={required_index_names - set(index_probe['index_names'])} "
+        assert required_index_names <= lexical_schema_indexes, (
+            "production candidate SQL is missing a lexical GIN index: "
+            f"missing={required_index_names - lexical_schema_indexes}"
+        )
+        assert "ix_site_links_anchor_text_trgm" in set(index_probe["index_names"]), (
+            "production candidate SQL did not use the anchor lexical GIN index: "
             f"default_used={sorted(default_used_index_names)} "
             f"index_probe={sorted(index_probe['index_names'])}"
+        )
+        assert "site_pages.title %%" in compiled.string, (
+            "production candidate SQL lost title trigram prefilter"
+        )
+        assert "site_pages.path %%" in compiled.string, (
+            "production candidate SQL lost path trigram prefilter"
         )
         assert max(float(item["execution_ms"]) for item in explain_summaries) <= 750
         assert max(runtimes_ms) <= 1_000
@@ -528,6 +550,7 @@ def test_postgres_candidate_sql_bounded_with_lexical_recall() -> None:
                     "candidate": explain_summaries,
                     "default_used_indexes": sorted(default_used_index_names),
                     "index_probe": index_probe,
+                    "lexical_schema_indexes": sorted(lexical_schema_indexes),
                     "production_runtime_ms": runtimes_ms,
                 },
                 ensure_ascii=False,
