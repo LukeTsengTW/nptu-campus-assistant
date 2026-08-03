@@ -914,14 +914,20 @@ class SqlSiteMapRepository(SiteMapRepository):
         ) -> Any:
             branches = []
             for term in contains_terms:
-                predicate = or_(
+                # Keep the indexed trigram predicate separate from the exact
+                # substring predicate.  Combining them under OR makes
+                # PostgreSQL prefer a sequential scan on the page table even
+                # when the GIN trigram index is otherwise usable.  Separate
+                # bounded UNION branches preserve substring recall and expose
+                # an indexable branch for every lexical column.
+                for predicate in (
                     column.op("%")(term),
                     column.ilike(f"%{term}%"),
-                )
-                statement = select(page_id_column.label("page_id"))
-                if from_clause is not None:
-                    statement = statement.select_from(from_clause)
-                branches.append(statement.where(*candidate_filters, predicate))
+                ):
+                    statement = select(page_id_column.label("page_id"))
+                    if from_clause is not None:
+                        statement = statement.select_from(from_clause)
+                    branches.append(statement.where(*candidate_filters, predicate))
             if not branches:
                 return select(literal(None).label("page_id")).where(false())
             return branches[0].union(*branches[1:])
