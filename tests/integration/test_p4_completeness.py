@@ -160,24 +160,18 @@ def _seed_document(
 
 
 def _cleanup(factory: sessionmaker[Session], token: str, unit: str) -> None:
-    prefix = f"https://www.nptu.edu.tw/p4-completeness-{token}"
+    url_match = f"%{token}%"
     with factory.begin() as session:
-        page_ids = select(SitePage.id).where(SitePage.canonical_url.like(f"{prefix}%"))
-        document_ids = select(Document.id).where(
-            Document.canonical_url.like(f"{prefix}%")
-        )
+        page_ids = select(SitePage.id).where(SitePage.canonical_url.like(url_match))
+        document_ids = select(Document.id).where(Document.canonical_url.like(url_match))
         session.execute(
             delete(SiteCrawlAttempt).where(SiteCrawlAttempt.site_page_id.in_(page_ids))
         )
         session.execute(
             delete(DocumentChunk).where(DocumentChunk.document_id.in_(document_ids))
         )
-        session.execute(
-            delete(Document).where(Document.canonical_url.like(f"{prefix}%"))
-        )
-        session.execute(
-            delete(SitePage).where(SitePage.canonical_url.like(f"{prefix}%"))
-        )
+        session.execute(delete(Document).where(Document.canonical_url.like(url_match)))
+        session.execute(delete(SitePage).where(SitePage.canonical_url.like(url_match)))
         session.execute(delete(Source).where(Source.name == f"document:{unit}"))
 
 
@@ -502,7 +496,9 @@ def test_postgres_p4_insufficient_document_uses_bounded_fixture_live_fallback() 
         max_pages=4,
         max_candidate_urls=12,
         max_depth=1,
-        max_pages_per_host=1,
+        # The fixture has one root and one detail page on the same host.  It
+        # remains bounded but must permit the linked target to be fetched.
+        max_pages_per_host=2,
     )
     executor = ToolExecutor(
         SqlRetriever(factory, embedding),
