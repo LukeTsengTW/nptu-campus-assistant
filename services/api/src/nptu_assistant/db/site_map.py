@@ -231,6 +231,11 @@ class SqlSiteMapRepository(SiteMapRepository):
                 last_modified=last_modified,
                 now=now,
             )
+            # The frontier cap query is intentionally raw, set-based SQL on
+            # PostgreSQL.  Flush the source's terminal crawl state before
+            # reading pending counts so the just-fetched source is not
+            # incorrectly counted as a newly queued page.
+            session.flush()
             bounded_links, frontier_skipped = self._bounded_frontier_links_in_session(
                 session,
                 links,
@@ -872,7 +877,15 @@ class SqlSiteMapRepository(SiteMapRepository):
         )
         qtext = term_values.c.query_text
         qweight = term_values.c.query_weight
-        contains_terms = tuple(term for term, _weight in query_terms)
+        # A URL path commonly uses hyphens where a natural-language query uses
+        # spaces.  Keep this bounded variant in the same VALUES CTE so path
+        # recall does not depend on a slow Python-side post-filter.
+        term_variants: list[str] = []
+        for term, _weight in query_terms:
+            for variant in (term, "-".join(term.split())):
+                if variant and variant not in term_variants:
+                    term_variants.append(variant)
+        contains_terms = tuple(term_variants)
         title_contains = (
             or_(*(SitePage.title.ilike(f"%{term}%") for term in contains_terms))
             if contains_terms
@@ -916,9 +929,18 @@ class SqlSiteMapRepository(SiteMapRepository):
                 or_(SiteLink.anchor_text.op("%")(qtext), anchor_contains),
             )
         )
-        candidate_page_ids = page_term_candidates.union(anchor_term_candidates).cte(
-            "site_map_candidate_page_ids"
+        priority_page_candidates = select(SitePage.id.label("page_id")).where(
+            *candidate_filters,
+            SitePage.page_type.in_(
+                [
+                    SitePageType.UNIT_HOMEPAGE.value,
+                    SitePageType.ANNOUNCEMENT_LISTING.value,
+                ]
+            ),
         )
+        candidate_page_ids = page_term_candidates.union(
+            anchor_term_candidates, priority_page_candidates
+        ).cte("site_map_candidate_page_ids")
         page_lexical_scores = (
             select(
                 SitePage.id.label("page_id"),

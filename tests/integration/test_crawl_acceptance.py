@@ -397,7 +397,7 @@ def test_postgres_migration_roundtrip_preserves_ingestion_semantics() -> None:
             }
             assert downgraded["failed"]["ingestion_content_hash"] == hashes["failed"]
             assert downgraded["pending"]["ingestion_content_hash"] == hashes["pending"]
-            assert downgraded["partial"]["announcement_ingestion_status"] == "pending"
+            assert downgraded["partial"]["announcement_ingestion_status"] == "failed"
             assert (
                 downgraded["incomplete"]["announcement_ingestion_status"] == "pending"
             )

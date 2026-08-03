@@ -762,7 +762,7 @@ def test_site_map_deadline_sets_transaction_local_statement_timeout() -> None:
             if "set_config" in statement
         ]
         assert len(timeout_calls) == 1
-        assert "2000ms" in repr(timeout_calls[0][1])
+        assert "750ms" in repr(timeout_calls[0][1])
     finally:
         event.remove(engine, "before_cursor_execute", capture_sql)
         engine.dispose()

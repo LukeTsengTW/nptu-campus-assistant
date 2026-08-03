@@ -229,7 +229,6 @@ class SqlDocumentRepository:
             if page.page_type in {"announcement_listing", "announcement_detail"}:
                 page.ingestion_status = "success"
                 page.ingestion_content_hash = digest
-                page.ingestion_attempt_hash = None
                 page.ingestion_error = None
                 if page.announcement_ingestion_status == "not_applicable":
                     page.announcement_ingestion_status = "pending"
@@ -273,6 +272,7 @@ class SqlDocumentRepository:
             )
             page.ingestion_status = "partial" if status == "incomplete" else "success"
             page.ingestion_error = page.announcement_ingestion_error
+            page.ingestion_attempt_hash = None
             self._clear_ingestion_lease(page)
             return True
 
