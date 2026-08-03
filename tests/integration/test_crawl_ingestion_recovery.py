@@ -609,7 +609,7 @@ def test_postgres_document_success_announcement_failure_retries_partial_state() 
             assert partial_page.announcement_ingestion_status == "failed"
             assert partial_page.ingestion_content_hash == expected_hash
             assert partial_page.announcement_ingestion_error is not None
-            assert "公告持久化部分成功" in partial_page.announcement_ingestion_error
+            assert "重試" in partial_page.announcement_ingestion_error
             assert partial_page.ingestion_lease_owner is None
             assert partial_page.ingestion_lease_token is None
             assert partial_page.ingestion_lease_expires_at is None

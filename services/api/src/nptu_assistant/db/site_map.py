@@ -904,30 +904,37 @@ class SqlSiteMapRepository(SiteMapRepository):
         # Keep the trigram prefilter in a dedicated candidate-id CTE.  This
         # lets PostgreSQL use the title/path/anchor GIN indexes before the
         # bounded similarity aggregation, while retaining anchor-only recall.
-        page_term_candidates = (
-            select(SitePage.id.label("page_id"))
-            .select_from(SitePage.__table__.join(term_values, true()))
-            .where(
-                *candidate_filters,
-                or_(
-                    SitePage.title.op("%")(qtext),
-                    SitePage.path.op("%")(qtext),
-                    title_contains,
-                    path_contains,
-                ),
-            )
+        title_trigram = (
+            or_(*(SitePage.title.op("%")(term) for term in contains_terms))
+            if contains_terms
+            else literal(False)
+        )
+        path_trigram = (
+            or_(*(SitePage.path.op("%")(term) for term in contains_terms))
+            if contains_terms
+            else literal(False)
+        )
+        anchor_trigram = (
+            or_(*(SiteLink.anchor_text.op("%")(term) for term in contains_terms))
+            if contains_terms
+            else literal(False)
+        )
+        page_title_candidates = select(SitePage.id.label("page_id")).where(
+            *candidate_filters,
+            title_trigram,
+        )
+        page_path_candidates = select(SitePage.id.label("page_id")).where(
+            *candidate_filters,
+            path_trigram,
         )
         anchor_term_candidates = (
             select(SiteLink.target_page_id.label("page_id"))
             .select_from(
                 SiteLink.__table__.join(
                     SitePage, SiteLink.target_page_id == SitePage.id
-                ).join(term_values, true())
+                )
             )
-            .where(
-                *candidate_filters,
-                or_(SiteLink.anchor_text.op("%")(qtext), anchor_contains),
-            )
+            .where(*candidate_filters, anchor_trigram)
         )
         priority_page_candidates = select(SitePage.id.label("page_id")).where(
             *candidate_filters,
@@ -938,8 +945,8 @@ class SqlSiteMapRepository(SiteMapRepository):
                 ]
             ),
         )
-        candidate_page_ids = page_term_candidates.union(
-            anchor_term_candidates, priority_page_candidates
+        candidate_page_ids = page_title_candidates.union(
+            page_path_candidates, anchor_term_candidates, priority_page_candidates
         ).cte("site_map_candidate_page_ids")
         page_lexical_scores = (
             select(
