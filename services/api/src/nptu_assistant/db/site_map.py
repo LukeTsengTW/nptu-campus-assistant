@@ -22,6 +22,7 @@ from sqlalchemy import (
     select,
     text,
     true,
+    union,
     update,
     values,
 )
@@ -901,40 +902,38 @@ class SqlSiteMapRepository(SiteMapRepository):
             if contains_terms
             else literal(False)
         )
+
         # Keep the trigram prefilter in a dedicated candidate-id CTE.  This
         # lets PostgreSQL use the title/path/anchor GIN indexes before the
         # bounded similarity aggregation, while retaining anchor-only recall.
-        title_trigram = (
-            or_(*(SitePage.title.op("%")(term) for term in contains_terms))
-            if contains_terms
-            else literal(False)
-        )
-        path_trigram = (
-            or_(*(SitePage.path.op("%")(term) for term in contains_terms))
-            if contains_terms
-            else literal(False)
-        )
-        anchor_trigram = (
-            or_(*(SiteLink.anchor_text.op("%")(term) for term in contains_terms))
-            if contains_terms
-            else literal(False)
-        )
-        page_title_candidates = select(SitePage.id.label("page_id")).where(
-            *candidate_filters,
-            title_trigram,
-        )
-        page_path_candidates = select(SitePage.id.label("page_id")).where(
-            *candidate_filters,
-            path_trigram,
-        )
-        anchor_term_candidates = (
-            select(SiteLink.target_page_id.label("page_id"))
-            .select_from(
-                SiteLink.__table__.join(
-                    SitePage, SiteLink.target_page_id == SitePage.id
+        def union_prefilter(
+            column: Any,
+            page_id_column: Any,
+            *,
+            from_clause: Any = None,
+        ) -> Any:
+            branches = []
+            for term in contains_terms:
+                predicate = or_(
+                    column.op("%")(term),
+                    column.ilike(f"%{term}%"),
                 )
-            )
-            .where(*candidate_filters, anchor_trigram)
+                statement = select(page_id_column.label("page_id"))
+                if from_clause is not None:
+                    statement = statement.select_from(from_clause)
+                branches.append(statement.where(*candidate_filters, predicate))
+            if not branches:
+                return select(literal(None).label("page_id")).where(false())
+            return branches[0].union(*branches[1:])
+
+        page_title_candidates = union_prefilter(SitePage.title, SitePage.id)
+        page_path_candidates = union_prefilter(SitePage.path, SitePage.id)
+        anchor_term_candidates = union_prefilter(
+            SiteLink.anchor_text,
+            SiteLink.target_page_id,
+            from_clause=SiteLink.__table__.join(
+                SitePage, SiteLink.target_page_id == SitePage.id
+            ),
         )
         priority_page_candidates = select(SitePage.id.label("page_id")).where(
             *candidate_filters,
@@ -945,8 +944,11 @@ class SqlSiteMapRepository(SiteMapRepository):
                 ]
             ),
         )
-        candidate_page_ids = page_title_candidates.union(
-            page_path_candidates, anchor_term_candidates, priority_page_candidates
+        candidate_page_ids = union(
+            page_title_candidates,
+            page_path_candidates,
+            anchor_term_candidates,
+            priority_page_candidates,
         ).cte("site_map_candidate_page_ids")
         page_lexical_scores = (
             select(
