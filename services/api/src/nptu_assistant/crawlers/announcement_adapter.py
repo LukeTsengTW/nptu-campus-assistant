@@ -74,11 +74,17 @@ class AnnouncementPersistenceResult:
 
     @property
     def partial(self) -> bool:
-        return self.undated_count > 0 or self.failed_count > 0
+        """Whether this result still has retryable persistence failures."""
+
+        return self.failed_count > 0
 
     @property
     def warning(self) -> str | None:
-        if not self.partial:
+        if self.undated_count and not self.failed_count:
+            return "公告項目缺少官方發布日期，已標記為 terminal incomplete；後續內容變更時可重新評估。"
+        if self.undated_count:
+            return "公告資料部分完成，另有缺少官方發布日期的項目已標記為 terminal incomplete。"
+        if not self.failed_count:
             return None
         if self.persisted_count:
             return "公告資料部分完成，未完成項目可稍後重試。"

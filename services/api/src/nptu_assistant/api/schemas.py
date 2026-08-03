@@ -168,6 +168,7 @@ class CrawlStatusResponse(BaseModel):
     failed: int = 0
     blocked: int = 0
     pending_ingestion: int = 0
+    incomplete_ingestion: int = 0
     active_workers: int = 0
     next_due_at: datetime | None = None
     recent_attempts: dict[str, int] = Field(default_factory=dict)

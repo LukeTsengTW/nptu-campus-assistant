@@ -167,7 +167,8 @@ class SitePage(TimestampMixin, Base):
             name="ck_site_pages_ingestion_status",
         ),
         CheckConstraint(
-            "announcement_ingestion_status IN ('not_applicable', 'pending', 'failed', 'success')",
+            "announcement_ingestion_status IN "
+            "('not_applicable', 'pending', 'failed', 'incomplete', 'success')",
             name="ck_site_pages_announcement_ingestion_status",
         ),
         Index("ix_site_pages_host", "host"),
@@ -243,6 +244,7 @@ class SitePage(TimestampMixin, Base):
     http_status: Mapped[int | None] = mapped_column(Integer)
     content_hash: Mapped[str | None] = mapped_column(String(64))
     ingestion_content_hash: Mapped[str | None] = mapped_column(String(64))
+    ingestion_attempt_hash: Mapped[str | None] = mapped_column(String(64))
     ingestion_status: Mapped[str] = mapped_column(
         String(16), nullable=False, default="pending", server_default="pending"
     )

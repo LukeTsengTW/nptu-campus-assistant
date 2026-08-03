@@ -108,6 +108,8 @@ def test_status_exposes_durable_pending_and_attempt_counts() -> None:
                 "pending": 4,
                 "due": 2,
                 "leased": 1,
+                "pending_ingestion": 3,
+                "incomplete_ingestion": 2,
                 "active_workers": 1,
                 "recent_attempts": {
                     "success_changed": 3,
@@ -123,6 +125,8 @@ def test_status_exposes_durable_pending_and_attempt_counts() -> None:
     assert response.status_code == 200
     assert response.json()["pending"] == 4
     assert response.json()["active_workers"] == 1
+    assert response.json()["pending_ingestion"] == 3
+    assert response.json()["incomplete_ingestion"] == 2
     assert response.json()["recent_attempts"] == {
         "success_changed": 3,
         "failed_transient": 1,

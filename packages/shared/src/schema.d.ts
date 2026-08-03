@@ -443,6 +443,11 @@ export interface components {
              */
             pending_ingestion: number;
             /**
+             * Incomplete Ingestion
+             * @default 0
+             */
+            incomplete_ingestion: number;
+            /**
              * Active Workers
              * @default 0
              */

@@ -3,12 +3,21 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from uuid import uuid4
 
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from nptu_assistant.crawlers.adapters.nptu_site import NptuSitePage
+from nptu_assistant.crawlers.adapters.nptu_site import (
+    NptuListingItem,
+    NptuSitePage,
+    UnitAnnouncementPageRole,
+)
+from nptu_assistant.crawlers.announcement_adapter import (
+    AnnouncementSourceIdentity,
+    IncrementalAnnouncementAdapter,
+)
 from nptu_assistant.crawlers.crawl_ingestion import (
     CrawlIngestionService,
     CrawlIngestionStatus,
@@ -58,6 +67,164 @@ class RecordingEmbeddingProvider:
         del timeout_seconds
         self.calls.append(texts)
         return [[0.0] * 1536 for _ in texts]
+
+
+ANNOUNCEMENT_URL = "https://www.nptu.edu.tw/p/406-1025-197412.php"
+ANNOUNCEMENT_SOURCE = AnnouncementSourceIdentity(
+    name="教務處公告",
+    url="https://www.nptu.edu.tw/p/403-1025-1019.php",
+    unit="教務處",
+)
+
+
+class MemoryAnnouncementIngestionRepository(MemoryDocumentRepository):
+    """保留 page ingestion 與公告 terminal 狀態的測試 repository。"""
+
+    def __init__(self, *, fail_announcement: bool = False) -> None:
+        super().__init__()
+        self.fail_announcement = fail_announcement
+        self.page_states: dict[str, dict[str, str | None]] = {}
+        self.announcement_items: dict[str, object] = {}
+        self.merge_calls = 0
+
+    def save_idempotent(
+        self,
+        metadata,
+        raw_text,
+        chunks,
+        embeddings,
+        **kwargs,
+    ) -> bool:
+        del kwargs
+        self.save(metadata, raw_text, chunks, embeddings)
+        return True
+
+    def begin_ingestion(self, canonical_url, digest, *, page_id, **kwargs) -> str:
+        del kwargs
+        state = self.page_states.setdefault(
+            str(page_id),
+            {
+                "canonical_url": canonical_url,
+                "hash": None,
+                "ingestion": "pending",
+                "announcement": "not_applicable",
+            },
+        )
+        if state["hash"] == digest and state["announcement"] in {
+            "success",
+            "incomplete",
+        }:
+            return "success"
+        state.update(
+            hash=digest,
+            ingestion="pending",
+            announcement="pending",
+        )
+        return "pending"
+
+    def complete_ingestion(self, canonical_url, digest, *, page_id, **kwargs) -> bool:
+        del canonical_url, digest, kwargs
+        self.page_states[str(page_id)]["ingestion"] = "success"
+        return True
+
+    def complete_announcement_ingestion(
+        self,
+        canonical_url,
+        digest,
+        *,
+        page_id,
+        status="success",
+        **kwargs,
+    ) -> bool:
+        del canonical_url, digest, kwargs
+        state = self.page_states[str(page_id)]
+        state["announcement"] = status
+        state["ingestion"] = "partial" if status == "incomplete" else "success"
+        return True
+
+    def fail_announcement_ingestion(
+        self,
+        canonical_url,
+        digest,
+        *,
+        page_id,
+        error=None,
+        **kwargs,
+    ) -> bool:
+        del canonical_url, digest, error, kwargs
+        state = self.page_states[str(page_id)]
+        state["announcement"] = "failed"
+        state["ingestion"] = "partial"
+        return True
+
+    def fail_ingestion(self, canonical_url, digest, *, page_id, **kwargs) -> bool:
+        del canonical_url, digest, kwargs
+        self.page_states[str(page_id)]["ingestion"] = "failed"
+        return True
+
+    def merge_source_announcements(
+        self,
+        candidates,
+        *,
+        source_name,
+        source_url,
+        source_unit,
+        interval_minutes,
+        crawled_at,
+    ) -> list[str]:
+        del source_name, source_url, source_unit, interval_minutes, crawled_at
+        self.merge_calls += 1
+        if self.fail_announcement:
+            raise RuntimeError("公告資料庫暫時不可用")
+        for candidate in candidates:
+            self.announcement_items[candidate.canonical_url] = candidate
+        return ["created" for _ in candidates]
+
+
+def announcement_listing_page(*, body: str = "公告列表") -> NptuSitePage:
+    return NptuSitePage(
+        title="公告列表",
+        canonical_url=ANNOUNCEMENT_URL,
+        body=body,
+        published_at=None,
+        links=(ANNOUNCEMENT_URL,),
+        role=UnitAnnouncementPageRole.LISTING,
+        announcement_items=(
+            NptuListingItem(
+                title="待補日期公告",
+                canonical_url=ANNOUNCEMENT_URL,
+                published_at=None,
+                summary="列表摘要",
+                anchor_text="待補日期公告",
+                order=0,
+            ),
+        ),
+    )
+
+
+def announcement_detail_page(
+    *,
+    body: str = "公告完整正文",
+    published_at: date | None = date(2026, 8, 2),
+) -> NptuSitePage:
+    return NptuSitePage(
+        title="待補日期公告完整標題",
+        canonical_url=ANNOUNCEMENT_URL,
+        body=body,
+        published_at=published_at,
+        links=(),
+        role=UnitAnnouncementPageRole.DETAIL,
+    )
+
+
+def _announcement_service(repository, embeddings):
+    return CrawlIngestionService(
+        repository,
+        embeddings,
+        default_unit="教務處",
+        announcement_adapter=IncrementalAnnouncementAdapter(repository),
+        announcement_source_resolver=lambda _page, _unit: ANNOUNCEMENT_SOURCE,
+    )
 
 
 def page(body: str, url: str = "https://www.nptu.edu.tw/rules") -> NptuSitePage:
@@ -189,7 +356,8 @@ def test_sqlite_pending_failed_success_recovery_is_fenced() -> None:
         state = session.scalar(select(SitePage).where(SitePage.id == page_id))
         assert state is not None
         assert state.ingestion_status == "failed"
-        assert state.ingestion_content_hash == content_hash("待恢復內容")
+        assert state.ingestion_content_hash != content_hash("待恢復內容")
+        assert state.ingestion_attempt_hash == content_hash("待恢復內容")
 
     second_token = uuid4()
     with factory.begin() as session:
@@ -235,3 +403,155 @@ def test_sqlite_document_save_is_idempotent_across_repository_instances() -> Non
 
     assert first.save_idempotent(metadata, "同一份內容", chunks, embeddings) is True
     assert second.save_idempotent(metadata, "同一份內容", chunks, embeddings) is False
+
+
+def test_undated_announcement_is_terminal_incomplete_and_same_hash_skips() -> None:
+    repository = MemoryAnnouncementIngestionRepository()
+    embeddings = RecordingEmbeddingProvider()
+    service = _announcement_service(repository, embeddings)
+    page_id = uuid4()
+    lease = {"page_id": page_id, "lease_owner": "worker-a", "lease_token": uuid4()}
+
+    first = service.ingest_page(
+        announcement_listing_page(),
+        **lease,
+        lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+    )
+    second = service.ingest_page(
+        announcement_listing_page(),
+        **lease,
+        lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+    )
+
+    state = repository.page_states[str(page_id)]
+    assert first.status is CrawlIngestionStatus.INCOMPLETE
+    assert first.announcement_incomplete == 1
+    assert first.announcement_failed == 0
+    assert state["announcement"] == "incomplete"
+    assert state["ingestion"] == "partial"
+    assert second.status is CrawlIngestionStatus.SKIPPED
+    assert len(embeddings.calls) == 1
+
+
+def test_mixed_listing_persists_dated_item_and_marks_page_incomplete() -> None:
+    repository = MemoryAnnouncementIngestionRepository()
+    embeddings = RecordingEmbeddingProvider()
+    service = _announcement_service(repository, embeddings)
+    page_id = uuid4()
+    lease = {"page_id": page_id, "lease_owner": "worker-a", "lease_token": uuid4()}
+    dated_url = "https://www.nptu.edu.tw/p/406-1025-197413.php"
+    undated_url = "https://www.nptu.edu.tw/p/406-1025-197414.php"
+    listing = NptuSitePage(
+        title="公告列表",
+        canonical_url="https://www.nptu.edu.tw/p/403-1025-1019.php",
+        body="公告列表",
+        published_at=None,
+        links=(dated_url, undated_url),
+        role=UnitAnnouncementPageRole.LISTING,
+        announcement_items=(
+            NptuListingItem(
+                title="已有日期公告",
+                canonical_url=dated_url,
+                published_at=date(2026, 8, 1),
+                summary="已有日期摘要",
+                anchor_text="已有日期公告",
+                order=0,
+            ),
+            NptuListingItem(
+                title="尚無日期公告",
+                canonical_url=undated_url,
+                published_at=None,
+                summary="尚無日期摘要",
+                anchor_text="尚無日期公告",
+                order=1,
+            ),
+        ),
+    )
+
+    result = service.ingest_page(
+        listing,
+        **lease,
+        lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+    )
+
+    state = repository.page_states[str(page_id)]
+    dated_candidate = repository.announcement_items[dated_url]
+    assert result.status is CrawlIngestionStatus.INCOMPLETE
+    assert result.announcement_persisted == 1
+    assert result.announcement_incomplete == 1
+    assert result.announcement_failed == 0
+    assert dated_candidate.published_at == date(2026, 8, 1)
+    assert undated_url not in repository.announcement_items
+    assert state["announcement"] == "incomplete"
+
+
+def test_detail_date_can_reingest_incomplete_announcement_to_success() -> None:
+    repository = MemoryAnnouncementIngestionRepository()
+    embeddings = RecordingEmbeddingProvider()
+    service = _announcement_service(repository, embeddings)
+    page_id = uuid4()
+    lease = {"page_id": page_id, "lease_owner": "worker-a", "lease_token": uuid4()}
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+
+    first = service.ingest_page(
+        announcement_listing_page(),
+        **lease,
+        lease_expires_at=expires_at,
+    )
+    enriched = service.ingest_page(
+        announcement_detail_page(),
+        **lease,
+        lease_expires_at=expires_at,
+    )
+
+    state = repository.page_states[str(page_id)]
+    candidate = repository.announcement_items[ANNOUNCEMENT_URL]
+    assert first.status is CrawlIngestionStatus.INCOMPLETE
+    assert enriched.status is CrawlIngestionStatus.CREATED
+    assert enriched.announcement_incomplete == 0
+    assert enriched.announcement_failed == 0
+    assert state["announcement"] == "success"
+    assert state["ingestion"] == "success"
+    assert candidate.published_at == date(2026, 8, 2)
+
+
+def test_announcement_repository_failure_remains_failed_and_retryable() -> None:
+    repository = MemoryAnnouncementIngestionRepository(fail_announcement=True)
+    embeddings = RecordingEmbeddingProvider()
+    service = _announcement_service(repository, embeddings)
+    page_id = uuid4()
+    lease = {"page_id": page_id, "lease_owner": "worker-a", "lease_token": uuid4()}
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+
+    first = service.ingest_page(
+        announcement_detail_page(),
+        **lease,
+        lease_expires_at=expires_at,
+    )
+    second = service.ingest_page(
+        announcement_detail_page(),
+        **lease,
+        lease_expires_at=expires_at,
+    )
+
+    state = repository.page_states[str(page_id)]
+    assert first.status is CrawlIngestionStatus.PARTIAL
+    assert second.status is CrawlIngestionStatus.PARTIAL
+    assert first.announcement_failed == 1
+    assert first.announcement_incomplete == 0
+    assert state["announcement"] == "failed"
+    assert repository.merge_calls == 2
+    assert len(embeddings.calls) == 2
+
+
+def test_incomplete_status_migration_is_added_after_0008() -> None:
+    migration_dir = Path(__file__).parents[3] / "database" / "migrations" / "versions"
+    migration = migration_dir / "20260803_0009_announcement_incomplete.py"
+    previous = migration_dir / "20260803_0008_ingestion_recovery.py"
+
+    assert migration.exists()
+    content = migration.read_text(encoding="utf-8")
+    assert 'down_revision: str | None = "20260803_0008"' in content
+    assert "'incomplete'" in content
+    assert "ck_site_pages_announcement_ingestion_status" in content
+    assert "incomplete" not in previous.read_text(encoding="utf-8")

@@ -4,6 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
+from hashlib import sha256
 from typing import Protocol, cast
 from uuid import UUID
 
@@ -35,6 +36,12 @@ class CrawlClaim:
     changed_streak: int = 0
     unchanged_streak: int = 0
     last_retry_after_at: datetime | None = None
+
+
+def canonical_crawl_identity(claim: CrawlClaim) -> str:
+    """Return the stable identity used to spread a page's crawl schedule."""
+
+    return claim.canonical_url or f"page:{claim.page_id}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +118,7 @@ class AdaptiveScheduleInputs:
     crawl_priority: int = 0
     failure_count: int = 0
     retry_after: str | None = None
+    identity: str = ""
 
     def __post_init__(self) -> None:
         normalized_page_type = getattr(self.page_type, "value", self.page_type)
@@ -119,6 +127,7 @@ class AdaptiveScheduleInputs:
             "page_type",
             str(normalized_page_type or "unknown"),
         )
+        object.__setattr__(self, "identity", str(self.identity or "").strip())
         for name in ("changed_streak", "unchanged_streak", "failure_count"):
             if getattr(self, name) < 0:
                 raise ValueError(f"{name} 不得為負數")
@@ -252,10 +261,10 @@ class AdaptiveSchedulePolicy:
         jitter: Jitter | None = None,
     ) -> None:
         self.config = config or AdaptiveScheduleConfig()
-        # The default is deliberately deterministic.  Deployments that need
-        # spread across workers can inject a stable jitter function, while
-        # tests can inject an identity or fixed-offset function.
-        self._jitter = jitter or self._identity_jitter
+        # A supplied jitter remains an escape hatch for deterministic tests or
+        # deployments with their own policy.  The production default below is
+        # derived from the page identity rather than process-local hash state.
+        self._jitter = jitter
 
     def success_decision(
         self,
@@ -268,6 +277,7 @@ class AdaptiveSchedulePolicy:
         crawl_priority: int = 0,
         failure_count: int = 0,
         retry_after: str | None = None,
+        identity: str | None = None,
         priority: int | None = None,
         inputs: AdaptiveScheduleInputs | None = None,
     ) -> SuccessDecision:
@@ -280,6 +290,7 @@ class AdaptiveSchedulePolicy:
             crawl_priority=crawl_priority if priority is None else priority,
             failure_count=failure_count,
             retry_after=retry_after,
+            identity=identity,
         )
         if policy_inputs.changed is None:
             raise ValueError("成功排程必須提供 changed")
@@ -291,7 +302,11 @@ class AdaptiveSchedulePolicy:
         )
         delay = base * self._adaptive_factor(policy_inputs)
         delay = self._bounded(delay, self.config.maximum_interval_seconds)
-        delay = self._jittered(delay, maximum=self.config.maximum_interval_seconds)
+        delay = self._jittered(
+            delay,
+            maximum=self.config.maximum_interval_seconds,
+            identity=self._state_identity(policy_inputs, outcome="success"),
+        )
         return SuccessDecision(
             next_crawl_at=now + timedelta(seconds=delay),
             delay_seconds=delay,
@@ -314,6 +329,7 @@ class AdaptiveSchedulePolicy:
         crawl_priority: int = 0,
         failure_count: int = 0,
         retry_after: str | None = None,
+        identity: str | None = None,
         priority: int | None = None,
         inputs: AdaptiveScheduleInputs | None = None,
     ) -> datetime:
@@ -326,6 +342,7 @@ class AdaptiveSchedulePolicy:
             crawl_priority=crawl_priority,
             failure_count=failure_count,
             retry_after=retry_after,
+            identity=identity,
             priority=priority,
             inputs=inputs,
         ).next_crawl_at
@@ -341,6 +358,7 @@ class AdaptiveSchedulePolicy:
         changed_streak: int = 0,
         unchanged_streak: int = 0,
         crawl_priority: int = 0,
+        identity: str | None = None,
         priority: int | None = None,
         inputs: AdaptiveScheduleInputs | None = None,
     ) -> FailureDecision:
@@ -353,6 +371,7 @@ class AdaptiveSchedulePolicy:
             crawl_priority=crawl_priority if priority is None else priority,
             failure_count=0 if failure_count is None else failure_count,
             retry_after=retry_after,
+            identity=identity,
         )
         if (
             http_status in {404, 410}
@@ -424,6 +443,9 @@ class AdaptiveSchedulePolicy:
                     self.config.retry_max_seconds,
                     self.config.maximum_interval_seconds,
                 ),
+                identity=self._state_identity(
+                    policy_inputs, outcome=f"failure:{http_status or 'unknown'}"
+                ),
             )
         return FailureDecision(
             retry=True,
@@ -450,6 +472,7 @@ class AdaptiveSchedulePolicy:
         crawl_priority: int,
         failure_count: int,
         retry_after: str | None,
+        identity: str | None,
     ) -> AdaptiveScheduleInputs:
         if inputs is not None:
             if changed is not None and inputs.changed not in {None, changed}:
@@ -459,6 +482,10 @@ class AdaptiveSchedulePolicy:
                 retry_after,
             }:
                 raise ValueError("Retry-After 與 policy inputs 不一致")
+            if identity is not None and inputs.identity not in {"", identity}:
+                raise ValueError("identity 與 policy inputs 不一致")
+            if identity is not None and not inputs.identity:
+                return replace(inputs, identity=identity)
             return inputs
         return AdaptiveScheduleInputs(
             page_type=page_type,
@@ -468,6 +495,7 @@ class AdaptiveSchedulePolicy:
             crawl_priority=crawl_priority,
             failure_count=failure_count,
             retry_after=retry_after,
+            identity=identity or "",
         )
 
     def _adaptive_factor(self, inputs: AdaptiveScheduleInputs) -> float:
@@ -504,15 +532,58 @@ class AdaptiveSchedulePolicy:
             max(self.config.minimum_interval_seconds, delay),
         )
 
-    def _jittered(self, delay: float, *, maximum: float) -> float:
-        jittered = self._jitter(delay)
+    def _jittered(
+        self,
+        delay: float,
+        *,
+        maximum: float,
+        identity: str,
+    ) -> float:
+        jittered = (
+            self._jitter(delay)
+            if self._jitter is not None
+            else self._stable_jitter(
+                delay,
+                identity=identity,
+                jitter_ratio=self.config.jitter_ratio,
+            )
+        )
         if jittered < 0:
             raise ValueError("jitter 不得產生負數延遲")
         return self._bounded(jittered, maximum)
 
     @staticmethod
-    def _identity_jitter(delay: float) -> float:
-        return delay
+    def _state_identity(inputs: AdaptiveScheduleInputs, *, outcome: str) -> str:
+        """Build a stable, state-aware jitter key without process-local hash()."""
+
+        if not inputs.identity:
+            return ""
+        return "|".join(
+            (
+                inputs.identity,
+                f"page_type={inputs.page_type}",
+                f"changed={inputs.changed}",
+                f"changed_streak={inputs.changed_streak}",
+                f"unchanged_streak={inputs.unchanged_streak}",
+                f"failure_count={inputs.failure_count}",
+                f"priority={inputs.crawl_priority}",
+                f"outcome={outcome}",
+            )
+        )
+
+    @staticmethod
+    def _stable_jitter(
+        delay: float,
+        *,
+        identity: str,
+        jitter_ratio: float,
+    ) -> float:
+        if not identity or jitter_ratio == 0:
+            return delay
+        digest = sha256(identity.encode("utf-8")).digest()
+        unit = int.from_bytes(digest[:8], "big") / float(1 << 64)
+        centered = (unit * 2.0) - 1.0
+        return delay * (1.0 + centered * jitter_ratio)
 
 
 class CrawlScheduler:
@@ -523,10 +594,12 @@ class CrawlScheduler:
         repository: CrawlLeaseRepository,
         *,
         policy: AdaptiveSchedulePolicy | None = None,
+        identity: Callable[[CrawlClaim], str] | None = None,
         now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ) -> None:
         self._repository = repository
         self._policy = policy or AdaptiveSchedulePolicy()
+        self._identity = identity or canonical_crawl_identity
         self._now = now
 
     def claim_due(
@@ -604,6 +677,7 @@ class CrawlScheduler:
             unchanged_streak=claim.unchanged_streak,
             crawl_priority=claim.crawl_priority,
             failure_count=claim.failure_count,
+            identity=self._identity(claim),
         )
         return self._repository.complete(
             claim,
@@ -653,6 +727,7 @@ class CrawlScheduler:
             changed_streak=claim.changed_streak,
             unchanged_streak=claim.unchanged_streak,
             crawl_priority=claim.crawl_priority,
+            identity=self._identity(claim),
         )
         applied = self._repository.fail(
             claim,

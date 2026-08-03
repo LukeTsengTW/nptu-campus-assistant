@@ -178,6 +178,7 @@ class CrawlWorkerController:
                 failed=_integer(durable.get("failed")),
                 blocked=_integer(durable.get("blocked")),
                 pending_ingestion=_integer(durable.get("pending_ingestion")),
+                incomplete_ingestion=_integer(durable.get("incomplete_ingestion")),
                 active_workers=_integer(durable.get("active_workers")),
                 next_due_at=_datetime_value(durable.get("next_due_at")),
                 recent_attempts=_attempt_counts(durable.get("recent_attempts")),

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -146,6 +150,214 @@ def test_success_policy_is_deterministic_and_uses_all_persisted_inputs() -> None
     assert first.next_crawl_at == NOW + timedelta(seconds=75)
 
 
+def test_default_jitter_is_stable_across_instances_for_same_identity() -> None:
+    config = AdaptiveScheduleConfig(
+        success_interval_seconds=100,
+        minimum_interval_seconds=1,
+        maximum_interval_seconds=200,
+        jitter_ratio=0.25,
+    )
+    identity = "https://www.nptu.edu.tw/announcements/stable-jitter"
+
+    first = AdaptiveSchedulePolicy(config).success_decision(
+        now=NOW,
+        changed=True,
+        identity=identity,
+    )
+    second = AdaptiveSchedulePolicy(config).success_decision(
+        now=NOW,
+        changed=True,
+        identity=identity,
+    )
+
+    assert first == second
+    assert first.policy_inputs.identity == identity
+
+
+def test_default_jitter_is_stable_across_processes() -> None:
+    script = """
+from datetime import datetime, timezone
+from nptu_assistant.crawlers.crawl_scheduler import AdaptiveScheduleConfig, AdaptiveSchedulePolicy
+
+decision = AdaptiveSchedulePolicy(
+    AdaptiveScheduleConfig(
+        success_interval_seconds=100,
+        minimum_interval_seconds=1,
+        maximum_interval_seconds=200,
+        jitter_ratio=0.25,
+    )
+).success_decision(
+    now=datetime(2026, 8, 2, 12, 0, tzinfo=timezone.utc),
+    changed=True,
+    identity="https://www.nptu.edu.tw/announcements/cross-process",
+)
+print(decision.delay_seconds)
+"""
+    environment = os.environ.copy()
+    source_root = Path(__file__).parents[1] / "src"
+    environment["PYTHONPATH"] = os.pathsep.join(
+        part for part in (str(source_root), environment.get("PYTHONPATH")) if part
+    )
+    environment["PYTHONHASHSEED"] = "random"
+
+    values = [
+        subprocess.run(
+            [sys.executable, "-c", script],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=environment,
+        ).stdout.strip()
+        for _ in range(2)
+    ]
+
+    assert values[0] == values[1]
+
+
+def test_default_jitter_spreads_different_url_identities() -> None:
+    config = AdaptiveScheduleConfig(
+        success_interval_seconds=100,
+        minimum_interval_seconds=1,
+        maximum_interval_seconds=200,
+        jitter_ratio=0.25,
+    )
+
+    first = AdaptiveSchedulePolicy(config).success_decision(
+        now=NOW,
+        changed=True,
+        identity="https://www.nptu.edu.tw/announcements/stable-jitter-a",
+    )
+    second = AdaptiveSchedulePolicy(config).success_decision(
+        now=NOW,
+        changed=True,
+        identity="https://www.nptu.edu.tw/announcements/stable-jitter-b",
+    )
+
+    assert first.delay_seconds != second.delay_seconds
+
+
+def test_default_jitter_ratio_zero_is_identity_for_success_and_failure() -> None:
+    policy = AdaptiveSchedulePolicy(
+        AdaptiveScheduleConfig(
+            success_interval_seconds=100,
+            retry_base_seconds=80,
+            retry_factor=1,
+            retry_max_seconds=200,
+            minimum_interval_seconds=1,
+            maximum_interval_seconds=200,
+            jitter_ratio=0,
+        )
+    )
+    identity = "https://www.nptu.edu.tw/announcements/no-jitter"
+
+    success = policy.success_decision(now=NOW, changed=True, identity=identity)
+    failure = policy.failure_decision(
+        now=NOW,
+        http_status=503,
+        failure_count=1,
+        identity=identity,
+    )
+
+    assert success.delay_seconds == 100
+    assert failure.delay_seconds == 80
+
+
+def test_default_jitter_is_bounded_for_success_and_failure() -> None:
+    config = AdaptiveScheduleConfig(
+        success_interval_seconds=100,
+        retry_base_seconds=80,
+        retry_factor=1,
+        retry_max_seconds=150,
+        minimum_interval_seconds=30,
+        maximum_interval_seconds=130,
+        jitter_ratio=0.5,
+    )
+    policy = AdaptiveSchedulePolicy(config)
+    identity = "https://www.nptu.edu.tw/announcements/bounded-jitter"
+
+    success = policy.success_decision(now=NOW, changed=True, identity=identity)
+    failure = policy.failure_decision(
+        now=NOW,
+        http_status=503,
+        failure_count=1,
+        identity=identity,
+    )
+
+    assert 50 <= success.delay_seconds <= 130
+    assert 40 <= failure.delay_seconds <= 120
+    assert success.next_crawl_at >= NOW + timedelta(seconds=50)
+    assert failure.next_crawl_at >= NOW + timedelta(seconds=40)
+
+
+def test_retry_after_is_never_reduced_by_default_jitter() -> None:
+    policy = AdaptiveSchedulePolicy(
+        AdaptiveScheduleConfig(
+            minimum_interval_seconds=1,
+            maximum_interval_seconds=100,
+            retry_max_seconds=100,
+            jitter_ratio=0.5,
+        )
+    )
+
+    decision = policy.failure_decision(
+        now=NOW,
+        http_status=429,
+        failure_count=1,
+        retry_after="30",
+        identity="https://www.nptu.edu.tw/announcements/retry-after",
+    )
+
+    assert decision.delay_seconds == 30
+    assert decision.next_crawl_at == NOW + timedelta(seconds=30)
+
+
+def test_production_scheduler_default_jitter_uses_claim_identity() -> None:
+    repository = RecordingRepository()
+    scheduler = CrawlScheduler(repository, now=lambda: NOW)
+    claim = CrawlClaim(
+        page_id=uuid4(),
+        canonical_url="https://www.nptu.edu.tw/announcements/production-jitter",
+        owner="worker-a",
+        token=uuid4(),
+        lease_expires_at=NOW + timedelta(minutes=5),
+        crawl_priority=0,
+        next_crawl_at=NOW,
+        failure_count=2,
+    )
+
+    decision = scheduler.fail(claim, http_status=503)
+
+    assert decision.policy_inputs is not None
+    assert decision.policy_inputs.identity == claim.canonical_url
+    assert decision.delay_seconds != 240
+
+
+def test_scheduler_accepts_injected_identity_with_fixed_jitter() -> None:
+    repository = RecordingRepository()
+    scheduler = CrawlScheduler(
+        repository,
+        policy=AdaptiveSchedulePolicy(jitter=lambda delay: delay + 1),
+        identity=lambda _claim: "injected-page-identity",
+        now=lambda: NOW,
+    )
+    claim = CrawlClaim(
+        page_id=uuid4(),
+        canonical_url="https://www.nptu.edu.tw/announcements/ignored",
+        owner="worker-a",
+        token=uuid4(),
+        lease_expires_at=NOW + timedelta(minutes=5),
+        crawl_priority=0,
+        next_crawl_at=NOW,
+        failure_count=0,
+    )
+
+    decision = scheduler.fail(claim, http_status=503)
+
+    assert decision.policy_inputs is not None
+    assert decision.policy_inputs.identity == "injected-page-identity"
+    assert decision.delay_seconds == 61
+
+
 def test_success_policy_respects_minimum_and_maximum_after_jitter() -> None:
     policy = AdaptiveSchedulePolicy(
         AdaptiveScheduleConfig(
@@ -288,6 +500,7 @@ def test_scheduler_passes_fenced_claim_and_policy_decision_to_repository() -> No
     assert decision.policy_inputs.page_type == "announcement_listing"
     assert decision.policy_inputs.changed_streak == 2
     assert decision.policy_inputs.unchanged_streak == 3
+    assert decision.policy_inputs.identity == claim.canonical_url
 
 
 def test_invalid_adaptive_config_is_rejected() -> None:

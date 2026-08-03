@@ -553,11 +553,22 @@ class SqlCrawlSchedulerRepository:
                     .where(
                         SitePage.content_hash.is_not(None),
                         or_(
-                            SitePage.ingestion_status != "success",
+                            SitePage.ingestion_status.in_(["pending", "failed"]),
                             SitePage.announcement_ingestion_status.in_(
                                 ["pending", "failed"]
                             ),
                         ),
+                    )
+                )
+                or 0
+            )
+            incomplete_ingestion = (
+                session.scalar(
+                    select(func.count())
+                    .select_from(SitePage)
+                    .where(
+                        SitePage.content_hash.is_not(None),
+                        SitePage.announcement_ingestion_status == "incomplete",
                     )
                 )
                 or 0
@@ -580,6 +591,7 @@ class SqlCrawlSchedulerRepository:
                 "failed": int(failed),
                 "blocked": int(blocked),
                 "pending_ingestion": int(pending_ingestion),
+                "incomplete_ingestion": int(incomplete_ingestion),
                 "next_due_at": next_due,
                 "active_workers": int(active_workers),
                 "recent_attempts": {

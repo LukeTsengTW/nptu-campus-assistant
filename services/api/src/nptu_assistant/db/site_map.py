@@ -113,7 +113,7 @@ class SqlSiteMapRepository(SiteMapRepository):
         clock: Callable[[], datetime] = _now,
         site_map_query_budget_ratio: float = 0.25,
         site_map_query_min_seconds: float = 0.05,
-        site_map_query_max_seconds: float = 2.0,
+        site_map_query_max_seconds: float = 0.75,
         frontier_policy: FrontierPolicy | None = None,
     ) -> None:
         if not 0 < site_map_query_budget_ratio <= 1:
@@ -266,9 +266,10 @@ class SqlSiteMapRepository(SiteMapRepository):
                 target_updated=sum(1 for item in target_outcomes if item[2]),
                 links_created=sum(1 for item in edge_outcomes if item),
                 links_updated=sum(1 for item in edge_outcomes if not item),
-                statement_count=3
-                + int(bool(target_pages))
-                + 2 * int(bool(edge_values)),
+                # PostgreSQL uses one set-based lock statement and one
+                # set-based state lookup. Live acceptance traces SQL; this
+                # field is the fixed operation budget exposed to callers.
+                statement_count=7,
                 frontier_skipped=frontier_skipped,
             )
 
@@ -312,53 +313,87 @@ class SqlSiteMapRepository(SiteMapRepository):
             session.bind is not None and session.bind.dialect.name == "postgresql"
         )
         if is_postgresql:
+            # All writers use the same global-then-host order.  One statement
+            # acquires every lock, so host count cannot turn this transaction
+            # into an advisory-lock N+1 sequence.
             session.execute(
                 text(
-                    "SELECT pg_advisory_xact_lock("
-                    "hashtextextended('nptu-frontier-global-cap', 0))"
-                )
+                    "WITH lock_keys AS ("
+                    " SELECT 0 AS lock_group, 'global' AS lock_name, "
+                    " hashtextextended('nptu-frontier-global-cap', 0)::bigint "
+                    " AS lock_key"
+                    " UNION ALL "
+                    " SELECT 1, host, hashtext(host)::bigint"
+                    " FROM unnest(CAST(:hosts AS text[])) AS requested(host)"
+                    ")"
+                    " SELECT pg_advisory_xact_lock(lock_key)"
+                    " FROM lock_keys"
+                    " ORDER BY lock_group, lock_name"
+                ),
+                {"hosts": list(hosts)},
             )
-            for host in hosts:
-                session.execute(
-                    text("SELECT pg_advisory_xact_lock(hashtext(:host))"),
-                    {"host": host},
-                )
 
-        existing_rows = session.execute(
-            select(SitePage.canonical_url).where(
-                SitePage.canonical_url.in_(tuple(unique))
-            )
-        ).scalars()
-        existing_urls = set(existing_rows)
-        pending_total = int(
-            session.scalar(
-                select(func.count())
-                .select_from(SitePage)
-                .where(
-                    SitePage.is_active.is_(True),
-                    SitePage.is_indexable.is_(True),
-                    SitePage.crawl_status.not_in(
-                        [SiteCrawlStatus.BLOCKED.value, SiteCrawlStatus.EXCLUDED.value]
-                    ),
-                    SitePage.crawl_status.in_(
-                        [
-                            SiteCrawlStatus.DISCOVERED.value,
-                            SiteCrawlStatus.QUEUED.value,
-                            SiteCrawlStatus.FAILED.value,
-                            SiteCrawlStatus.FETCHING.value,
-                        ]
-                    ),
+            # Existing URLs, the global pending count, and all requested host
+            # counts are read under the locks in one bounded SQL statement.
+            state_rows = session.execute(
+                text(
+                    "WITH requested_urls AS ("
+                    " SELECT unnest(CAST(:urls AS text[])) AS canonical_url"
+                    "), requested_hosts AS ("
+                    " SELECT unnest(CAST(:hosts AS text[])) AS host"
+                    "), eligible AS ("
+                    " SELECT sp.host, count(*)::bigint AS pending_count"
+                    " FROM site_pages sp"
+                    " JOIN requested_hosts rh ON rh.host = sp.host"
+                    " WHERE sp.is_active IS TRUE"
+                    "   AND sp.is_indexable IS TRUE"
+                    "   AND sp.crawl_status NOT IN ('blocked', 'excluded')"
+                    "   AND sp.crawl_status IN "
+                    "       ('discovered', 'queued', 'failed', 'fetching')"
+                    " GROUP BY sp.host"
+                    "), total AS ("
+                    " SELECT count(*)::bigint AS pending_count"
+                    " FROM site_pages sp"
+                    " WHERE sp.is_active IS TRUE"
+                    "   AND sp.is_indexable IS TRUE"
+                    "   AND sp.crawl_status NOT IN ('blocked', 'excluded')"
+                    "   AND sp.crawl_status IN "
+                    "       ('discovered', 'queued', 'failed', 'fetching')"
+                    ")"
+                    " SELECT 'existing' AS row_kind, sp.canonical_url, "
+                    "        sp.host, NULL::bigint AS pending_count"
+                    " FROM site_pages sp"
+                    " JOIN requested_urls ru ON ru.canonical_url = sp.canonical_url"
+                    " UNION ALL"
+                    " SELECT 'host', NULL, host, pending_count FROM eligible"
+                    " UNION ALL"
+                    " SELECT 'total', NULL, NULL, pending_count FROM total"
+                ),
+                {"urls": list(unique), "hosts": list(hosts)},
+            ).mappings()
+            existing_urls: set[str] = set()
+            pending_by_host: dict[str, int] = {host: 0 for host in hosts}
+            pending_total = 0
+            for row in state_rows:
+                kind = row["row_kind"]
+                if kind == "existing":
+                    existing_urls.add(str(row["canonical_url"]))
+                elif kind == "host":
+                    pending_by_host[str(row["host"])] = int(row["pending_count"] or 0)
+                else:
+                    pending_total = int(row["pending_count"] or 0)
+        else:
+            existing_rows = session.execute(
+                select(SitePage.canonical_url).where(
+                    SitePage.canonical_url.in_(tuple(unique))
                 )
-            )
-            or 0
-        )
-        pending_by_host = {
-            host: int(
+            ).scalars()
+            existing_urls = set(existing_rows)
+            pending_total = int(
                 session.scalar(
                     select(func.count())
                     .select_from(SitePage)
                     .where(
-                        SitePage.host == host,
                         SitePage.is_active.is_(True),
                         SitePage.is_indexable.is_(True),
                         SitePage.crawl_status.not_in(
@@ -379,8 +414,35 @@ class SqlSiteMapRepository(SiteMapRepository):
                 )
                 or 0
             )
-            for host in hosts
-        }
+            pending_by_host = {
+                host: int(
+                    session.scalar(
+                        select(func.count())
+                        .select_from(SitePage)
+                        .where(
+                            SitePage.host == host,
+                            SitePage.is_active.is_(True),
+                            SitePage.is_indexable.is_(True),
+                            SitePage.crawl_status.not_in(
+                                [
+                                    SiteCrawlStatus.BLOCKED.value,
+                                    SiteCrawlStatus.EXCLUDED.value,
+                                ]
+                            ),
+                            SitePage.crawl_status.in_(
+                                [
+                                    SiteCrawlStatus.DISCOVERED.value,
+                                    SiteCrawlStatus.QUEUED.value,
+                                    SiteCrawlStatus.FAILED.value,
+                                    SiteCrawlStatus.FETCHING.value,
+                                ]
+                            ),
+                        )
+                    )
+                    or 0
+                )
+                for host in hosts
+            }
         kept: list[SiteLinkUpsert] = []
         skipped = 0
         for link in unique.values():
@@ -496,20 +558,17 @@ class SqlSiteMapRepository(SiteMapRepository):
             )
             if is_postgresql:
                 config_sql = (
-                    "SELECT set_config('pg_trgm.similarity_threshold', "
+                    "SELECT set_config('statement_timeout', :timeout, true), "
+                    "set_config('pg_trgm.similarity_threshold', "
                     ":trigram_threshold, true)"
                 )
                 config_parameters: dict[str, object] = {
-                    "trigram_threshold": str(PG_TRGM_PREFILTER_THRESHOLD)
+                    "trigram_threshold": str(PG_TRGM_PREFILTER_THRESHOLD),
+                    "timeout": f"{math.ceil(self._site_map_query_max_seconds * 1000)}ms",
                 }
                 if deadline is not None:
                     budget_seconds = self._site_map_budget_seconds(deadline)
                     timeout_ms = max(1, math.ceil(budget_seconds * 1000))
-                    config_sql = (
-                        "SELECT set_config('statement_timeout', :timeout, true), "
-                        "set_config('pg_trgm.similarity_threshold', "
-                        ":trigram_threshold, true)"
-                    )
                     config_parameters["timeout"] = f"{timeout_ms}ms"
                     deadline.raise_if_expired()
                 session.execute(
@@ -629,9 +688,29 @@ class SqlSiteMapRepository(SiteMapRepository):
             else_=0.0,
         )
         query_terms = self._query_terms(plan)
+        page_lexical_scores: Any = None
+        anchor_lexical_scores: Any = None
+        candidate_filters = (
+            SitePage.is_active.is_(True),
+            SitePage.is_indexable.is_(True),
+            SitePage.crawl_status.not_in(
+                [
+                    SiteCrawlStatus.BLOCKED.value,
+                    SiteCrawlStatus.EXCLUDED.value,
+                ]
+            ),
+            _host_scope(allowed_hosts),
+        )
         if dialect_name == "postgresql":
-            lexical_relevance, anchor_relevance, lexical_match = (
-                self._postgres_lexical_expressions(query_terms)
+            (
+                lexical_relevance,
+                anchor_relevance,
+                lexical_match,
+                page_lexical_scores,
+                anchor_lexical_scores,
+            ) = self._postgres_lexical_expressions(
+                query_terms,
+                candidate_filters=candidate_filters,
             )
         else:
             lexical_relevance, anchor_relevance, lexical_match = (
@@ -664,6 +743,63 @@ class SqlSiteMapRepository(SiteMapRepository):
             ),
         )
         final_score = lexical_relevance * 0.75 + structural_score * 0.25
+        if dialect_name == "postgresql":
+            candidate_scores = (
+                select(
+                    SitePage.id.label("page_id"),
+                    lexical_relevance.label("lexical_relevance"),
+                    structural_score.label("structural_score"),
+                    anchor_relevance.label("anchor_relevance"),
+                )
+                .select_from(
+                    SitePage.__table__.join(
+                        page_lexical_scores,
+                        page_lexical_scores.c.page_id == SitePage.id,
+                    ).outerjoin(
+                        anchor_lexical_scores,
+                        anchor_lexical_scores.c.page_id == SitePage.id,
+                    )
+                )
+                .where(
+                    or_(
+                        lexical_match,
+                        SitePage.page_type.in_(
+                            [
+                                SitePageType.UNIT_HOMEPAGE.value,
+                                SitePageType.ANNOUNCEMENT_LISTING.value,
+                            ]
+                        ),
+                    )
+                )
+                .cte("site_map_candidate_scores")
+                .prefix_with("MATERIALIZED")
+            )
+            candidate_final_score = (
+                candidate_scores.c.lexical_relevance * 0.75
+                + candidate_scores.c.structural_score * 0.25
+            )
+            return (
+                select(
+                    SitePage,
+                    candidate_scores.c.lexical_relevance,
+                    candidate_scores.c.structural_score,
+                    candidate_final_score.label("final_score"),
+                    candidate_scores.c.anchor_relevance,
+                )
+                .join(
+                    candidate_scores,
+                    candidate_scores.c.page_id == SitePage.id,
+                )
+                .order_by(
+                    candidate_final_score.desc(),
+                    candidate_scores.c.lexical_relevance.desc(),
+                    candidate_scores.c.structural_score.desc(),
+                    SitePage.minimum_depth.asc(),
+                    SitePage.failure_count.asc(),
+                    SitePage.last_successful_crawl_at.desc().nulls_last(),
+                )
+                .limit(limit)
+            )
         return (
             select(
                 SitePage,
@@ -673,15 +809,7 @@ class SqlSiteMapRepository(SiteMapRepository):
                 anchor_relevance.label("anchor_relevance"),
             )
             .where(
-                SitePage.is_active.is_(True),
-                SitePage.is_indexable.is_(True),
-                SitePage.crawl_status.not_in(
-                    [
-                        SiteCrawlStatus.BLOCKED.value,
-                        SiteCrawlStatus.EXCLUDED.value,
-                    ]
-                ),
-                _host_scope(allowed_hosts),
+                *candidate_filters,
                 or_(
                     lexical_match,
                     SitePage.page_type.in_(
@@ -730,7 +858,9 @@ class SqlSiteMapRepository(SiteMapRepository):
     @staticmethod
     def _postgres_lexical_expressions(
         query_terms: Sequence[tuple[str, float]],
-    ) -> tuple[Any, Any, Any]:
+        *,
+        candidate_filters: Sequence[Any],
+    ) -> tuple[Any, Any, Any, Any, Any]:
         term_values = (
             values(
                 column("query_text", String),
@@ -738,102 +868,143 @@ class SqlSiteMapRepository(SiteMapRepository):
                 name="site_map_query_terms",
             )
             .data(query_terms)
-            .alias("site_map_query_terms")
+            .cte("site_map_query_terms")
         )
         qtext = term_values.c.query_text
         qweight = term_values.c.query_weight
-        title_similarity = (
+        contains_terms = tuple(term for term, _weight in query_terms)
+        title_contains = (
+            or_(*(SitePage.title.ilike(f"%{term}%") for term in contains_terms))
+            if contains_terms
+            else literal(False)
+        )
+        path_contains = (
+            or_(*(SitePage.path.ilike(f"%{term}%") for term in contains_terms))
+            if contains_terms
+            else literal(False)
+        )
+        anchor_contains = (
+            or_(*(SiteLink.anchor_text.ilike(f"%{term}%") for term in contains_terms))
+            if contains_terms
+            else literal(False)
+        )
+        # Keep the trigram prefilter in a dedicated candidate-id CTE.  This
+        # lets PostgreSQL use the title/path/anchor GIN indexes before the
+        # bounded similarity aggregation, while retaining anchor-only recall.
+        page_term_candidates = (
+            select(SitePage.id.label("page_id"))
+            .select_from(SitePage.__table__.join(term_values, true()))
+            .where(
+                *candidate_filters,
+                or_(
+                    SitePage.title.op("%")(qtext),
+                    SitePage.path.op("%")(qtext),
+                    title_contains,
+                    path_contains,
+                ),
+            )
+        )
+        anchor_term_candidates = (
+            select(SiteLink.target_page_id.label("page_id"))
+            .select_from(
+                SiteLink.__table__.join(
+                    SitePage, SiteLink.target_page_id == SitePage.id
+                ).join(term_values, true())
+            )
+            .where(
+                *candidate_filters,
+                or_(SiteLink.anchor_text.op("%")(qtext), anchor_contains),
+            )
+        )
+        candidate_page_ids = page_term_candidates.union(anchor_term_candidates).cte(
+            "site_map_candidate_page_ids"
+        )
+        page_lexical_scores = (
             select(
+                SitePage.id.label("page_id"),
                 func.max(
                     func.similarity(func.coalesce(SitePage.title, ""), qtext) * qweight
-                )
-            )
-            .select_from(term_values)
-            .scalar_subquery()
-        )
-        path_similarity = (
-            select(
+                ).label("title_similarity"),
                 func.max(
                     func.similarity(func.coalesce(SitePage.path, ""), qtext) * qweight
-                )
+                ).label("path_similarity"),
+                func.bool_or(
+                    and_(
+                        SitePage.title.op("%")(qtext),
+                        func.similarity(func.coalesce(SitePage.title, ""), qtext)
+                        >= TITLE_TRIGRAM_THRESHOLD,
+                    )
+                ).label("title_fuzzy_match"),
+                func.bool_or(
+                    and_(
+                        SitePage.path.op("%")(qtext),
+                        func.similarity(func.coalesce(SitePage.path, ""), qtext)
+                        >= PATH_TRIGRAM_THRESHOLD,
+                    )
+                ).label("path_fuzzy_match"),
             )
-            .select_from(term_values)
-            .scalar_subquery()
+            .select_from(
+                SitePage.__table__.join(
+                    candidate_page_ids, candidate_page_ids.c.page_id == SitePage.id
+                ).join(term_values, true())
+            )
+            .where(*candidate_filters)
+            .group_by(SitePage.id)
+            .cte("site_map_page_lexical_scores")
         )
-        anchor_similarity = (
+        anchor_lexical_scores = (
             select(
+                SiteLink.target_page_id.label("page_id"),
                 func.max(
                     func.similarity(func.coalesce(SiteLink.anchor_text, ""), qtext)
                     * qweight
-                )
+                ).label("anchor_similarity"),
+                func.bool_or(SiteLink.anchor_text.op("%")(qtext)).label("anchor_match"),
+                func.bool_or(
+                    and_(
+                        SiteLink.anchor_text.op("%")(qtext),
+                        func.similarity(SiteLink.anchor_text, qtext)
+                        >= ANCHOR_TRIGRAM_THRESHOLD,
+                    )
+                ).label("anchor_fuzzy_match"),
             )
-            .select_from(SiteLink)
-            .join(term_values, true())
-            .where(SiteLink.target_page_id == SitePage.id)
-            .correlate(SitePage)
-            .scalar_subquery()
-        )
-        contains_terms = tuple(term for term, _weight in query_terms)
-        title_contains = or_(
-            *(SitePage.title.ilike(f"%{term}%") for term in contains_terms)
-        )
-        path_contains = or_(
-            *(SitePage.path.ilike(f"%{term}%") for term in contains_terms)
-        )
-        anchor_match = (
-            select(SiteLink.id)
-            .where(
-                SiteLink.target_page_id == SitePage.id,
-                or_(*(SiteLink.anchor_text.op("%")(term) for term in contains_terms)),
+            .select_from(
+                SiteLink.__table__.join(
+                    candidate_page_ids,
+                    candidate_page_ids.c.page_id == SiteLink.target_page_id,
+                ).join(term_values, true())
             )
-            .exists()
+            .where(or_(SiteLink.anchor_text.op("%")(qtext), anchor_contains))
+            .group_by(SiteLink.target_page_id)
+            .cte("site_map_anchor_lexical_scores")
+        )
+        anchor_match = func.coalesce(
+            anchor_lexical_scores.c.anchor_match,
+            literal(False),
         )
         title_fuzzy_match = or_(
-            *(
-                and_(
-                    SitePage.title.op("%")(term),
-                    func.similarity(func.coalesce(SitePage.title, ""), term)
-                    >= TITLE_TRIGRAM_THRESHOLD,
-                )
-                for term in contains_terms
-            )
+            page_lexical_scores.c.title_fuzzy_match,
+            literal(False),
         )
         path_fuzzy_match = or_(
-            *(
-                and_(
-                    SitePage.path.op("%")(term),
-                    func.similarity(func.coalesce(SitePage.path, ""), term)
-                    >= PATH_TRIGRAM_THRESHOLD,
-                )
-                for term in contains_terms
-            )
+            page_lexical_scores.c.path_fuzzy_match,
+            literal(False),
         )
-        anchor_fuzzy_match = (
-            select(SiteLink.id)
-            .where(
-                SiteLink.target_page_id == SitePage.id,
-                or_(
-                    *(
-                        and_(
-                            SiteLink.anchor_text.op("%")(term),
-                            func.similarity(SiteLink.anchor_text, term)
-                            >= ANCHOR_TRIGRAM_THRESHOLD,
-                        )
-                        for term in contains_terms
-                    )
-                ),
-            )
-            .exists()
+        anchor_fuzzy_match = func.coalesce(
+            anchor_lexical_scores.c.anchor_fuzzy_match,
+            literal(False),
         )
-        unit_contains = or_(
-            *(SitePage.unit.ilike(f"%{term}%") for term in contains_terms)
+        unit_contains = (
+            or_(*(SitePage.unit.ilike(f"%{term}%") for term in contains_terms))
+            if contains_terms
+            else literal(False)
         )
         lexical = func.least(
             literal(1.0),
             func.greatest(
-                func.coalesce(title_similarity, 0.0),
-                func.coalesce(path_similarity, 0.0),
-                func.coalesce(anchor_similarity, 0.0),
+                func.coalesce(page_lexical_scores.c.title_similarity, 0.0),
+                func.coalesce(page_lexical_scores.c.path_similarity, 0.0),
+                func.coalesce(anchor_lexical_scores.c.anchor_similarity, 0.0),
             )
             * 0.65
             + case((title_contains, 0.28), else_=0.0)
@@ -843,7 +1014,7 @@ class SqlSiteMapRepository(SiteMapRepository):
         )
         return (
             lexical,
-            func.coalesce(anchor_similarity, 0.0),
+            func.coalesce(anchor_lexical_scores.c.anchor_similarity, 0.0),
             or_(
                 title_contains,
                 path_contains,
@@ -853,6 +1024,8 @@ class SqlSiteMapRepository(SiteMapRepository):
                 anchor_fuzzy_match,
                 unit_contains,
             ),
+            page_lexical_scores,
+            anchor_lexical_scores,
         )
 
     @staticmethod

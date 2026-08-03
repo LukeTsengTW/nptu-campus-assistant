@@ -12,6 +12,7 @@ def test_site_crawl_models_expose_lease_and_attempt_metadata() -> None:
         "crawl_lease_owner",
         "crawl_lease_expires_at",
         "ingestion_content_hash",
+        "ingestion_attempt_hash",
         "ingestion_status",
         "ingestion_lease_token",
         "ingestion_lease_owner",

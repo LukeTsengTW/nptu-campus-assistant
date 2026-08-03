@@ -1594,6 +1594,11 @@
             "title": "Pending Ingestion",
             "default": 0
           },
+          "incomplete_ingestion": {
+            "type": "integer",
+            "title": "Incomplete Ingestion",
+            "default": 0
+          },
           "active_workers": {
             "type": "integer",
             "title": "Active Workers",

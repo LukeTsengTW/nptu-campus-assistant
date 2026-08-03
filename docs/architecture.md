@@ -63,3 +63,34 @@ homepage intent 直接由 registry 建立 deterministic config-backed official e
 `SearchPlan` 的 `query` 是依對話解除指涉後的獨立問題，`search_queries` 最多 4 個，`concepts` 最多 8 個。這些概念只用於相關性評分，不是全部必須逐字命中的 AND 條件。官方搜尋只提供候選 URL；候選仍須經後端 NPTU allowlist、robots、redirect、HTML content type 與 canonical URL 驗證，模型不能指定 URL。
 
 搜尋診斷將高相關成功、高相關失敗與無關失敗分開。只有高排名候選失敗且可能影響答案時才附 partial warning；正常零結果不視為網路錯誤，已有高可信資料庫 evidence 時也不執行 live crawl。
+
+## P3.1.1 frontier persistence statement benchmark
+
+`tests/integration/test_frontier_persistence_acceptance.py` 是 opt-in 的真實 PostgreSQL acceptance benchmark，不使用 SQLite 代替 PostgreSQL。它把一次 fetched page persistence 視為一個 transaction，並以 SQLAlchemy engine trace 實測 `transaction_count`、實際 `statement_count`、commit／rollback、執行時間、建立的 targets 與 edges；repository 回傳的 `statement_count` 不能取代這份 SQL trace。
+
+驗收 workload 包含同一 host 的 100 個 links、分布於 10 與 100 個 hosts 的 100 個 links、canonical URL 重複、既有／新 target、非 HTML resource、global／per-host pending cap、兩個相反 host 順序的並行 writer，以及故意觸發資料庫長度錯誤的 rollback。測試也驗證 advisory lock 的 host key 以排序後順序取得、兩個 writer 不 deadlock，並確認 duplicate 不會增加 page 或 edge。
+
+P3.1.1 的 statement acceptance 是 workload scaling contract：同 host 的 link 數由 1 增至 100 時，實際 SQL statement 數只能維持固定差距；host 數增加到 100 時不得形成每個 host 一個 lock／COUNT 的無界 N+1。global／per-host cap 必須同時限制 pending targets，非 HTML 只能留下 excluded metadata／edge，rollback 則不得留下 source、target 或 edge。未設定 `RUN_POSTGRES_INTEGRATION=1` 或 `DATABASE_URL` 時，這些測試會 skip；skip 不代表 acceptance 已通過。
+
+本機執行方式：
+
+```powershell
+$env:RUN_POSTGRES_INTEGRATION="1"
+$env:DATABASE_URL="postgresql+psycopg://<local-user>:<local-password>@127.0.0.1:5432/<local-db>"
+cd services/api
+uv run pytest ../../tests/integration/test_frontier_persistence_acceptance.py --import-mode=importlib -q -rP
+```
+
+若 100-host case 超過固定 statement budget，或 trace 顯示 statement 數隨 host 線性增加，應優先把 frontier selection／pending counts 合併成單一 set-based CTE（以 `VALUES` 或 unnest 載入 normalized targets，按 host 做 windowed cap，再一次回傳 existing／pending counts），並把 per-host advisory lock 改成一個 sorted set-based call，例如：
+
+```sql
+WITH ordered_keys AS MATERIALIZED (
+  SELECT hashtext(host)::bigint AS lock_key
+  FROM unnest(:hosts::text[]) AS incoming(host)
+  ORDER BY host
+)
+SELECT pg_advisory_xact_lock(lock_key)
+FROM ordered_keys;
+```
+
+目前 production 實作以單一 lock query 依 global、排序後 host 取得 advisory lock，再以一個 set-based state query 同時回傳 existing URL、host pending count 與 global pending count。非 HTML rows 可保留 edge／excluded metadata，但不得進入 HTML pending rank。這是固定 statement budget 的實作契約，不得只調高測試 assertion。

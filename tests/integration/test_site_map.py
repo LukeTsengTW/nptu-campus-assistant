@@ -354,7 +354,7 @@ def test_batch_persistence_100_links_uses_one_transaction_and_fixed_sql() -> Non
         batch_statement_count = len(statements)
         assert result.links_created == 100
         assert result.statement_count <= 8
-        assert batch_statement_count <= 12
+        assert batch_statement_count <= 9
         with factory() as session:
             assert (
                 session.scalar(
@@ -376,7 +376,7 @@ def test_batch_persistence_100_links_uses_one_transaction_and_fixed_sql() -> Non
         # The event hook counts only the write transaction.  The two
         # assertions above intentionally query the database after the batch
         # and must not be mistaken for frontier write statements.
-        assert batch_statement_count <= 12
+        assert batch_statement_count <= 9
         print(
             "site_map_batch_benchmark "
             f"links=100 transactions=1 statements={batch_statement_count} "

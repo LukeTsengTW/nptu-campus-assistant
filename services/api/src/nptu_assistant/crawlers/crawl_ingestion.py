@@ -30,6 +30,7 @@ class CrawlIngestionStatus(StrEnum):
     CREATED = "created"
     SKIPPED = "skipped"
     PARTIAL = "partial"
+    INCOMPLETE = "incomplete"
     FAILED = "failed"
 
 
@@ -38,6 +39,7 @@ class CrawlIngestionState(StrEnum):
 
     PENDING = "pending"
     FAILED = "failed"
+    INCOMPLETE = "incomplete"
     SUCCESS = "success"
 
 
@@ -49,6 +51,7 @@ class CrawlIngestionResult:
     content_hash: str | None = None
     announcement_persisted: int = 0
     announcement_failed: int = 0
+    announcement_incomplete: int = 0
 
 
 class CrawlIngestionService:
@@ -189,6 +192,7 @@ class CrawlIngestionService:
                 )
                 announcement_persisted = 0
                 announcement_failed = 0
+                announcement_incomplete = 0
                 announcement_partial = False
                 if self._announcement_adapter is not None and page.role in {
                     UnitAnnouncementPageRole.LISTING,
@@ -228,12 +232,10 @@ class CrawlIngestionService:
                         )
                     else:
                         announcement_persisted = announcement_result.persisted_count
-                        announcement_failed = (
-                            announcement_result.failed_count
-                            + announcement_result.undated_count
-                        )
-                        announcement_partial = announcement_result.partial
-                        if announcement_partial:
+                        announcement_failed = announcement_result.failed_count
+                        announcement_incomplete = announcement_result.undated_count
+                        announcement_partial = announcement_result.failed_count > 0
+                        if announcement_result.failed_count:
                             self._fail_announcement_ingestion(
                                 page.canonical_url,
                                 digest,
@@ -242,6 +244,16 @@ class CrawlIngestionService:
                                 lease_token=lease_token,
                                 error=announcement_result.warning
                                 or "公告資料部分持久化失敗",
+                            )
+                        elif announcement_result.undated_count:
+                            self._complete_announcement_ingestion(
+                                page.canonical_url,
+                                digest,
+                                page_id=page_id,
+                                lease_owner=lease_owner,
+                                lease_token=lease_token,
+                                status=CrawlIngestionState.INCOMPLETE.value,
+                                warning=announcement_result.warning,
                             )
                         else:
                             self._complete_announcement_ingestion(
@@ -256,6 +268,8 @@ class CrawlIngestionService:
                 page.canonical_url,
                 CrawlIngestionStatus.PARTIAL
                 if announcement_partial
+                else CrawlIngestionStatus.INCOMPLETE
+                if announcement_incomplete
                 else CrawlIngestionStatus.CREATED
                 if created
                 else CrawlIngestionStatus.SKIPPED,
@@ -263,6 +277,7 @@ class CrawlIngestionService:
                 content_hash=digest,
                 announcement_persisted=announcement_persisted,
                 announcement_failed=announcement_failed,
+                announcement_incomplete=announcement_incomplete,
             )
         except Exception as exc:  # noqa: BLE001 - ingestion is a fail-open worker boundary
             try:
@@ -297,7 +312,7 @@ class CrawlIngestionService:
         lease_token: UUID | str | None = None,
         lease_expires_at: datetime | None = None,
     ) -> bool:
-        """Return whether this fetched hash still needs a successful ingestion.
+        """Return whether this fetched hash still needs a terminal ingestion.
 
         The optional repository method is DB-backed when available.  The
         legacy fallback keeps the existing in-memory adapter contract.
@@ -379,19 +394,48 @@ class CrawlIngestionService:
         page_id: UUID | str | None,
         lease_owner: str | None,
         lease_token: UUID | str | None,
+        status: str = CrawlIngestionState.SUCCESS.value,
+        warning: str | None = None,
     ) -> None:
         complete = getattr(self._repository, "complete_announcement_ingestion", None)
         if not callable(complete) or not self._has_lease_context(
             page_id, lease_owner, lease_token
         ):
             return
-        applied = complete(
-            canonical_url,
-            digest,
-            page_id=page_id,
-            lease_owner=lease_owner,
-            lease_token=lease_token,
-        )
+        try:
+            applied = complete(
+                canonical_url,
+                digest,
+                page_id=page_id,
+                lease_owner=lease_owner,
+                lease_token=lease_token,
+                status=status,
+                warning=warning,
+            )
+        except TypeError as exc:
+            # Existing repository doubles may still implement the old success
+            # signature.  Never silently downgrade the new incomplete state.
+            if "unexpected keyword" not in str(exc).casefold():
+                raise
+            try:
+                applied = complete(
+                    canonical_url,
+                    digest,
+                    page_id=page_id,
+                    lease_owner=lease_owner,
+                    lease_token=lease_token,
+                    status=status,
+                )
+            except TypeError:
+                if status != CrawlIngestionState.SUCCESS.value:
+                    raise
+                applied = complete(
+                    canonical_url,
+                    digest,
+                    page_id=page_id,
+                    lease_owner=lease_owner,
+                    lease_token=lease_token,
+                )
         if applied is False:
             raise RuntimeError("公告 ingestion lease 已失效，拒絕完成公告持久化")
 

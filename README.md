@@ -152,6 +152,8 @@ corepack pnpm build
 
 詳細策略與整合測試請參閱 `docs/testing.md`。
 
+P3.1.1 frontier persistence acceptance 必須使用真實 PostgreSQL；測試會追蹤實際 transaction／SQL statement、執行時間、targets／edges，並驗證 canonical URL 去重、frontier cap、並行 advisory lock 與 rollback。執行方式與固定 statement scaling contract 見 `docs/architecture.md` 的「P3.1.1 frontier persistence statement benchmark」。
+
 若要執行真正的 PostgreSQL/pgvector 整合流程（不使用 SQLite）：
 
 ```powershell

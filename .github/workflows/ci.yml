@@ -54,7 +54,7 @@ jobs:
       - name: Migrate and seed twice
         run: |
           uv run --project services/api alembic -c alembic.ini upgrade head
-          uv run --project services/api alembic -c alembic.ini downgrade 20260802_0007
+          uv run --project services/api alembic -c alembic.ini downgrade 20260803_0008
           uv run --project services/api alembic -c alembic.ini upgrade head
           uv run --project services/api nptu-assistant seed
           uv run --project services/api nptu-assistant seed
@@ -76,6 +76,7 @@ jobs:
           tests/integration/test_crawl_acceptance.py
           tests/integration/test_crawl_ingestion_recovery.py
           tests/integration/test_crawl_performance.py
+          tests/integration/test_frontier_persistence_acceptance.py
           tests/integration/test_site_map.py
           --import-mode=importlib -q -rP
 

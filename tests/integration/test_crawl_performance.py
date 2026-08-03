@@ -12,21 +12,21 @@ import pytest
 from nptu_assistant.crawlers.site_map import (
     FrontierPolicy,
     SiteCrawlStatus,
+    SiteLinkType,
+    SiteLinkUpsert,
     SitePageType,
+    SitePageUpsert,
 )
+from nptu_assistant.crawlers.site_models import SearchPlan
 from nptu_assistant.db.crawl_models import SiteCrawlAttempt
 from nptu_assistant.db.crawl_scheduler import (
     SqlCrawlSchedulerRepository,
     due_pages_statement,
 )
-from nptu_assistant.db.models import SitePage
+from nptu_assistant.db.models import SiteLink, SitePage
 from nptu_assistant.db.site_map import SqlSiteMapRepository
-from nptu_assistant.crawlers.site_map import (
-    SiteLinkType,
-    SiteLinkUpsert,
-    SitePageUpsert,
-)
 from sqlalchemy import create_engine, delete, event, func, select, text
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.orm import Session, sessionmaker
 
 pytestmark = pytest.mark.skipif(
@@ -64,6 +64,36 @@ def _indexes(plan: dict[str, object]) -> set[str]:
             if isinstance(child, dict):
                 result.update(_indexes(child))
     return result
+
+
+def _index_names(plan: dict[str, object]) -> set[str]:
+    result: set[str] = set()
+    value = plan.get("Index Name")
+    if isinstance(value, str):
+        result.add(value)
+    children = plan.get("Plans", [])
+    if isinstance(children, list):
+        for child in children:
+            if isinstance(child, dict):
+                result.update(_index_names(child))
+    return result
+
+
+def _buffers(plan: dict[str, object]) -> dict[str, int]:
+    totals = {
+        "shared_hit_blocks": int(plan.get("Shared Hit Blocks", 0) or 0),
+        "shared_read_blocks": int(plan.get("Shared Read Blocks", 0) or 0),
+        "shared_dirtied_blocks": int(plan.get("Shared Dirtied Blocks", 0) or 0),
+        "shared_written_blocks": int(plan.get("Shared Written Blocks", 0) or 0),
+    }
+    children = plan.get("Plans", [])
+    if isinstance(children, list):
+        for child in children:
+            if isinstance(child, dict):
+                nested = _buffers(child)
+                for key, value in nested.items():
+                    totals[key] += value
+    return totals
 
 
 def test_postgres_claim_status_and_frontier_benchmark() -> None:
@@ -254,7 +284,7 @@ def test_postgres_claim_status_and_frontier_benchmark() -> None:
         frontier_elapsed_ms = (time.perf_counter() - frontier_started) * 1000
         frontier_statement_count = len(statements) - frontier_start
         assert frontier_result.target_created == 100
-        assert frontier_statement_count <= 12
+        assert frontier_statement_count <= 9
         assert frontier_elapsed_ms < 10_000
 
         print(
@@ -302,5 +332,181 @@ def test_postgres_claim_status_and_frontier_benchmark() -> None:
             )
             session.execute(
                 delete(SitePage).where(SitePage.canonical_url.like(f"{prefix}%"))
+            )
+        engine.dispose()
+
+
+def test_postgres_candidate_sql_bounded_with_lexical_recall() -> None:
+    """Run the production candidate SQL against a representative live dataset."""
+
+    factory, engine = _factory()
+    prefix = f"p31-candidate-{uuid4().hex}"
+    page_ids = [uuid4() for _ in range(5_000)]
+    title_page_id = page_ids[1_001]
+    path_page_id = page_ids[2_002]
+    anchor_page_id = page_ids[3_003]
+    concept_page_id = page_ids[4_004]
+    invalid_page_ids = page_ids[:3]
+    page_rows: list[dict[str, object]] = []
+    for index, page_id in enumerate(page_ids):
+        title = f"site page {index}"
+        path = f"/{prefix}/{index}"
+        if page_id in invalid_page_ids:
+            title = "scholarship invalid filter"
+        elif page_id == title_page_id:
+            title = "scholarship application title recall"
+        elif page_id == path_page_id:
+            path = f"/{prefix}/financial-aid/path-recall"
+        elif page_id == concept_page_id:
+            title = "financial aid concept recall"
+        page_rows.append(
+            {
+                "id": page_id,
+                "canonical_url": f"https://www.nptu.edu.tw{path}",
+                "host": "www.nptu.edu.tw",
+                "path": path,
+                "title": title,
+                "page_type": SitePageType.GENERAL_PAGE.value,
+                "discovery_source": "internal_link",
+                "crawl_status": SiteCrawlStatus.DISCOVERED.value,
+                "is_active": page_id not in invalid_page_ids,
+                "is_indexable": page_id != invalid_page_ids[1],
+            }
+        )
+    page_rows[2]["crawl_status"] = SiteCrawlStatus.BLOCKED.value
+
+    link_rows: list[dict[str, object]] = []
+    for source_index in range(5_000):
+        for offset in range(1, 5):
+            target_index = (source_index + offset) % 5_000
+            link_rows.append(
+                {
+                    "id": uuid4(),
+                    "source_page_id": page_ids[source_index],
+                    "target_page_id": page_ids[target_index],
+                    "anchor_text": (
+                        "application anchor recall"
+                        if page_ids[target_index] == anchor_page_id
+                        else f"link {source_index}-{offset}"
+                    ),
+                    "link_type": SiteLinkType.CONTENT.value,
+                }
+            )
+
+    repository = SqlSiteMapRepository(
+        factory,
+        site_map_query_max_seconds=0.75,
+    )
+    plan = SearchPlan(
+        query="scholarship",
+        search_queries=["scholarship", "application", "financial aid"],
+        concepts=["student grant"],
+        limit=20,
+    )
+    statement = repository.build_candidate_query(
+        plan,
+        scope=None,
+        allowed_hosts=("nptu.edu.tw",),
+        limit=20,
+        dialect_name="postgresql",
+    )
+    compiled = statement.compile(
+        dialect=postgresql.dialect(),
+        compile_kwargs={"literal_binds": True},
+    )
+    explain_sql = f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {compiled}"
+    try:
+        with factory.begin() as session:
+            session.execute(SitePage.__table__.insert(), page_rows)
+            session.execute(SiteLink.__table__.insert(), link_rows)
+            session.execute(text("ANALYZE site_pages"))
+            session.execute(text("ANALYZE site_links"))
+
+        explain_summaries: list[dict[str, object]] = []
+        for _ in range(3):
+            with engine.connect() as connection:
+                connection.execute(
+                    text(
+                        "SELECT set_config("
+                        "'pg_trgm.similarity_threshold', '0.10', true)"
+                    )
+                )
+                raw_plan = connection.exec_driver_sql(explain_sql).scalar_one()
+            payload = raw_plan[0] if isinstance(raw_plan, list) else raw_plan
+            assert isinstance(payload, dict)
+            root = payload["Plan"]
+            assert isinstance(root, dict)
+            explain_summaries.append(
+                {
+                    "planning_ms": float(payload["Planning Time"]),
+                    "execution_ms": float(payload["Execution Time"]),
+                    "node_types": sorted(_node_types(root)),
+                    "indexes": sorted(_indexes(root)),
+                    "index_names": sorted(_index_names(root)),
+                    "buffers": _buffers(root),
+                }
+            )
+
+        runtimes_ms: list[float] = []
+        for _ in range(3):
+            started = time.perf_counter()
+            rows = repository.find_candidates(
+                plan,
+                scope=None,
+                allowed_hosts=("nptu.edu.tw",),
+                limit=20,
+            )
+            runtimes_ms.append((time.perf_counter() - started) * 1000)
+        assert rows
+        returned_urls = {candidate.canonical_url for candidate in rows}
+        expected_ids = {title_page_id, path_page_id, anchor_page_id, concept_page_id}
+        expected_urls = {
+            str(row["canonical_url"]) for row in page_rows if row["id"] in expected_ids
+        }
+        assert expected_urls <= returned_urls, (
+            f"missing lexical recall urls: {expected_urls - returned_urls}"
+        )
+        invalid_urls = {
+            str(row["canonical_url"])
+            for row in page_rows
+            if row["id"] in invalid_page_ids
+        }
+        assert not returned_urls.intersection(invalid_urls)
+        used_index_names = {
+            name
+            for summary in explain_summaries
+            for name in summary["index_names"]
+            if isinstance(name, str)
+        }
+        required_index_names = {
+            "ix_site_pages_title_trgm",
+            "ix_site_pages_path_trgm",
+            "ix_site_links_anchor_text_trgm",
+        }
+        assert required_index_names <= used_index_names, (
+            "candidate EXPLAIN did not exercise every lexical GIN index: "
+            f"missing={required_index_names - used_index_names} "
+            f"used={sorted(used_index_names)}"
+        )
+        assert max(float(item["execution_ms"]) for item in explain_summaries) <= 750
+        assert max(runtimes_ms) <= 1_000
+        print(
+            json.dumps(
+                {
+                    "dataset": {
+                        "site_pages": 5_000,
+                        "site_links": 20_000,
+                        "hosts": 1,
+                    },
+                    "candidate": explain_summaries,
+                    "production_runtime_ms": runtimes_ms,
+                },
+                ensure_ascii=False,
+            )
+        )
+    finally:
+        with factory.begin() as session:
+            session.execute(
+                delete(SitePage).where(SitePage.canonical_url.like(f"%/{prefix}/%"))
             )
         engine.dispose()

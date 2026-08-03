@@ -108,12 +108,21 @@ class SqlDocumentRepository:
                 token=lease_token,
                 now=now or datetime.now(timezone.utc),
             )
-            if page.ingestion_status != "success":
-                return True
-            if (
-                page.page_type in {"announcement_listing", "announcement_detail"}
-                and page.announcement_ingestion_status != "success"
-            ):
+            is_announcement = page.page_type in {
+                "announcement_listing",
+                "announcement_detail",
+            }
+            if is_announcement:
+                if page.ingestion_status not in {"success", "partial"}:
+                    return True
+                if page.announcement_ingestion_status not in {
+                    "success",
+                    "incomplete",
+                }:
+                    return True
+                if page.ingestion_content_hash != digest:
+                    return True
+            elif page.ingestion_status != "success":
                 return True
             return (
                 session.scalar(
@@ -157,8 +166,19 @@ class SqlDocumentRepository:
                 )
             )
             if existing is not None:
-                if page.page_type in {"announcement_listing", "announcement_detail"}:
-                    page.ingestion_content_hash = digest
+                is_announcement = page.page_type in {
+                    "announcement_listing",
+                    "announcement_detail",
+                }
+                if is_announcement:
+                    if (
+                        page.ingestion_status in {"success", "partial"}
+                        and page.ingestion_content_hash == digest
+                        and page.announcement_ingestion_status
+                        in {"success", "incomplete"}
+                    ):
+                        return "success"
+                    page.ingestion_attempt_hash = digest
                     page.ingestion_status = "pending"
                     page.ingestion_error = None
                     page.announcement_ingestion_status = "pending"
@@ -169,7 +189,7 @@ class SqlDocumentRepository:
                     return "pending"
                 self._mark_ingestion_success(page, digest)
                 return "success"
-            page.ingestion_content_hash = digest
+            page.ingestion_attempt_hash = digest
             page.ingestion_status = "pending"
             page.ingestion_error = None
             if page.page_type in {"announcement_listing", "announcement_detail"}:
@@ -209,6 +229,7 @@ class SqlDocumentRepository:
             if page.page_type in {"announcement_listing", "announcement_detail"}:
                 page.ingestion_status = "success"
                 page.ingestion_content_hash = digest
+                page.ingestion_attempt_hash = None
                 page.ingestion_error = None
                 if page.announcement_ingestion_status == "not_applicable":
                     page.announcement_ingestion_status = "pending"
@@ -224,8 +245,12 @@ class SqlDocumentRepository:
         page_id: UUID | str,
         lease_owner: str,
         lease_token: UUID | str,
+        status: str = "success",
+        warning: str | None = None,
         now: datetime | None = None,
     ) -> bool:
+        if status not in {"success", "incomplete"}:
+            raise ValueError("公告 ingestion terminal status 不合法")
         checked_at = now or datetime.now(timezone.utc)
         with self._factory.begin() as session:
             page = self._locked_ingestion_page(
@@ -240,8 +265,14 @@ class SqlDocumentRepository:
                 token=lease_token,
                 now=checked_at,
             )
-            page.announcement_ingestion_status = "success"
-            page.announcement_ingestion_error = None
+            page.announcement_ingestion_status = status
+            page.announcement_ingestion_error = (
+                (warning or "公告項目缺少官方日期，標記為不完整")[:1000]
+                if status == "incomplete"
+                else None
+            )
+            page.ingestion_status = "partial" if status == "incomplete" else "success"
+            page.ingestion_error = page.announcement_ingestion_error
             self._clear_ingestion_lease(page)
             return True
 
@@ -304,7 +335,7 @@ class SqlDocumentRepository:
                 now=checked_at,
             )
             page.ingestion_status = "failed"
-            page.ingestion_content_hash = digest
+            page.ingestion_attempt_hash = digest
             page.ingestion_error = (error or "未知錯誤")[:1000]
             self._clear_ingestion_lease(page)
             return True
@@ -364,7 +395,7 @@ class SqlDocumentRepository:
         if ingestion_expires_at is None or ingestion_expires_at <= now:
             raise RuntimeError("ingestion lease 已失效，拒絕狀態變更")
         if (
-            page.ingestion_content_hash != digest
+            page.ingestion_attempt_hash != digest
             or page.ingestion_lease_owner != owner
             or page.ingestion_lease_token != cls._as_uuid(token)
         ):
@@ -374,6 +405,7 @@ class SqlDocumentRepository:
     def _mark_ingestion_success(page: SitePage, digest: str) -> None:
         page.ingestion_status = "success"
         page.ingestion_content_hash = digest
+        page.ingestion_attempt_hash = None
         page.ingestion_error = None
         SqlDocumentRepository._clear_ingestion_lease(page)
 

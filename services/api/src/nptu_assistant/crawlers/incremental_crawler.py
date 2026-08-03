@@ -820,9 +820,10 @@ class IncrementalCrawler:
                     links_discovered=len(page.links),
                     retry_after=response.headers.get("retry-after"),
                 )
-            ingestion_performed = (
-                ingestion_result.status is CrawlIngestionStatus.CREATED
-            )
+            ingestion_performed = ingestion_result.status in {
+                CrawlIngestionStatus.CREATED,
+                CrawlIngestionStatus.INCOMPLETE,
+            }
         return self._result(
             target,
             outcome,

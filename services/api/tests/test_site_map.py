@@ -458,6 +458,13 @@ def test_scoped_relevant_unit_pages_can_skip_discovery() -> None:
     assert service.has_sufficient_candidates(plan, candidates, scope=scope, minimum=2)
 
 
+def test_site_search_default_candidate_budget_is_bounded() -> None:
+    config = SiteSearchConfig()
+
+    assert config.site_map_query_max_seconds <= 0.75
+    assert config.site_map_query_max_seconds <= 1.0
+
+
 def test_global_homepage_intent_can_skip_for_exact_official_homepage() -> None:
     service = make_service(MemorySiteMapRepository())
     homepage = candidate(

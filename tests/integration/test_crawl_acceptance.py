@@ -5,13 +5,16 @@ import uuid
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
+from alembic import command
+from alembic.config import Config
 import pytest
 from nptu_assistant.crawlers.site_map import SiteCrawlStatus, SitePageType
 from nptu_assistant.db.crawl_models import SiteCrawlAttempt
 from nptu_assistant.db.crawl_scheduler import SqlCrawlSchedulerRepository
 from nptu_assistant.db.models import SitePage
-from sqlalchemy import create_engine, delete, event, func, inspect, select
+from sqlalchemy import create_engine, delete, event, func, inspect, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
 pytestmark = pytest.mark.skipif(
@@ -278,6 +281,7 @@ def test_p3_migration_columns_and_indexes_are_live() -> None:
             "last_error_at",
             "last_retry_after_at",
             "ingestion_content_hash",
+            "ingestion_attempt_hash",
             "ingestion_status",
             "ingestion_error",
             "announcement_ingestion_status",
@@ -317,4 +321,115 @@ def test_p3_migration_columns_and_indexes_are_live() -> None:
             "ck_site_pages_announcement_ingestion_status",
         } <= checks
     finally:
+        engine.dispose()
+
+
+def test_postgres_migration_roundtrip_preserves_ingestion_semantics() -> None:
+    """Exercise 0009 data backfill, downgrade compatibility, and restoration."""
+
+    factory, engine = make_factory()
+    token = uuid.uuid4().hex
+    prefix = f"https://p31-migration-{token}.nptu.edu.tw"
+    now = datetime.now(timezone.utc)
+    hashes = {
+        "success": "1" * 64,
+        "failed": "2" * 64,
+        "pending": "3" * 64,
+        "partial": "4" * 64,
+        "incomplete": "5" * 64,
+    }
+    rows = [
+        SitePage(
+            canonical_url=f"{prefix}/{name}",
+            host=f"p31-migration-{token}.nptu.edu.tw",
+            path=f"/{name}",
+            page_type=(
+                SitePageType.ANNOUNCEMENT_LISTING.value
+                if name == "incomplete"
+                else SitePageType.GENERAL_PAGE.value
+            ),
+            crawl_status=SiteCrawlStatus.SUCCESS.value,
+            next_crawl_at=now + timedelta(hours=1),
+            content_hash=hashes[name],
+            ingestion_content_hash=hashes[name],
+            ingestion_status=("partial" if name == "incomplete" else name),
+            ingestion_error=("retryable" if name == "failed" else None),
+            announcement_ingestion_status=(
+                "incomplete" if name == "incomplete" else "not_applicable"
+            ),
+            announcement_ingestion_error=(
+                "官方頁面未提供日期" if name == "incomplete" else None
+            ),
+            is_active=True,
+            is_indexable=True,
+        )
+        for name in ("success", "failed", "pending", "partial", "incomplete")
+    ]
+    # The fixture mirrors 0008's historical meaning for pending/failed: the
+    # attempted fetched hash was stored in ingestion_content_hash.
+    rows[1].ingestion_status = "failed"
+    rows[2].ingestion_status = "pending"
+    rows[3].ingestion_status = "partial"
+    rows[3].announcement_ingestion_status = "failed"
+    rows[3].announcement_ingestion_error = "announcement retryable"
+
+    with factory.begin() as session:
+        session.add_all(rows)
+
+    config = Config(str(Path(__file__).resolve().parents[2] / "alembic.ini"))
+    try:
+        engine.dispose()
+        command.downgrade(config, "20260803_0008")
+        assert "ingestion_attempt_hash" not in {
+            column["name"] for column in inspect(engine).get_columns("site_pages")
+        }
+        with factory() as session:
+            downgraded = {
+                row["canonical_url"].rsplit("/", 1)[-1]: row
+                for row in session.execute(
+                    text(
+                        "SELECT canonical_url, ingestion_content_hash, "
+                        "announcement_ingestion_status, announcement_ingestion_error "
+                        "FROM site_pages WHERE canonical_url LIKE :prefix"
+                    ),
+                    {"prefix": f"{prefix}/%"},
+                ).mappings()
+            }
+            assert downgraded["failed"]["ingestion_content_hash"] == hashes["failed"]
+            assert downgraded["pending"]["ingestion_content_hash"] == hashes["pending"]
+            assert downgraded["partial"]["announcement_ingestion_status"] == "pending"
+            assert (
+                downgraded["incomplete"]["announcement_ingestion_status"] == "pending"
+            )
+            assert downgraded["incomplete"]["announcement_ingestion_error"].startswith(
+                "terminal_incomplete:"
+            )
+
+        command.upgrade(config, "head")
+        assert "ingestion_attempt_hash" in {
+            column["name"] for column in inspect(engine).get_columns("site_pages")
+        }
+        with factory() as session:
+            upgraded = {
+                page.canonical_url.rsplit("/", 1)[-1]: page
+                for page in session.scalars(
+                    select(SitePage).where(SitePage.canonical_url.like(f"{prefix}/%"))
+                )
+            }
+            assert upgraded["success"].ingestion_content_hash == hashes["success"]
+            assert upgraded["success"].ingestion_attempt_hash is None
+            for name in ("failed", "pending"):
+                assert upgraded[name].ingestion_content_hash is None
+                assert upgraded[name].ingestion_attempt_hash == hashes[name]
+            assert upgraded["partial"].ingestion_content_hash == hashes["partial"]
+            assert upgraded["partial"].announcement_ingestion_status == "failed"
+            assert upgraded["incomplete"].ingestion_content_hash == hashes["incomplete"]
+            assert upgraded["incomplete"].announcement_ingestion_status == "incomplete"
+            assert upgraded["incomplete"].announcement_ingestion_error == (
+                "官方頁面未提供日期"
+            )
+    finally:
+        # Leave the shared CI database at head even if an assertion fails.
+        command.upgrade(config, "head")
+        cleanup(factory, prefix)
         engine.dispose()

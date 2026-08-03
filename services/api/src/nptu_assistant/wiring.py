@@ -22,7 +22,10 @@ from nptu_assistant.crawlers.announcement_adapter import (
     IncrementalAnnouncementAdapter,
 )
 from nptu_assistant.crawlers.crawl_ingestion import CrawlIngestionService
-from nptu_assistant.crawlers.crawl_scheduler import CrawlScheduler
+from nptu_assistant.crawlers.crawl_scheduler import (
+    CrawlScheduler,
+    canonical_crawl_identity,
+)
 from nptu_assistant.crawlers.http import CrawlHttpClient
 from nptu_assistant.crawlers.incremental_crawler import (
     IncrementalCrawler,
@@ -184,7 +187,7 @@ def build_services(settings: Settings) -> dict[str, object]:
             site_config.site_map_query_min_seconds if site_config else 0.05
         ),
         site_map_query_max_seconds=(
-            site_config.site_map_query_max_seconds if site_config else 2.0
+            site_config.site_map_query_max_seconds if site_config else 0.75
         ),
     )
     site_map_service = SiteMapService(
@@ -271,7 +274,10 @@ def build_services(settings: Settings) -> dict[str, object]:
         ),
     )
     crawl_lease_repository = SqlCrawlSchedulerRepository(factory)
-    crawl_scheduler = CrawlScheduler(crawl_lease_repository)
+    crawl_scheduler = CrawlScheduler(
+        crawl_lease_repository,
+        identity=canonical_crawl_identity,
+    )
     incremental_crawler = IncrementalCrawler(
         http_client,
         site_map_service,

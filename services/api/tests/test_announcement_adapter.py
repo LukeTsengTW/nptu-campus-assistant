@@ -29,6 +29,7 @@ class MemoryAnnouncementRepository:
         self.items: dict[str, AnnouncementCandidate] = {}
         self.calls: list[tuple[str, tuple[str, ...]]] = []
         self.fail_urls = set(fail_urls or ())
+        self.successful_source_refreshes: list[tuple[str, datetime]] = []
 
     def merge_source_announcements(
         self,
@@ -50,6 +51,14 @@ class MemoryAnnouncementRepository:
         status = "updated" if candidate.canonical_url in self.items else "created"
         self.items[candidate.canonical_url] = candidate
         return [status]
+
+    def mark_incremental_source_success(
+        self,
+        *,
+        source_name: str,
+        crawled_at: datetime,
+    ) -> None:
+        self.successful_source_refreshes.append((source_name, crawled_at))
 
 
 def listing_item(
@@ -171,11 +180,36 @@ def test_missing_date_is_observable_and_never_fabricated() -> None:
 
     assert first.undated_count == 1
     assert second.undated_count == 1
-    assert first.warning == "公告資料尚未完成，請稍後重試。"
+    assert len(repository.successful_source_refreshes) == 2
+    assert "terminal incomplete" in (first.warning or "")
     assert repository.items == {}
     assert date.today() not in {
         candidate.published_at for candidate in repository.items.values()
     }
+
+
+def test_dated_and_undated_listing_advances_source_without_retrying_undated_item() -> (
+    None
+):
+    undated_url = "https://ccs.nptu.edu.tw/p/406-1025-197413.php?Lang=zh-tw"
+    repository = MemoryAnnouncementRepository()
+    adapter = IncrementalAnnouncementAdapter(repository)
+    page = listing_page(
+        listing_item(canonical_url=URL),
+        listing_item(canonical_url=undated_url, published_at=None),
+    )
+
+    first = adapter.persist_page(page, SOURCE, crawled_at=CRAWLED_AT)
+    second = adapter.persist_page(page, SOURCE, crawled_at=CRAWLED_AT)
+
+    assert first.persisted_count == 1
+    assert first.undated_count == 1
+    assert first.partial is False
+    assert second.skipped_count == 1
+    assert second.undated_count == 1
+    assert second.failed_count == 0
+    assert len(repository.successful_source_refreshes) == 2
+    assert undated_url not in repository.items
 
 
 def test_undated_listing_can_be_completed_when_detail_later_supplies_date() -> None:
