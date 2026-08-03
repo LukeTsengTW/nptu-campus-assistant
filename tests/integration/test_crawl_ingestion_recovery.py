@@ -400,9 +400,14 @@ def test_postgres_crawl_ingestion_failure_reclaims_with_full_fetch_and_fencing()
         db_retry_base_seconds=0.0,
         db_retry_max_seconds=0.0,
     )
+    target = {
+        "canonical_url": page_url,
+        "unit": unit,
+        "allowed_hosts": ("nptu.edu.tw",),
+    }
 
     try:
-        first_run = crawler.run_once(batch_size=1)
+        first_run = crawler.run_once(targets=(target,), batch_size=1)
         assert len(first_run.results) == 1
         assert first_run.results[0].outcome is IncrementalCrawlOutcome.INGESTION_FAILED
         assert embeddings.calls == 1
@@ -429,7 +434,7 @@ def test_postgres_crawl_ingestion_failure_reclaims_with_full_fetch_and_fencing()
             first_fetched_hash = first_page.content_hash
 
         clock.value += timedelta(hours=2)
-        second_run = crawler.run_once(batch_size=1)
+        second_run = crawler.run_once(targets=(target,), batch_size=1)
         assert len(second_run.results) == 1
         assert second_run.results[0].outcome is IncrementalCrawlOutcome.UNCHANGED
         assert embeddings.calls == 2
