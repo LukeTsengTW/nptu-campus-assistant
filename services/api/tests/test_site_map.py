@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Collection, Mapping
+from datetime import datetime, timedelta, timezone
 
 from nptu_assistant.crawlers.adapters.nptu_site import (
     NptuListingItem,
@@ -9,12 +10,14 @@ from nptu_assistant.crawlers.adapters.nptu_site import (
 )
 from nptu_assistant.crawlers.config import SiteSearchConfig
 from nptu_assistant.crawlers.crawl_policy import is_crawlable_url
+from nptu_assistant.crawlers.crawl_policy import is_frontier_trap_url
 from nptu_assistant.crawlers.official_units import (
     DocumentSearchScope,
     load_default_official_unit_directory,
 )
 from nptu_assistant.crawlers.site_map import (
     SiteCrawlStatus,
+    FrontierPolicy,
     SiteLinkType,
     SiteMapCandidate,
     SiteMapBatchWriteResult,
@@ -34,6 +37,8 @@ from nptu_assistant.crawlers.site_models import (
 )
 from nptu_assistant.crawlers.site_search import NptuSiteSearchService
 from nptu_assistant.crawlers.site_models import SearchDeadline
+
+NOW = datetime(2026, 8, 2, 12, 0, tzinfo=timezone.utc)
 
 
 class MemorySiteMapRepository:
@@ -101,8 +106,9 @@ class MemorySiteMapRepository:
         etag: str | None = None,
         last_modified: str | None = None,
         links: tuple[SiteLinkUpsert, ...] = (),
+        allow_unleased: bool = False,
     ) -> SiteMapBatchWriteResult:
-        del title, http_status, etag, last_modified
+        del title, http_status, etag, last_modified, allow_unleased
         self.batch_calls += 1
         self.upsert_page(source)
         self.successes.append((source.canonical_url, content_hash))
@@ -277,6 +283,90 @@ def test_fetched_page_persists_internal_links_and_rejects_external_urls() -> Non
     assert repository.batch_calls == 1
 
 
+def test_frontier_policy_bounds_links_depth_and_new_target_delay() -> None:
+    repository = MemorySiteMapRepository()
+    policy = FrontierPolicy(
+        max_depth=1,
+        per_page_link_cap=2,
+        new_target_delay=timedelta(minutes=2),
+    )
+    service = SiteMapService(
+        repository,
+        official_units=load_default_official_unit_directory(),
+        source_configs=(),
+        site_config=SiteSearchConfig(
+            enabled=True,
+            seed_urls=["https://www.nptu.edu.tw/"],
+            allowed_hosts=["nptu.edu.tw"],
+        ),
+        frontier_policy=policy,
+        clock=lambda: NOW,
+    )
+    announcement = NptuListingItem(
+        title="公告",
+        canonical_url="https://www.nptu.edu.tw/announcement/1",
+        published_at=None,
+        summary="",
+        anchor_text="公告",
+        order=0,
+    )
+    page = NptuSitePage(
+        title="首頁",
+        canonical_url="https://www.nptu.edu.tw/",
+        body="內容",
+        published_at=None,
+        links=(
+            announcement.canonical_url,
+            "https://www.nptu.edu.tw/rules.pdf",
+            "https://www.nptu.edu.tw/ordinary",
+            "https://www.nptu.edu.tw/logo.jpg",
+            "https://www.nptu.edu.tw/ordinary#same-page",
+        ),
+        link_texts=(
+            (announcement.canonical_url, "公告"),
+            ("https://www.nptu.edu.tw/rules.pdf", "規章"),
+            ("https://www.nptu.edu.tw/ordinary", "一般頁"),
+            ("https://www.nptu.edu.tw/logo.jpg", "圖片"),
+            ("https://www.nptu.edu.tw/ordinary#same-page", "一般頁"),
+        ),
+        role=UnitAnnouncementPageRole.LISTING,
+        announcement_items=(announcement,),
+    )
+
+    summary = service.record_fetched_page(
+        page,
+        unit="國立屏東大學",
+        depth=0,
+        allowed_hosts=("nptu.edu.tw",),
+    )
+
+    assert summary.links_created == 2
+    assert set(repository.pages) >= {
+        page.canonical_url,
+        announcement.canonical_url,
+        "https://www.nptu.edu.tw/rules.pdf",
+    }
+    assert repository.pages[
+        announcement.canonical_url
+    ].next_crawl_at == NOW + timedelta(minutes=2)
+    assert repository.pages["https://www.nptu.edu.tw/rules.pdf"].is_indexable is False
+
+    deeper = NptuSitePage(
+        title="第二層",
+        canonical_url="https://www.nptu.edu.tw/deeper",
+        body="內容",
+        published_at=None,
+        links=("https://www.nptu.edu.tw/deeper/target",),
+    )
+    service.record_fetched_page(
+        deeper,
+        unit="國立屏東大學",
+        depth=1,
+        allowed_hosts=("nptu.edu.tw",),
+    )
+    assert "https://www.nptu.edu.tw/deeper/target" not in repository.pages
+
+
 def candidate(
     url: str,
     *,
@@ -410,6 +500,13 @@ def test_crawlability_policy_rejects_non_html_resources_and_non_http_urls() -> N
         "https://www.nptu.edu.tw/page#section",
     ):
         assert not is_crawlable_url(url)
+
+
+def test_frontier_trap_policy_rejects_tracking_and_unbounded_shapes() -> None:
+    assert is_frontier_trap_url("https://www.nptu.edu.tw/page?utm_source=search")
+    assert is_frontier_trap_url("https://www.nptu.edu.tw/page?a=1&a=2")
+    assert is_frontier_trap_url("https://www.nptu.edu.tw/" + "/same" * 33)
+    assert not is_frontier_trap_url("https://www.nptu.edu.tw/page?page=2")
 
 
 def test_anchor_and_concept_relevance_is_distinct_from_structure() -> None:

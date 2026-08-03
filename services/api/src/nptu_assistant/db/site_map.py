@@ -4,6 +4,7 @@ import math
 import uuid
 from collections.abc import Callable, Collection, Mapping, Sequence
 from datetime import datetime, timezone
+from dataclasses import replace
 from typing import Any, cast
 from urllib.parse import urlsplit
 
@@ -35,6 +36,7 @@ from nptu_assistant.crawlers.site_map import (
     PAGE_TYPE_PRIORITY,
     SiteCrawlStatus,
     SiteDiscoverySource,
+    FrontierPolicy,
     SiteLinkType,
     SiteLinkUpsert,
     SiteMapBatchWriteResult,
@@ -112,6 +114,7 @@ class SqlSiteMapRepository(SiteMapRepository):
         site_map_query_budget_ratio: float = 0.25,
         site_map_query_min_seconds: float = 0.05,
         site_map_query_max_seconds: float = 0.75,
+        frontier_policy: FrontierPolicy | None = None,
     ) -> None:
         if not 0 < site_map_query_budget_ratio <= 1:
             raise ValueError("site map 查詢 budget ratio 必須介於 0 與 1 之間")
@@ -124,6 +127,7 @@ class SqlSiteMapRepository(SiteMapRepository):
         self._site_map_query_budget_ratio = site_map_query_budget_ratio
         self._site_map_query_min_seconds = site_map_query_min_seconds
         self._site_map_query_max_seconds = site_map_query_max_seconds
+        self._frontier_policy = frontier_policy or FrontierPolicy()
 
     def upsert_page(self, page: SitePageUpsert) -> SiteMapWriteResult:
         now = self._clock()
@@ -170,29 +174,52 @@ class SqlSiteMapRepository(SiteMapRepository):
         etag: str | None = None,
         last_modified: str | None = None,
         links: Sequence[SiteLinkUpsert] = (),
+        page_id: uuid.UUID | None = None,
         lease_owner: str | None = None,
         lease_token: uuid.UUID | None = None,
+        lease_expires_at: datetime | None = None,
+        allow_unleased: bool = False,
     ) -> SiteMapBatchWriteResult:
         """在單一 transaction 批次寫入 source、targets、edges、crawl state。"""
         now = self._clock()
-        targets: dict[str, SitePageUpsert] = {}
-        for link in links:
-            if link.target.canonical_url != source.canonical_url:
-                targets.setdefault(link.target.canonical_url, link.target)
         with self._factory.begin() as session:
-            source_outcome = self._upsert_pages_in_session(session, (source,), now=now)[
-                0
-            ]
+            source_outcome = (
+                self._upsert_pages_in_session(session, (source,), now=now)[0]
+                if page_id is None
+                else (source, False, False)
+            )
             source_page = session.scalar(
                 select(SitePage)
-                .where(SitePage.canonical_url == source.canonical_url)
+                .where(
+                    SitePage.canonical_url == source.canonical_url,
+                    *((SitePage.id == page_id,) if page_id is not None else ()),
+                )
                 .with_for_update()
             )
             if source_page is None:
                 raise RuntimeError("site map fetched source page 建立失敗")
+            if page_id is not None and (
+                lease_owner is None or lease_token is None or lease_expires_at is None
+            ):
+                raise RuntimeError("site map fetched page lease context incomplete")
+            if page_id is None and any(
+                value is not None
+                for value in (lease_owner, lease_token, lease_expires_at)
+            ):
+                raise RuntimeError(
+                    "site map fetched page lease context requires page id"
+                )
+            if page_id is None and not allow_unleased:
+                raise RuntimeError(
+                    "site map fetched page 必須有 lease；live discovery fallback "
+                    "需明確設定 allow_unleased"
+                )
             if lease_token is not None and (
                 source_page.crawl_lease_token != lease_token
                 or source_page.crawl_lease_owner != lease_owner
+                or source_page.crawl_lease_expires_at is None
+                or source_page.crawl_lease_expires_at <= now
+                or (lease_expires_at is not None and lease_expires_at <= now)
             ):
                 raise RuntimeError("site map page lease 已失效，拒絕寫入")
             self._apply_crawl_success(
@@ -204,6 +231,15 @@ class SqlSiteMapRepository(SiteMapRepository):
                 last_modified=last_modified,
                 now=now,
             )
+            bounded_links, frontier_skipped = self._bounded_frontier_links_in_session(
+                session,
+                links,
+                now=now,
+            )
+            targets: dict[str, SitePageUpsert] = {}
+            for link in bounded_links:
+                if link.target.canonical_url != source.canonical_url:
+                    targets.setdefault(link.target.canonical_url, link.target)
             target_pages = tuple(targets.values())
             target_outcomes = self._upsert_pages_in_session(
                 session, target_pages, now=now
@@ -219,7 +255,7 @@ class SqlSiteMapRepository(SiteMapRepository):
                     link.anchor_text,
                     link.link_type,
                 )
-                for link in links
+                for link in bounded_links
                 if link.target.canonical_url in page_ids
             )
             edge_outcomes = self._upsert_links_in_session(session, edge_values, now=now)
@@ -233,7 +269,143 @@ class SqlSiteMapRepository(SiteMapRepository):
                 statement_count=3
                 + int(bool(target_pages))
                 + 2 * int(bool(edge_values)),
+                frontier_skipped=frontier_skipped,
             )
+
+    def _bounded_frontier_links_in_session(
+        self,
+        session: Session,
+        links: Sequence[SiteLinkUpsert],
+        *,
+        now: datetime,
+    ) -> tuple[tuple[SiteLinkUpsert, ...], int]:
+        """Filter and cap newly discovered links inside one DB transaction."""
+
+        unique: dict[str, SiteLinkUpsert] = {}
+        for link in links:
+            normalized = self._frontier_policy.normalize_target(
+                link.target.canonical_url,
+                allowed_hosts=None,
+                allow_document=True,
+            )
+            if normalized is None:
+                continue
+            target = replace(
+                link.target,
+                canonical_url=normalized,
+                is_indexable=link.target.is_indexable and is_crawlable_url(normalized),
+                next_crawl_at=(
+                    link.target.next_crawl_at
+                    or self._frontier_policy.new_target_due_at(now)
+                ),
+            )
+            previous = unique.get(normalized)
+            if previous is None or (not previous.anchor_text and link.anchor_text):
+                unique[normalized] = replace(link, target=target)
+        if not unique:
+            return (), 0
+
+        hosts = sorted(
+            {(urlsplit(url).hostname or "").casefold().rstrip(".") for url in unique}
+        )
+        is_postgresql = (
+            session.bind is not None and session.bind.dialect.name == "postgresql"
+        )
+        if is_postgresql:
+            session.execute(
+                text(
+                    "SELECT pg_advisory_xact_lock("
+                    "hashtextextended('nptu-frontier-global-cap', 0))"
+                )
+            )
+            for host in hosts:
+                session.execute(
+                    text("SELECT pg_advisory_xact_lock(hashtext(:host))"),
+                    {"host": host},
+                )
+
+        existing_rows = session.execute(
+            select(SitePage.canonical_url).where(
+                SitePage.canonical_url.in_(tuple(unique))
+            )
+        ).scalars()
+        existing_urls = set(existing_rows)
+        pending_total = int(
+            session.scalar(
+                select(func.count())
+                .select_from(SitePage)
+                .where(
+                    SitePage.is_active.is_(True),
+                    SitePage.is_indexable.is_(True),
+                    SitePage.crawl_status.not_in(
+                        [SiteCrawlStatus.BLOCKED.value, SiteCrawlStatus.EXCLUDED.value]
+                    ),
+                    SitePage.crawl_status.in_(
+                        [
+                            SiteCrawlStatus.DISCOVERED.value,
+                            SiteCrawlStatus.QUEUED.value,
+                            SiteCrawlStatus.FAILED.value,
+                            SiteCrawlStatus.FETCHING.value,
+                        ]
+                    ),
+                )
+            )
+            or 0
+        )
+        pending_by_host = {
+            host: int(
+                session.scalar(
+                    select(func.count())
+                    .select_from(SitePage)
+                    .where(
+                        SitePage.host == host,
+                        SitePage.is_active.is_(True),
+                        SitePage.is_indexable.is_(True),
+                        SitePage.crawl_status.not_in(
+                            [
+                                SiteCrawlStatus.BLOCKED.value,
+                                SiteCrawlStatus.EXCLUDED.value,
+                            ]
+                        ),
+                        SitePage.crawl_status.in_(
+                            [
+                                SiteCrawlStatus.DISCOVERED.value,
+                                SiteCrawlStatus.QUEUED.value,
+                                SiteCrawlStatus.FAILED.value,
+                                SiteCrawlStatus.FETCHING.value,
+                            ]
+                        ),
+                    )
+                )
+                or 0
+            )
+            for host in hosts
+        }
+        kept: list[SiteLinkUpsert] = []
+        skipped = 0
+        for link in unique.values():
+            # Keep the edge for graph metadata, but resource targets are
+            # explicitly excluded and never consume the HTML frontier.
+            if not link.target.is_indexable:
+                kept.append(link)
+                continue
+            if link.target.canonical_url in existing_urls:
+                kept.append(link)
+                continue
+            host = (urlsplit(link.target.canonical_url).hostname or "").casefold()
+            if pending_total >= self._frontier_policy.max_pending_total:
+                skipped += 1
+                continue
+            if (
+                pending_by_host.get(host, 0)
+                >= self._frontier_policy.per_host_pending_cap
+            ):
+                skipped += 1
+                continue
+            kept.append(link)
+            pending_total += 1
+            pending_by_host[host] = pending_by_host.get(host, 0) + 1
+        return tuple(kept), skipped
 
     def record_crawl_success(
         self,
@@ -244,7 +416,13 @@ class SqlSiteMapRepository(SiteMapRepository):
         http_status: int | None,
         etag: str | None = None,
         last_modified: str | None = None,
+        allow_unleased: bool = False,
     ) -> SiteMapWriteResult:
+        if not allow_unleased:
+            raise RuntimeError(
+                "site map crawl success 必須有 lease；live fallback "
+                "需明確設定 allow_unleased"
+            )
         now = self._clock()
         with self._factory.begin() as session:
             outcome = self._upsert_pages_in_session(
@@ -274,7 +452,13 @@ class SqlSiteMapRepository(SiteMapRepository):
         *,
         http_status: int | None = None,
         status: SiteCrawlStatus = SiteCrawlStatus.FAILED,
+        allow_unleased: bool = False,
     ) -> SiteMapWriteResult:
+        if not allow_unleased:
+            raise RuntimeError(
+                "site map crawl failure 必須有 lease；live fallback "
+                "需明確設定 allow_unleased"
+            )
         now = self._clock()
         with self._factory.begin() as session:
             outcome = self._upsert_pages_in_session(
@@ -911,6 +1095,10 @@ class SqlSiteMapRepository(SiteMapRepository):
                         SitePage.minimum_depth,
                         excluded.minimum_depth,
                     ),
+                    "next_crawl_at": case(
+                        (SitePage.next_crawl_at.is_(None), excluded.next_crawl_at),
+                        else_=SitePage.next_crawl_at,
+                    ),
                     "is_active": case(
                         (
                             incoming_source_rank >= existing_source_rank,
@@ -957,8 +1145,7 @@ class SqlSiteMapRepository(SiteMapRepository):
         session.flush()
         return outcomes
 
-    @staticmethod
-    def _page_values(page: SitePageUpsert, *, now: datetime) -> dict[str, Any]:
+    def _page_values(self, page: SitePageUpsert, *, now: datetime) -> dict[str, Any]:
         parsed = urlsplit(page.canonical_url)
         return {
             "id": uuid.uuid4(),
@@ -970,16 +1157,28 @@ class SqlSiteMapRepository(SiteMapRepository):
             "content_hash": page.content_hash,
             "page_type": page.page_type.value,
             "discovery_source": page.discovery_source.value,
-            "crawl_status": SiteCrawlStatus.DISCOVERED.value,
+            "crawl_status": (
+                SiteCrawlStatus.DISCOVERED.value
+                if page.is_indexable
+                else SiteCrawlStatus.EXCLUDED.value
+            ),
             "last_discovered_at": now,
+            "next_crawl_at": (
+                page.next_crawl_at or self._frontier_policy.new_target_due_at(now)
+            ),
             "crawl_priority": page.crawl_priority,
             "minimum_depth": page.minimum_depth,
             "is_indexable": page.is_indexable,
-            "is_active": True,
+            "is_active": page.is_indexable,
         }
 
-    @staticmethod
-    def _merge_page(existing: SitePage, page: SitePageUpsert, *, now: datetime) -> None:
+    def _merge_page(
+        self,
+        existing: SitePage,
+        page: SitePageUpsert,
+        *,
+        now: datetime,
+    ) -> None:
         if not existing.title or (
             existing.crawl_status
             not in {SiteCrawlStatus.SUCCESS.value, SiteCrawlStatus.UNCHANGED.value}
@@ -1005,6 +1204,10 @@ class SqlSiteMapRepository(SiteMapRepository):
         ):
             existing.discovery_source = page.discovery_source.value
         existing.last_discovered_at = max(existing.last_discovered_at, now)
+        if existing.next_crawl_at is None:
+            existing.next_crawl_at = (
+                page.next_crawl_at or self._frontier_policy.new_target_due_at(now)
+            )
         existing.crawl_priority = max(existing.crawl_priority, page.crawl_priority)
         existing.minimum_depth = min(existing.minimum_depth, page.minimum_depth)
         incoming_is_trusted = source_priority(page.discovery_source) >= source_priority(

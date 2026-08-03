@@ -103,7 +103,7 @@ class UnitSourceResolver:
         self._source_route_matcher = AliasNormalizer(
             {alias: source_name for alias, source_name in configured_routes.items()}
         )
-        self._unit_to_sources = {
+        self._unit_to_sources: dict[str, tuple[CrawlerSourceConfig, ...]] = {
             unit: tuple(configs) for unit, configs in unit_to_sources.items()
         }
         self._official_units = official_units
@@ -246,7 +246,7 @@ class UnitSourceResolver:
             if self._official_units is not None
             else None
         )
-        enabled_sources = tuple(
+        enabled_sources: tuple[CrawlerSourceConfig, ...] = tuple(
             source
             for source in self._unit_to_sources.get(canonical, ())
             if source.enabled
@@ -304,9 +304,16 @@ class UnitSourceResolver:
                 requested,
                 candidates=tuple(sorted({source.unit for source in enabled_sources})),
             )
+        resolved_source = next(iter(enabled_sources), None)
+        if resolved_source is None:
+            return UnitResolution(
+                UnitResolutionStatus.UNSUPPORTED,
+                requested,
+                canonical_unit=canonical,
+            )
         return UnitResolution(
             UnitResolutionStatus.RESOLVED,
             requested,
             canonical_unit=canonical,
-            source=enabled_sources[0],
+            source=resolved_source,
         )

@@ -63,12 +63,19 @@ def test_information_college_source_loads_from_project_config() -> None:
 def test_scholarship_sources_and_routes_load_from_project_config() -> None:
     config_path = WORKSPACE_ROOT / "data/sources/announcements.yaml"
     configs = load_source_configs(config_path)
-    external = next(item for item in configs if item.name == "student-scholarship-external-html")
-    internal = next(item for item in configs if item.name == "student-scholarship-internal-html")
+    external = next(
+        item for item in configs if item.name == "student-scholarship-external-html"
+    )
+    internal = next(
+        item for item in configs if item.name == "student-scholarship-internal-html"
+    )
     keyword_config = load_keyword_search_config(config_path)
 
     for source in (external, internal):
-        assert source.url == "https://staf-life.nptu.edu.tw/p/412-1074-14573.php?Lang=zh-tw"
+        assert (
+            source.url
+            == "https://staf-life.nptu.edu.tw/p/412-1074-14573.php?Lang=zh-tw"
+        )
         assert source.unit == "生活輔導組"
         assert source.allowed_hosts == ["staf-life.nptu.edu.tw"]
         assert source.max_items == 20
@@ -80,7 +87,9 @@ def test_scholarship_sources_and_routes_load_from_project_config() -> None:
         assert source.detail is not None and source.detail.enabled is False
         assert source.dynamic_listing is not None
         assert source.dynamic_listing.method == "post"
-        assert source.dynamic_listing.url.startswith("https://staf-life.nptu.edu.tw/app/index.php?")
+        assert source.dynamic_listing.url.startswith(
+            "https://staf-life.nptu.edu.tw/app/index.php?"
+        )
         assert source.dynamic_listing.wrapper_id == (
             "cmb_1373_0" if source is external else "cmb_1373_1"
         )
@@ -90,8 +99,13 @@ def test_scholarship_sources_and_routes_load_from_project_config() -> None:
     assert internal.selectors is not None
     assert internal.selectors.listing == "#cmb_1373_1"
     assert keyword_config.source_routes["獎學金"] == "student-scholarship-external-html"
-    assert keyword_config.source_routes["獎助學金"] == "student-scholarship-external-html"
-    assert keyword_config.source_routes["校內獎學金"] == "student-scholarship-internal-html"
+    assert (
+        keyword_config.source_routes["獎助學金"] == "student-scholarship-external-html"
+    )
+    assert (
+        keyword_config.source_routes["校內獎學金"]
+        == "student-scholarship-internal-html"
+    )
 
 
 def test_invalid_source_route_config_is_rejected() -> None:
@@ -113,7 +127,12 @@ def test_invalid_source_route_config_is_rejected() -> None:
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
-        (lambda item: item.update(url="http://ccs.nptu.edu.tw/p/403-1025-1019-1.php"), "HTTPS"),
+        (
+            lambda item: item.update(
+                url="http://ccs.nptu.edu.tw/p/403-1025-1019-1.php"
+            ),
+            "HTTPS",
+        ),
         (lambda item: item.update(allowed_hosts=["example.com"]), "host"),
         (lambda item: item.update(allowed_hosts=["www.nptu.edu.tw"]), "allowlist"),
         (lambda item: item.update(aliases=[""]), "別名"),

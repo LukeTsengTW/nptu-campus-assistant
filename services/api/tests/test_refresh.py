@@ -62,7 +62,9 @@ class RecordingCrawler:
         names = source_names or ["nptu-overview"]
         return CrawlRunResult(
             self.summary,
-            {name: self.canonical_urls for name in names} if not self.summary.failed else {},
+            {name: self.canonical_urls for name in names}
+            if not self.summary.failed
+            else {},
             frozenset(names) if self.persisted_source_snapshots else frozenset(),
         )
 
@@ -180,7 +182,9 @@ def test_failed_refresh_returns_stable_warning(tmp_path: Path) -> None:
     assert repository.refreshes == []
 
 
-def test_successful_empty_refresh_persists_an_empty_source_snapshot(tmp_path: Path) -> None:
+def test_successful_empty_refresh_persists_an_empty_source_snapshot(
+    tmp_path: Path,
+) -> None:
     config = tmp_path / "announcements.yaml"
     write_config(config)
     crawler = RecordingCrawler(CrawlSummary(), canonical_urls=())

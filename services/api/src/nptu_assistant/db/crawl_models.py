@@ -65,6 +65,7 @@ class SiteCrawlAttempt(Base):
     http_status: Mapped[int | None] = mapped_column(Integer)
     content_type: Mapped[str | None] = mapped_column(String(255))
     content_length: Mapped[int | None] = mapped_column(Integer)
+    final_url: Mapped[str | None] = mapped_column(String(2000))
     duration_ms: Mapped[int | None] = mapped_column(Integer)
     content_changed: Mapped[bool | None] = mapped_column(Boolean)
     links_discovered: Mapped[int] = mapped_column(

@@ -11,6 +11,11 @@ def test_site_crawl_models_expose_lease_and_attempt_metadata() -> None:
         "crawl_lease_token",
         "crawl_lease_owner",
         "crawl_lease_expires_at",
+        "ingestion_content_hash",
+        "ingestion_status",
+        "ingestion_lease_token",
+        "ingestion_lease_owner",
+        "ingestion_lease_expires_at",
     } <= set(SitePage.__table__.c.keys())
     assert {
         "site_page_id",
@@ -50,3 +55,18 @@ def test_crawl_migration_round_trip_has_current_parent_and_reversible_objects() 
     assert 'op.create_table(\n        "site_crawl_attempts"' in source
     assert 'op.drop_table("site_crawl_attempts")' in source
     assert 'op.drop_column("site_pages", "crawl_lease_token")' in source
+
+
+def test_ingestion_recovery_migration_is_append_only_and_reversible() -> None:
+    migration = (
+        Path(__file__)
+        .resolve()
+        .parents[3]
+        .joinpath("database/migrations/versions/20260803_0008_ingestion_recovery.py")
+    )
+    source = migration.read_text(encoding="utf-8")
+
+    assert 'revision: str = "20260803_0008"' in source
+    assert 'down_revision: str | None = "20260802_0007"' in source
+    assert 'op.add_column("site_pages", sa.Column("ingestion_content_hash"' in source
+    assert 'op.drop_column("site_pages", "ingestion_content_hash")' in source

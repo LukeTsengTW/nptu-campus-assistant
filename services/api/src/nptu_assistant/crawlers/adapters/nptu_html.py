@@ -23,6 +23,8 @@ class NptuHtmlListAdapter:
 
     def parse_listing(self, content: str) -> list[AnnouncementCandidate]:
         selectors = self._config.selectors
+        if selectors is None:
+            raise ValueError("缺少 HTML selectors")
         soup = BeautifulSoup(content, "html.parser")
         listing_roots = soup.select(selectors.listing)
         if not listing_roots:
@@ -75,8 +77,12 @@ class NptuHtmlListAdapter:
         if not isinstance(raw_href, str) or not raw_href.strip():
             raise ValueError("公告項目缺少連結屬性")
 
-        published_at = parse_published_at(" ".join(date_node.get_text(" ", strip=True).split()))
-        canonical_url = canonicalize_nptu_url(urljoin(self._config.url, raw_href.strip()))
+        published_at = parse_published_at(
+            " ".join(date_node.get_text(" ", strip=True).split())
+        )
+        canonical_url = canonicalize_nptu_url(
+            urljoin(self._config.url, raw_href.strip())
+        )
         if not is_allowed_source_url(canonical_url, self._config.allowed_hosts):
             raise ValueError("公告詳細網址不在來源 host allowlist")
         return AnnouncementCandidate(

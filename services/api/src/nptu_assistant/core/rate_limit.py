@@ -8,7 +8,9 @@ from typing import Protocol
 
 
 class RateLimiter(Protocol):
-    def allow(self, bucket: str, key: str, *, limit: int, window_seconds: int) -> bool: ...
+    def allow(
+        self, bucket: str, key: str, *, limit: int, window_seconds: int
+    ) -> bool: ...
 
 
 class InMemoryRateLimiter:

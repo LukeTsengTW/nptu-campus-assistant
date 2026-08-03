@@ -7,7 +7,14 @@ from typing import Any
 from pythonjsonlogger.json import JsonFormatter
 
 
-_SENSITIVE_FIELDS = ("api_key", "authorization", "password", "question", "secret", "token")
+_SENSITIVE_FIELDS = (
+    "api_key",
+    "authorization",
+    "password",
+    "question",
+    "secret",
+    "token",
+)
 
 
 def redact_sensitive_fields(value: Any) -> Any:
@@ -26,13 +33,15 @@ def redact_sensitive_fields(value: Any) -> Any:
 
 
 class RedactingJsonFormatter(JsonFormatter):
-    def process_log_record(self, log_record: dict[str, Any]) -> dict[str, Any]:
-        return redact_sensitive_fields(log_record)
+    def process_log_record(self, log_data: dict[str, Any]) -> dict[str, Any]:
+        return redact_sensitive_fields(log_data)
 
 
 def configure_logging(level: str) -> None:
     handler = logging.StreamHandler()
-    handler.setFormatter(RedactingJsonFormatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+    handler.setFormatter(
+        RedactingJsonFormatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+    )
     root = logging.getLogger()
     root.handlers.clear()
     root.addHandler(handler)

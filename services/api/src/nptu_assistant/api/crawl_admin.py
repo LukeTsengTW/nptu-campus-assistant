@@ -49,7 +49,17 @@ def _datetime_value(value: object) -> datetime | None:
 def _text_list(value: object) -> list[str]:
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
         return []
-    return [item for item in value if isinstance(item, str)]
+    return [item[:1000] for item in value if isinstance(item, str)][:20]
+
+
+def _attempt_counts(value: object) -> dict[str, int]:
+    if not isinstance(value, Mapping):
+        return {}
+    return {
+        str(key)[:64]: max(0, _integer(count))
+        for key, count in list(value.items())[:20]
+        if isinstance(key, str)
+    }
 
 
 class RefreshCoordinator(Protocol):
@@ -111,8 +121,8 @@ class CrawlWorkerController:
         self._schedule_store = schedule_store
         self._lock = threading.Lock()
         self._stop_requested = False
-        self._running = False
-        self._pending: _PendingSchedule | None = None
+        self._active_runs = 0
+        self._pending: list[_PendingSchedule] = []
         self._stop_event: asyncio.Event | None = None
         self._wake_event: asyncio.Event | None = None
         self._last_report: dict[str, object] | None = None
@@ -124,14 +134,14 @@ class CrawlWorkerController:
 
     def status(self) -> Mapping[str, object]:
         with self._lock:
-            if self._running:
+            if self._active_runs:
                 state = "running"
             elif self._stop_requested:
                 state = "stopped"
             else:
                 state = "idle"
             report = _mapping(dict(self._last_report or {}))
-            pending = self._pending
+            pending = self._pending[0] if self._pending else None
             durable = {}
             status = getattr(self._schedule_store, "status", None)
             if callable(status):
@@ -148,7 +158,7 @@ class CrawlWorkerController:
                 successes_total=self._successes_total,
                 failures_total=self._failures_total,
                 schedules_total=self._schedules_total,
-                queue_depth=int(pending is not None),
+                queue_depth=len(self._pending),
                 last_run_status=_text(report.get("status")),
                 last_sources_attempted=_integer(report.get("sources_attempted")),
                 last_sources_succeeded=_integer(report.get("sources_succeeded")),
@@ -162,11 +172,15 @@ class CrawlWorkerController:
                 next_run_at=pending.run_at if pending else None,
                 pending_schedule_id=pending.schedule_id if pending else None,
                 dry_run=bool(report.get("dry_run", False)),
+                pending=_integer(durable.get("pending")),
                 due=_integer(durable.get("due")),
                 leased=_integer(durable.get("leased")),
+                failed=_integer(durable.get("failed")),
                 blocked=_integer(durable.get("blocked")),
+                pending_ingestion=_integer(durable.get("pending_ingestion")),
                 active_workers=_integer(durable.get("active_workers")),
                 next_due_at=_datetime_value(durable.get("next_due_at")),
+                recent_attempts=_attempt_counts(durable.get("recent_attempts")),
             ).model_dump(mode="json")
 
     def schedule(self, request: CrawlScheduleRequest) -> Mapping[str, object]:
@@ -201,7 +215,8 @@ class CrawlWorkerController:
                 )
             )
         with self._lock:
-            self._pending = pending
+            self._pending.append(pending)
+            self._pending.sort(key=lambda item: (item.run_at, item.scheduled_at))
             self._schedules_total += 1
             wake_event = self._wake_event
         if wake_event is not None:
@@ -237,7 +252,25 @@ class CrawlWorkerController:
         if dry_run and not selected:
             selected = tuple(self._source_names())
         with self._lock:
-            self._running = True
+            if self._active_runs:
+                return {
+                    "run_id": run_id,
+                    "status": "busy",
+                    "dry_run": dry_run,
+                    "source_names": list(selected),
+                    "sources_attempted": 0,
+                    "sources_succeeded": 0,
+                    "sources_failed": 0,
+                    "created": 0,
+                    "updated": 0,
+                    "unchanged": 0,
+                    "failed": 0,
+                    "errors": ["已有 crawl worker 執行中"],
+                    "started_at": started_at,
+                    "finished_at": started_at,
+                    "duration_ms": 0.0,
+                }
+            self._active_runs += 1
         try:
             if dry_run:
                 results: list[object] = []
@@ -270,7 +303,7 @@ class CrawlWorkerController:
                 "updated": 0,
                 "unchanged": 0,
                 "failed": 1,
-                "errors": [f"{type(exc).__name__}: {exc}"],
+                "errors": [f"{type(exc).__name__}: {exc}"[:1000]],
                 "started_at": started_at,
                 "finished_at": finished_at,
                 "duration_ms": max(
@@ -279,7 +312,7 @@ class CrawlWorkerController:
             }
         finally:
             with self._lock:
-                self._running = False
+                self._active_runs = max(0, self._active_runs - 1)
         with self._lock:
             self._last_report = dict(report)
             self._runs_total += 1
@@ -331,10 +364,10 @@ class CrawlWorkerController:
                     continue
                 wait_seconds = max(0.0, (next_periodic - now).total_seconds())
                 with self._lock:
-                    if self._pending is not None:
+                    if self._pending:
                         wait_seconds = min(
                             wait_seconds,
-                            max(0.0, (self._pending.run_at - now).total_seconds()),
+                            max(0.0, (self._pending[0].run_at - now).total_seconds()),
                         )
                 stop_task = asyncio.create_task(stop_event.wait())
                 wake_task = asyncio.create_task(wake_event.wait())
@@ -364,11 +397,9 @@ class CrawlWorkerController:
 
     def _take_due_schedule(self, now: datetime) -> _PendingSchedule | None:
         with self._lock:
-            if self._pending is None or self._pending.run_at > now:
+            if not self._pending or self._pending[0].run_at > now:
                 return None
-            pending = self._pending
-            self._pending = None
-            return pending
+            return self._pending.pop(0)
 
     def _build_report(
         self,
@@ -445,7 +476,7 @@ class CrawlWorkerController:
             "sources_succeeded": sources_succeeded,
             "sources_failed": sources_failed,
             **counters,
-            "errors": errors,
+            "errors": _text_list(errors),
             "started_at": started_at,
             "finished_at": finished_at,
             "duration_ms": max(0.0, (finished_at - started_at).total_seconds() * 1000),

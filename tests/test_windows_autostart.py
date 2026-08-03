@@ -113,7 +113,15 @@ def test_start_script_waits_for_docker_then_starts_compose_and_checks_health(
         server.server_close()
 
     assert result.returncode == 0, result.stdout + result.stderr
-    all_calls = calls.read_text(encoding="mbcs").splitlines()
+    # PowerShell 7 and the Windows PowerShell compatibility layer can use
+    # different encodings for cmd.exe redirection.  The fake command only
+    # writes ASCII plus the project path, so accept the UTF-8 form first and
+    # fall back to the active Windows code page for native Windows runners.
+    try:
+        calls_text = calls.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        calls_text = calls.read_text(encoding="mbcs")
+    all_calls = calls_text.splitlines()
     assert all_calls.count("info") >= 3
     compose_call = all_calls[-1]
     assert compose_call.startswith("compose --project-directory ")

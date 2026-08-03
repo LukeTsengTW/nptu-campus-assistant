@@ -54,7 +54,7 @@ jobs:
       - name: Migrate and seed twice
         run: |
           uv run --project services/api alembic -c alembic.ini upgrade head
-          uv run --project services/api alembic -c alembic.ini downgrade 20260719_0004
+          uv run --project services/api alembic -c alembic.ini downgrade 20260802_0007
           uv run --project services/api alembic -c alembic.ini upgrade head
           uv run --project services/api nptu-assistant seed
           uv run --project services/api nptu-assistant seed
@@ -62,8 +62,22 @@ jobs:
       - name: Backend and PostgreSQL integration tests
         run: uv run --project services/api pytest --import-mode=importlib -rP
 
+      - name: Python quality checks
+        run: |
+          uv run --project services/api ruff format --isolated --check services/api/src services/api/tests tests/integration
+          uv run --project services/api ruff check --isolated --select E4,E7,E9,F services/api/src services/api/tests tests/integration
+          uv run --project services/api pyright services/api/src
+          uv run --project services/api python -m compileall -q services/api/src services/api/tests tests/integration
+          git diff --check
+
       - name: P3 PostgreSQL crawler acceptance
-        run: uv run --project services/api pytest tests/integration/test_crawl_acceptance.py --import-mode=importlib -q -rP
+        run: >-
+          uv run --project services/api pytest
+          tests/integration/test_crawl_acceptance.py
+          tests/integration/test_crawl_ingestion_recovery.py
+          tests/integration/test_crawl_performance.py
+          tests/integration/test_site_map.py
+          --import-mode=importlib -q -rP
 
       - name: Verify generated API contracts
         run: |

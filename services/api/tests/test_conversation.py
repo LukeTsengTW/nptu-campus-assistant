@@ -11,11 +11,15 @@ from nptu_assistant.rag.conversation import (
 
 
 def test_conversation_tables_have_expiry_sequence_and_cascade_contract() -> None:
-    assert {"id", "created_at", "updated_at", "expires_at"} <= set(Conversation.__table__.columns.keys())
+    assert {"id", "created_at", "updated_at", "expires_at"} <= set(
+        Conversation.__table__.columns.keys()
+    )
     assert {"conversation_id", "sequence", "event_type", "content", "metadata"} <= set(
         ConversationEvent.__table__.columns.keys()
     )
-    conversation_fk = next(iter(ConversationEvent.__table__.c.conversation_id.foreign_keys))
+    conversation_fk = next(
+        iter(ConversationEvent.__table__.c.conversation_id.foreign_keys)
+    )
     assert conversation_fk.ondelete == "CASCADE"
     assert any(
         set(constraint.columns.keys()) == {"conversation_id", "sequence"}
@@ -39,7 +43,9 @@ def test_sensitive_values_are_not_retained_in_conversation_text() -> None:
     assert redact_sensitive_text("最近五則公告") == "最近五則公告"
 
 
-def event(sequence: int, event_type: str, content: str | None, metadata: dict | None = None) -> StoredConversationEvent:
+def event(
+    sequence: int, event_type: str, content: str | None, metadata: dict | None = None
+) -> StoredConversationEvent:
     return StoredConversationEvent(
         sequence=sequence,
         event_type=event_type,
@@ -49,11 +55,19 @@ def event(sequence: int, event_type: str, content: str | None, metadata: dict | 
     )
 
 
-def test_context_keeps_at_most_twelve_messages_and_sixteen_thousand_characters() -> None:
-    events = [event(index, "user", f"訊息{index}-" + ("字" * 2_000)) for index in range(1, 16)]
+def test_context_keeps_at_most_twelve_messages_and_sixteen_thousand_characters() -> (
+    None
+):
+    events = [
+        event(index, "user", f"訊息{index}-" + ("字" * 2_000)) for index in range(1, 16)
+    ]
 
     context = build_conversation_context("conversation-1", events)
-    messages = [item for item in context.input_items if item.get("role") in {"user", "assistant"}]
+    messages = [
+        item
+        for item in context.input_items
+        if item.get("role") in {"user", "assistant"}
+    ]
 
     assert len(messages) <= 12
     assert sum(len(str(item["content"])) for item in context.input_items) <= 16_000

@@ -62,7 +62,9 @@ class CrawlerService:
         unknown = requested - known
         if unknown:
             summary.failed += len(unknown)
-            summary.errors.extend(f"未知 crawler source：{name}" for name in sorted(unknown))
+            summary.errors.extend(
+                f"未知 crawler source：{name}" for name in sorted(unknown)
+            )
             return CrawlRunResult(summary, canonical_urls)
         selected = [
             config
@@ -110,9 +112,14 @@ class CrawlerService:
         for candidate in adapter.parse_listing(listing)[: config.max_items]:
             resolved = candidate
             if config.adapter == "fixture" and self._detail_enabled(config):
-                detail_path = (self._workspace_root / config.url).with_name("detail.html")
+                detail_path = (self._workspace_root / config.url).with_name(
+                    "detail.html"
+                )
                 if detail_path.exists():
-                    resolved = self._with_body(candidate, adapter.parse_detail(detail_path.read_text(encoding="utf-8")))
+                    resolved = self._with_body(
+                        candidate,
+                        adapter.parse_detail(detail_path.read_text(encoding="utf-8")),
+                    )
             elif self._detail_enabled(config):
                 try:
                     detail = (
@@ -125,7 +132,9 @@ class CrawlerService:
                     )
                     resolved = self._with_body(candidate, adapter.parse_detail(detail))
                 except Exception:
-                    resolved = self._with_warning(candidate, "公告詳情暫時無法取得，使用列表內容")
+                    resolved = self._with_warning(
+                        candidate, "公告詳情暫時無法取得，使用列表內容"
+                    )
             resolved_candidates.append(resolved)
 
         source_url = (
@@ -156,7 +165,9 @@ class CrawlerService:
         return config.adapter in {"fixture", "nptu_overview"}
 
     @staticmethod
-    def _with_body(candidate: AnnouncementCandidate, body: str) -> AnnouncementCandidate:
+    def _with_body(
+        candidate: AnnouncementCandidate, body: str
+    ) -> AnnouncementCandidate:
         return AnnouncementCandidate(
             title=candidate.title,
             canonical_url=candidate.canonical_url,
@@ -169,7 +180,9 @@ class CrawlerService:
         )
 
     @staticmethod
-    def _with_warning(candidate: AnnouncementCandidate, warning: str) -> AnnouncementCandidate:
+    def _with_warning(
+        candidate: AnnouncementCandidate, warning: str
+    ) -> AnnouncementCandidate:
         return AnnouncementCandidate(
             title=candidate.title,
             canonical_url=candidate.canonical_url,

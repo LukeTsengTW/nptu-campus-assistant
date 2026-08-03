@@ -11,7 +11,11 @@ from nptu_assistant.core.security import (
     is_allowed_nptu_url,
     is_allowed_source_url,
 )
-from nptu_assistant.core.settings import Settings, WORKSPACE_ROOT, resolve_workspace_path
+from nptu_assistant.core.settings import (
+    Settings,
+    WORKSPACE_ROOT,
+    resolve_workspace_path,
+)
 
 
 def test_settings_parse_cors_without_wildcard() -> None:
@@ -36,7 +40,9 @@ def test_workspace_path_resolution_is_independent_of_cwd(tmp_path, monkeypatch) 
 
 def test_admin_api_defaults_to_disabled_outside_development() -> None:
     production = Settings(_env_file=None, app_env="production", admin_api_enabled=None)
-    development = Settings(_env_file=None, app_env="development", admin_api_enabled=None)
+    development = Settings(
+        _env_file=None, app_env="development", admin_api_enabled=None
+    )
 
     assert production.is_admin_enabled is False
     assert development.is_admin_enabled is True
@@ -88,9 +94,12 @@ def test_source_url_allowlist_uses_domain_boundaries() -> None:
 
 
 def test_canonicalize_nptu_url_removes_fragment_and_default_port() -> None:
-    assert canonicalize_nptu_url(
-        "https://CCS.NPTU.EDU.TW:443/p/406.php?Lang=zh-tw#content"
-    ) == "https://ccs.nptu.edu.tw/p/406.php?Lang=zh-tw"
+    assert (
+        canonicalize_nptu_url(
+            "https://CCS.NPTU.EDU.TW:443/p/406.php?Lang=zh-tw#content"
+        )
+        == "https://ccs.nptu.edu.tw/p/406.php?Lang=zh-tw"
+    )
 
     with pytest.raises(ValueError, match="NPTU"):
         canonicalize_nptu_url("https://example.com/item")

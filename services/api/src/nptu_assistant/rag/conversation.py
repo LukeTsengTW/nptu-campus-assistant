@@ -5,8 +5,10 @@ import re
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from typing import Any, cast
 
 from sqlalchemy import delete, func, select
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session, sessionmaker
 
 from nptu_assistant.api.schemas import AnswerType
@@ -88,7 +90,9 @@ def build_conversation_context(
         used_characters = len(summary)
 
     message_events = [
-        item for item in ordered if item.event_type in {"user", "assistant"} and item.content
+        item
+        for item in ordered
+        if item.event_type in {"user", "assistant"} and item.content
     ][-MAX_CONTEXT_MESSAGES:]
     selected: list[dict[str, object]] = []
     remaining = MAX_CONTEXT_CHARACTERS - used_characters
@@ -185,11 +189,14 @@ class SqlConversationStore:
             )
             if conversation is None:
                 raise ValueError("對話不存在或已過期")
-            sequence = session.scalar(
-                select(func.max(ConversationEvent.sequence)).where(
-                    ConversationEvent.conversation_id == parsed_id
+            sequence = (
+                session.scalar(
+                    select(func.max(ConversationEvent.sequence)).where(
+                        ConversationEvent.conversation_id == parsed_id
+                    )
                 )
-            ) or 0
+                or 0
+            )
 
             def add_event(
                 event_type: str,
@@ -240,5 +247,10 @@ class SqlConversationStore:
         except ValueError:
             return False
         with self._factory.begin() as session:
-            result = session.execute(delete(Conversation).where(Conversation.id == parsed_id))
+            result = cast(
+                CursorResult[Any],
+                session.execute(
+                    delete(Conversation).where(Conversation.id == parsed_id)
+                ),
+            )
             return bool(result.rowcount)

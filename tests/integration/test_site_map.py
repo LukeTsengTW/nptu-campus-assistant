@@ -26,6 +26,8 @@ from nptu_assistant.crawlers.config import SiteSearchConfig
 from nptu_assistant.crawlers.crawl_policy import is_crawlable_url
 from nptu_assistant.crawlers.official_units import load_default_official_unit_directory
 from nptu_assistant.crawlers.site_map import (
+    FrontierPolicy,
+    SiteCrawlStatus,
     SiteDiscoverySource,
     SiteLinkType,
     SiteLinkUpsert,
@@ -43,6 +45,7 @@ from nptu_assistant.crawlers.site_models import (
 from nptu_assistant.crawlers.site_search import NptuSiteSearchService
 from nptu_assistant.crawlers.site_search_cache import InMemorySiteSearchCache
 from nptu_assistant.db.models import Announcement, Document, SiteLink, SitePage, Source
+from nptu_assistant.db.crawl_scheduler import SqlCrawlSchedulerRepository
 from nptu_assistant.db.site_map import SqlSiteMapRepository
 
 
@@ -181,6 +184,119 @@ def test_concurrent_page_and_link_upsert_is_idempotent() -> None:
         engine.dispose()
 
 
+def test_postgres_frontier_pending_cap_delays_and_deduplicates_targets() -> None:
+    factory, engine = make_factory()
+    prefix = f"https://p2-frontier-{uuid.uuid4().hex}.nptu.edu.tw"
+    now = datetime(2026, 8, 2, 12, 0, tzinfo=timezone.utc)
+    policy = FrontierPolicy(
+        per_host_pending_cap=2,
+        new_target_delay=timedelta(minutes=3),
+    )
+    repository = SqlSiteMapRepository(
+        factory,
+        clock=lambda: now,
+        frontier_policy=policy,
+    )
+    source = SitePageUpsert(
+        canonical_url=f"{prefix}/source",
+        page_type=SitePageType.GENERAL_PAGE,
+        discovery_source=SiteDiscoverySource.CONFIGURED_SEED,
+    )
+    links = tuple(
+        SiteLinkUpsert(
+            target=SitePageUpsert(
+                canonical_url=f"{prefix}/target-{index}",
+                page_type=SitePageType.UNKNOWN,
+                discovery_source=SiteDiscoverySource.INTERNAL_LINK,
+            ),
+            anchor_text=f"目標 {index}",
+            link_type=SiteLinkType.CONTENT,
+        )
+        for index in range(5)
+    ) + (
+        SiteLinkUpsert(
+            target=SitePageUpsert(
+                canonical_url=f"{prefix}/target-0#fragment",
+                page_type=SitePageType.UNKNOWN,
+                discovery_source=SiteDiscoverySource.INTERNAL_LINK,
+            ),
+            anchor_text="重複目標",
+            link_type=SiteLinkType.CONTENT,
+        ),
+    )
+    try:
+        result = repository.persist_fetched_page(
+            source,
+            title="來源",
+            content_hash="a" * 64,
+            http_status=200,
+            links=links,
+            allow_unleased=True,
+        )
+        assert result.target_created == 2
+        with factory() as session:
+            targets = session.scalars(
+                select(SitePage).where(
+                    SitePage.canonical_url.like(f"{prefix}/target-%")
+                )
+            ).all()
+            assert len(targets) == 2
+            assert all(
+                target.next_crawl_at == now + timedelta(minutes=3) for target in targets
+            )
+    finally:
+        cleanup(factory, prefix)
+        engine.dispose()
+
+
+def test_postgres_fetched_page_write_requires_unexpired_page_lease() -> None:
+    factory, engine = make_factory()
+    token = uuid.uuid4().hex
+    prefix = f"https://p2-fetched-lease-{token}.nptu.edu.tw"
+    lease_host = f"p2-fetched-lease-{token}.nptu.edu.tw"
+    now = datetime(2026, 8, 2, 12, 0, tzinfo=timezone.utc)
+    source = SitePageUpsert(
+        canonical_url=f"{prefix}/source",
+        page_type=SitePageType.GENERAL_PAGE,
+        discovery_source=SiteDiscoverySource.CONFIGURED_SEED,
+    )
+    with factory.begin() as session:
+        session.add(
+            SitePage(
+                canonical_url=source.canonical_url,
+                host=lease_host,
+                path="/source",
+                page_type=SitePageType.GENERAL_PAGE.value,
+                discovery_source=SiteDiscoverySource.CONFIGURED_SEED.value,
+                crawl_status="discovered",
+                next_crawl_at=now - timedelta(seconds=1),
+                is_active=True,
+                is_indexable=True,
+            )
+        )
+    scheduler = SqlCrawlSchedulerRepository(factory)
+    site_map = SqlSiteMapRepository(factory, clock=lambda: now + timedelta(seconds=2))
+    try:
+        claim = scheduler.claim_due(
+            owner="fetched-lease-worker",
+            limit=1,
+            lease_duration=timedelta(seconds=1),
+            now=now,
+        )[0]
+        with pytest.raises(RuntimeError, match="lease"):
+            site_map.persist_fetched_page(
+                source,
+                title="過期結果",
+                content_hash="b" * 64,
+                http_status=200,
+                lease_owner=claim.owner,
+                lease_token=claim.token,
+            )
+    finally:
+        cleanup(factory, prefix)
+        engine.dispose()
+
+
 def test_batch_persistence_100_links_uses_one_transaction_and_fixed_sql() -> None:
     factory, engine = make_factory()
     token = uuid.uuid4().hex
@@ -225,11 +341,13 @@ def test_batch_persistence_100_links_uses_one_transaction_and_fixed_sql() -> Non
             content_hash="c" * 64,
             http_status=200,
             links=links,
+            allow_unleased=True,
         )
         batch_ms = (perf_counter() - started) * 1000
         batch_statement_count = len(statements)
         assert result.links_created == 100
         assert result.statement_count <= 8
+        assert batch_statement_count <= 12
         with factory() as session:
             assert (
                 session.scalar(
@@ -248,7 +366,10 @@ def test_batch_persistence_100_links_uses_one_transaction_and_fixed_sql() -> Non
                 )
                 == 100
             )
-        assert len(statements) <= 8
+        # The event hook counts only the write transaction.  The two
+        # assertions above intentionally query the database after the batch
+        # and must not be mistaken for frontier write statements.
+        assert batch_statement_count <= 12
         print(
             "site_map_batch_benchmark "
             f"links=100 transactions=1 statements={batch_statement_count} "
@@ -256,6 +377,141 @@ def test_batch_persistence_100_links_uses_one_transaction_and_fixed_sql() -> Non
         )
     finally:
         event.remove(engine, "before_cursor_execute", capture_sql)
+        cleanup(factory, prefix)
+        engine.dispose()
+
+
+def test_non_html_frontier_target_is_excluded_but_edge_is_saved() -> None:
+    factory, engine = make_factory()
+    prefix = f"https://p31-nonhtml-{uuid.uuid4().hex}.nptu.edu.tw"
+    source = SitePageUpsert(
+        canonical_url=f"{prefix}/source",
+        page_type=SitePageType.GENERAL_PAGE,
+        discovery_source=SiteDiscoverySource.INTERNAL_LINK,
+    )
+    target_url = f"{prefix}/download/notice.pdf"
+    try:
+        result = SqlSiteMapRepository(factory).persist_fetched_page(
+            source,
+            title="來源",
+            content_hash="d" * 64,
+            http_status=200,
+            links=(
+                SiteLinkUpsert(
+                    target=SitePageUpsert(
+                        canonical_url=target_url,
+                        discovery_source=SiteDiscoverySource.INTERNAL_LINK,
+                    ),
+                    anchor_text="下載公告",
+                    link_type=SiteLinkType.DOCUMENT,
+                ),
+            ),
+            allow_unleased=True,
+        )
+        assert result.links_created == 1
+        with factory() as session:
+            target = session.scalar(
+                select(SitePage).where(SitePage.canonical_url == target_url)
+            )
+            assert target is not None
+            assert target.is_indexable is False
+            assert target.is_active is False
+            assert target.crawl_status == SiteCrawlStatus.EXCLUDED.value
+            assert (
+                session.scalar(
+                    select(func.count())
+                    .select_from(SiteLink)
+                    .where(SiteLink.target_page_id == target.id)
+                )
+                == 1
+            )
+    finally:
+        cleanup(factory, prefix)
+        engine.dispose()
+
+
+def test_global_frontier_cap_is_serialized_across_hosts() -> None:
+    factory, engine = make_factory()
+    token = uuid.uuid4().hex
+    with factory() as session:
+        existing_pending = int(
+            session.scalar(
+                select(func.count())
+                .select_from(SitePage)
+                .where(
+                    SitePage.is_active.is_(True),
+                    SitePage.is_indexable.is_(True),
+                    SitePage.crawl_status.in_(
+                        [
+                            SiteCrawlStatus.DISCOVERED.value,
+                            SiteCrawlStatus.QUEUED.value,
+                            SiteCrawlStatus.FAILED.value,
+                            SiteCrawlStatus.FETCHING.value,
+                        ]
+                    ),
+                )
+            )
+            or 0
+        )
+    policy = FrontierPolicy(
+        max_pending_total=existing_pending + 1,
+        per_host_pending_cap=10,
+    )
+    repository = SqlSiteMapRepository(factory, frontier_policy=policy)
+    prefix = f"https://p31-global-cap-{token}"
+
+    def persist(index: int) -> int:
+        host = f"p31-global-cap-{token}-{index}.nptu.edu.tw"
+        source = SitePageUpsert(
+            canonical_url=f"https://{host}/source",
+            page_type=SitePageType.GENERAL_PAGE,
+            discovery_source=SiteDiscoverySource.INTERNAL_LINK,
+        )
+        result = repository.persist_fetched_page(
+            source,
+            title="來源",
+            content_hash=("e" if index == 0 else "f") * 64,
+            http_status=200,
+            links=(
+                SiteLinkUpsert(
+                    target=SitePageUpsert(
+                        canonical_url=f"https://{host}/target",
+                        discovery_source=SiteDiscoverySource.INTERNAL_LINK,
+                    ),
+                    anchor_text="目標",
+                    link_type=SiteLinkType.CONTENT,
+                ),
+            ),
+            allow_unleased=True,
+        )
+        return result.target_created
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            created = list(pool.map(persist, (0, 1)))
+        assert sorted(created) == [0, 1]
+        with factory() as session:
+            assert (
+                session.scalar(
+                    select(func.count())
+                    .select_from(SitePage)
+                    .where(
+                        SitePage.is_active.is_(True),
+                        SitePage.is_indexable.is_(True),
+                        SitePage.crawl_status.in_(
+                            [
+                                SiteCrawlStatus.DISCOVERED.value,
+                                SiteCrawlStatus.QUEUED.value,
+                                SiteCrawlStatus.FAILED.value,
+                                SiteCrawlStatus.FETCHING.value,
+                            ]
+                        ),
+                        SitePage.canonical_url.like(f"{prefix}-%/target"),
+                    )
+                )
+                <= 1
+            )
+    finally:
         cleanup(factory, prefix)
         engine.dispose()
 
@@ -818,6 +1074,7 @@ def test_crawl_state_tracks_hash_changes_and_failure_recovery() -> None:
             title="第一版",
             content_hash="a" * 64,
             http_status=200,
+            allow_unleased=True,
             etag='"v1"',
             last_modified="Wed, 01 Jan 2026 00:00:00 GMT",
         )
@@ -835,6 +1092,7 @@ def test_crawl_state_tracks_hash_changes_and_failure_recovery() -> None:
             title="第一版",
             content_hash="a" * 64,
             http_status=200,
+            allow_unleased=True,
         )
         with factory() as session:
             unchanged = session.scalar(
@@ -843,12 +1101,13 @@ def test_crawl_state_tracks_hash_changes_and_failure_recovery() -> None:
             assert unchanged is not None
             assert unchanged.crawl_status == "unchanged"
             assert unchanged.last_changed_at == first_changed_at
-        repository.record_crawl_failure(url, http_status=503)
+        repository.record_crawl_failure(url, http_status=503, allow_unleased=True)
         repository.record_crawl_success(
             url,
             title="第二版",
             content_hash="b" * 64,
             http_status=200,
+            allow_unleased=True,
         )
         with factory() as session:
             recovered = session.scalar(

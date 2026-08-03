@@ -16,7 +16,9 @@ def parse_document(path: Path) -> str:
         raise ValueError(f"不支援的文件格式：{suffix}")
     if suffix == ".pdf":
         with fitz.open(path) as document:
-            return normalize_text("\n".join(page.get_text("text") for page in document))
+            return normalize_text(
+                "\n".join(str(page.get_text("text")) for page in document)
+            )
     text = path.read_text(encoding="utf-8")
     if suffix in {".html", ".htm"}:
         return extract_clean_html(text)

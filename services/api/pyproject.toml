@@ -27,6 +27,8 @@ dev = [
   "pytest>=8.4,<10",
   "pytest-cov>=6,<8",
   "pytest-httpx>=0.35,<1",
+  "pyright>=1.1.390,<2",
+  "ruff>=0.12,<1",
 ]
 
 [project.scripts]
@@ -50,3 +52,10 @@ source = ["nptu_assistant"]
 [tool.coverage.report]
 show_missing = true
 skip_covered = true
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]

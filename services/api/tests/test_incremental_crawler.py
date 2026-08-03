@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 
 import httpx
+from sqlalchemy.exc import OperationalError
 from nptu_assistant.crawlers.adapters.nptu_site import NptuSitePageAdapter
 from nptu_assistant.crawlers.crawl_ingestion import (
     CrawlIngestionResult,
@@ -398,3 +399,171 @@ def test_worker_limits_active_fetches_to_configured_concurrency() -> None:
 
     assert len(result.results) == 5
     assert max_active <= 2
+
+
+def test_failed_ingestion_hash_forces_full_fetch_and_recovers() -> None:
+    class RecoveryIngestion:
+        def __init__(self) -> None:
+            self.statuses = [CrawlIngestionStatus.FAILED, CrawlIngestionStatus.CREATED]
+            self.pages = []
+
+        def needs_ingestion(self, canonical_url: str, digest: str, **kwargs) -> bool:
+            del canonical_url, digest, kwargs
+            return True
+
+        def ingest_page(self, page, *, unit=None):
+            self.pages.append((page, unit))
+            return CrawlIngestionResult(
+                page.canonical_url,
+                self.statuses.pop(0),
+            )
+
+    ingestion = RecoveryIngestion()
+    http = FakeHttpClient(response(headers={"etag": '"v1"'}))
+    worker = make_worker(
+        http,
+        MemoryPageSink(),
+        ingestion_service=ingestion,
+    )
+
+    first = worker.run_once([IncrementalCrawlTarget(URL)]).results[0]
+    second = worker.run_once(
+        [
+            IncrementalCrawlTarget(
+                URL,
+                etag='"v1"',
+                content_hash=content_hash(
+                    NptuSitePageAdapter()
+                    .parse_page(HTML, URL, allowed_hosts=("nptu.edu.tw",))
+                    .body
+                ),
+            )
+        ]
+    ).results[0]
+
+    assert first.outcome is IncrementalCrawlOutcome.INGESTION_FAILED
+    assert second.outcome is IncrementalCrawlOutcome.UNCHANGED
+    assert second.ingestion_performed is True
+    assert http.headers[1] == {}
+    assert len(ingestion.pages) == 2
+
+
+def test_default_worker_allows_only_one_active_fetch_per_host() -> None:
+    active = 0
+    max_active = 0
+    guard = threading.Lock()
+
+    class SlowHttpClient(FakeHttpClient):
+        def get_response(self, url: str, *, allowed_hosts, request_headers=None):
+            nonlocal active, max_active
+            with guard:
+                active += 1
+                max_active = max(max_active, active)
+            time.sleep(0.01)
+            with guard:
+                active -= 1
+            return response(url=url)
+
+    worker = make_worker(
+        SlowHttpClient(response()),
+        MemoryPageSink(),
+        max_concurrency=3,
+    )
+
+    result = worker.run_once(
+        [
+            IncrementalCrawlTarget(f"https://www.nptu.edu.tw/news/{index}")
+            for index in range(4)
+        ]
+    )
+
+    assert len(result.results) == 4
+    assert max_active == 1
+
+
+def test_run_loop_caps_claims_at_remaining_max_pages() -> None:
+    class BoundedScheduler:
+        def __init__(self) -> None:
+            self.calls: list[int] = []
+            self.targets = tuple(
+                SimpleNamespace(canonical_url=f"{URL}/{index}") for index in range(4)
+            )
+
+        def claim_due(self, *, owner, limit, lease_duration):
+            del owner, lease_duration
+            self.calls.append(limit)
+            return self.targets[:limit]
+
+        def complete(self, claim, **kwargs):
+            del claim, kwargs
+            return True
+
+        def renew(self, claim, **kwargs):
+            del claim, kwargs
+            return True
+
+    scheduler = BoundedScheduler()
+    worker = make_worker(
+        FakeHttpClient(response()),
+        MemoryPageSink(),
+        scheduler=scheduler,
+        max_concurrency=4,
+    )
+
+    worker.run_loop(max_pages=1, batch_size=4, poll_interval_seconds=0)
+
+    assert scheduler.calls == [1]
+
+
+def test_run_loop_does_not_claim_after_stop_event() -> None:
+    class Scheduler:
+        def __init__(self) -> None:
+            self.claims = 0
+
+        def claim_due(self, **kwargs):
+            del kwargs
+            self.claims += 1
+            return ()
+
+    scheduler = Scheduler()
+    stop_event = threading.Event()
+    stop_event.set()
+    worker = make_worker(
+        FakeHttpClient(response()),
+        MemoryPageSink(),
+        scheduler=scheduler,
+    )
+
+    worker.run_loop(stop_event=stop_event, poll_interval_seconds=0)
+
+    assert scheduler.claims == 0
+
+
+def test_database_claim_retries_with_bounded_backoff() -> None:
+    class RetryScheduler:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def claim_due(self, **kwargs):
+            del kwargs
+            self.calls += 1
+            if self.calls < 3:
+                raise OperationalError("SELECT", {}, RuntimeError("temporary"))
+            return ()
+
+    sleeps: list[float] = []
+    scheduler = RetryScheduler()
+    worker = make_worker(
+        FakeHttpClient(response()),
+        MemoryPageSink(),
+        scheduler=scheduler,
+        sleep=sleeps.append,
+        db_retry_attempts=3,
+        db_retry_base_seconds=0.25,
+        db_retry_max_seconds=0.3,
+    )
+
+    worker.run_once()
+
+    assert scheduler.calls == 3
+    assert sleeps == [0.25, 0.3]

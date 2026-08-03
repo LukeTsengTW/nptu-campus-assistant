@@ -1564,6 +1564,11 @@
             "title": "Dry Run",
             "default": false
           },
+          "pending": {
+            "type": "integer",
+            "title": "Pending",
+            "default": 0
+          },
           "due": {
             "type": "integer",
             "title": "Due",
@@ -1574,9 +1579,19 @@
             "title": "Leased",
             "default": 0
           },
+          "failed": {
+            "type": "integer",
+            "title": "Failed",
+            "default": 0
+          },
           "blocked": {
             "type": "integer",
             "title": "Blocked",
+            "default": 0
+          },
+          "pending_ingestion": {
+            "type": "integer",
+            "title": "Pending Ingestion",
             "default": 0
           },
           "active_workers": {

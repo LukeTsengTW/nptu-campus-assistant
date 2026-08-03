@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from threading import Event, Thread
 
 from fastapi.testclient import TestClient
 from nptu_assistant.api.crawl_admin import CrawlWorkerController
@@ -98,6 +99,53 @@ def test_status_and_schedule_are_admin_authorized() -> None:
     assert admin.requests[0].dry_run is True
 
 
+def test_status_exposes_durable_pending_and_attempt_counts() -> None:
+    class DurableAdmin(RecordingAdmin):
+        def status(self) -> dict[str, object]:
+            return {
+                "status": "idle",
+                "enabled": True,
+                "pending": 4,
+                "due": 2,
+                "leased": 1,
+                "active_workers": 1,
+                "recent_attempts": {
+                    "success_changed": 3,
+                    "failed_transient": 1,
+                },
+            }
+
+    response = make_client(DurableAdmin()).get(
+        "/v1/admin/site-map/crawl/status",
+        headers={"X-Admin-Key": "test-admin-key"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["pending"] == 4
+    assert response.json()["active_workers"] == 1
+    assert response.json()["recent_attempts"] == {
+        "success_changed": 3,
+        "failed_transient": 1,
+    }
+
+
+def test_admin_aliases_and_schedule_validation_remain_compatible() -> None:
+    client = make_client(RecordingAdmin())
+    headers = {"X-Admin-Key": "test-admin-key"}
+
+    old_status = client.get("/v1/admin/crawl/status", headers=headers)
+    site_map_status = client.get("/v1/admin/site-map/crawl/status", headers=headers)
+    invalid = client.post(
+        "/v1/admin/site-map/crawl/schedule",
+        headers=headers,
+        json={"urls": ["https://example.com/not-allowed"]},
+    )
+
+    assert old_status.status_code == 200
+    assert site_map_status.status_code == 200
+    assert invalid.status_code == 422
+
+
 def test_schedule_endpoint_only_submits_to_control_plane() -> None:
     class NoCrawler:
         def run(self, source_names: list[str] | None = None) -> CrawlSummary:
@@ -157,6 +205,30 @@ def test_worker_dry_run_is_observable_without_refreshing() -> None:
     assert coordinator.calls == 0
     assert status["runs_total"] == 1
     assert status["last_duration_ms"] is not None
+
+
+def test_worker_rejects_concurrent_run_once_reentry() -> None:
+    started = Event()
+    release = Event()
+
+    class Coordinator:
+        def refresh_due_sources(self) -> list[object]:
+            started.set()
+            assert release.wait(5)
+            return []
+
+    worker = CrawlWorkerController(Coordinator())
+    reports: list[dict[str, object]] = []
+    thread = Thread(target=lambda: reports.append(dict(worker.run_once())))
+    thread.start()
+    assert started.wait(5)
+    busy = worker.run_once()
+    release.set()
+    thread.join(5)
+
+    assert busy["status"] == "busy"
+    assert reports[0]["status"] == "completed"
+    assert worker.status()["runs_total"] == 1
 
 
 def test_cli_worker_modes_are_mutually_exclusive() -> None:

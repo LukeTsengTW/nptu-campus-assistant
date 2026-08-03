@@ -52,7 +52,9 @@ class DocumentIngestionService:
                     summary.skipped += 1
                     continue
                 chunks = chunk_text(raw_text)
-                embeddings = self._embedding_provider.embed([chunk.content for chunk in chunks])
+                embeddings = self._embedding_provider.embed(
+                    [chunk.content for chunk in chunks]
+                )
                 self._repository.save(metadata, raw_text, chunks, embeddings)
                 summary.created += 1
             except Exception as exc:
@@ -63,7 +65,9 @@ class DocumentIngestionService:
     @staticmethod
     def _load_metadata(path: Path) -> DocumentMetadata:
         candidates = [path.with_suffix(".yaml"), path.with_suffix(".yml")]
-        metadata_path = next((candidate for candidate in candidates if candidate.exists()), None)
+        metadata_path = next(
+            (candidate for candidate in candidates if candidate.exists()), None
+        )
         if metadata_path is None:
             raise ValueError("缺少同名 YAML metadata")
         payload = yaml.safe_load(metadata_path.read_text(encoding="utf-8"))

@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import date
-from typing import Literal
+from typing import Literal, cast
 from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup, Tag
@@ -56,9 +56,10 @@ class NptuAssociationSearchAdapter:
             raise ValueError("bootstrap URL 不在 NPTU allowlist")
         soup = BeautifulSoup(content, "html.parser")
         for form in soup.find_all("form"):
-            if not isinstance(form, Tag) or form.find(attrs={"name": "SchKey"}) is None:
+            if not isinstance(form, Tag) or form.select_one("[name='SchKey']") is None:
                 continue
-            method = str(form.get("method", "get")).lower()
+            method_value = str(form.get("method", "get")).lower()
+            method = cast(Literal["get", "post"], method_value)
             if method not in {"get", "post"}:
                 raise ValueError("搜尋表單僅允許 GET 或 POST")
             return BootstrapForm(method, self._hidden_fields(form))
@@ -69,11 +70,12 @@ class NptuAssociationSearchAdapter:
         for form in soup.find_all("form"):
             if not isinstance(form, Tag):
                 continue
-            keyword = form.find(attrs={"name": "SchKey"})
-            search_type = form.find("select", attrs={"name": "SchType"})
+            keyword = form.select_one("[name='SchKey']")
+            search_type = form.select_one("select[name='SchType']")
             if keyword is None or not isinstance(search_type, Tag):
                 continue
-            method = str(form.get("method", "get")).lower()
+            method_value = str(form.get("method", "get")).lower()
+            method = cast(Literal["get", "post"], method_value)
             if method not in {"get", "post"}:
                 raise ValueError("搜尋表單僅允許 GET 或 POST")
             action_url = urljoin(page_url, str(form.get("action") or page_url))
@@ -88,7 +90,9 @@ class NptuAssociationSearchAdapter:
             return SearchForm(method, action_url, hidden_fields, search_types)
         raise ValueError("找不到含 SchKey 與 SchType 的搜尋表單")
 
-    def parse_results(self, content: str, page_url: str) -> list[AnnouncementSearchResult]:
+    def parse_results(
+        self, content: str, page_url: str
+    ) -> list[AnnouncementSearchResult]:
         soup = BeautifulSoup(content, "html.parser")
         root = soup.select_one(
             "#assopartlist, #assocomlist, [data-search-results], .assosearch, .search-results, #assosearch"
@@ -101,7 +105,9 @@ class NptuAssociationSearchAdapter:
         for container in containers:
             if not isinstance(container, Tag):
                 continue
-            anchor = container.select_one(".mtitle > a[href]") or container.find("a", href=True)
+            anchor = container.select_one(".mtitle > a[href]") or container.find(
+                "a", href=True
+            )
             if not isinstance(anchor, Tag):
                 continue
             title = anchor.get_text(" ", strip=True)
@@ -121,7 +127,9 @@ class NptuAssociationSearchAdapter:
             unit_node = container.select_one(".unit, [data-unit], .subsitename")
             category_node = container.select_one(".category, [data-category]")
             unit = unit_node.get_text(" ", strip=True) if unit_node else "國立屏東大學"
-            category = category_node.get_text(" ", strip=True) if category_node else None
+            category = (
+                category_node.get_text(" ", strip=True) if category_node else None
+            )
             results.append(
                 AnnouncementSearchResult(
                     title=title,

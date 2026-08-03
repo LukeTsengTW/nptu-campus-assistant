@@ -148,9 +148,7 @@ class SqlRetriever:
                 if deadline is not None and (
                     deadline.expired() or _is_postgres_query_cancelled(exc)
                 ):
-                    raise SearchDeadlineExceeded(
-                        "文件檢索已耗盡搜尋時間額度"
-                    ) from exc
+                    raise SearchDeadlineExceeded("文件檢索已耗盡搜尋時間額度") from exc
                 raise
             evidence = self._rrf_merge(
                 ranked_rows,

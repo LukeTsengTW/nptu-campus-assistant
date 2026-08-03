@@ -6,11 +6,13 @@ from datetime import date, datetime
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     Date,
     DateTime,
     ForeignKey,
     Index,
     Integer,
+    JSON,
     String,
     Text,
     UniqueConstraint,
@@ -48,9 +50,9 @@ class Source(TimestampMixin, Base):
         Integer, default=60, nullable=False
     )
     canonical_urls: Mapped[list[str]] = mapped_column(
-        JSONB,
+        JSON().with_variant(JSONB, "postgresql"),
         default=list,
-        server_default=text("'[]'::jsonb"),
+        server_default=text("'[]'"),
         nullable=False,
     )
     last_successful_crawl_at: Mapped[datetime | None] = mapped_column(
@@ -145,7 +147,9 @@ class SiteSearchCacheRecord(Base):
     __table_args__ = (Index("ix_site_search_cache_expires_at", "expires_at"),)
 
     cache_key: Mapped[str] = mapped_column(Text, primary_key=True)
-    payload: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False)
+    payload: Mapped[dict[str, object]] = mapped_column(
+        JSON().with_variant(JSONB, "postgresql"), nullable=False
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -158,6 +162,14 @@ class SiteSearchCacheRecord(Base):
 class SitePage(TimestampMixin, Base):
     __tablename__ = "site_pages"
     __table_args__ = (
+        CheckConstraint(
+            "ingestion_status IN ('pending', 'failed', 'partial', 'success')",
+            name="ck_site_pages_ingestion_status",
+        ),
+        CheckConstraint(
+            "announcement_ingestion_status IN ('not_applicable', 'pending', 'failed', 'success')",
+            name="ck_site_pages_announcement_ingestion_status",
+        ),
         Index("ix_site_pages_host", "host"),
         Index("ix_site_pages_unit", "unit"),
         Index("ix_site_pages_page_type", "page_type"),
@@ -169,7 +181,21 @@ class SitePage(TimestampMixin, Base):
             "crawl_status",
         ),
         Index("ix_site_pages_crawl_lease_expires_at", "crawl_lease_expires_at"),
+        Index("ix_site_pages_ingestion_status", "ingestion_status"),
+        Index(
+            "ix_site_pages_ingestion_lease_expires_at",
+            "ingestion_lease_expires_at",
+        ),
+        Index(
+            "ix_site_pages_announcement_ingestion_status",
+            "announcement_ingestion_status",
+        ),
         Index("ix_site_pages_host_next_crawl_at", "host", "next_crawl_at"),
+        Index(
+            "ix_site_pages_host_crawl_lease_expires_at",
+            "host",
+            "crawl_lease_expires_at",
+        ),
         Index(
             "ix_site_pages_due_active_crawlable",
             "next_crawl_at",
@@ -216,6 +242,23 @@ class SitePage(TimestampMixin, Base):
     )
     http_status: Mapped[int | None] = mapped_column(Integer)
     content_hash: Mapped[str | None] = mapped_column(String(64))
+    ingestion_content_hash: Mapped[str | None] = mapped_column(String(64))
+    ingestion_status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="pending", server_default="pending"
+    )
+    ingestion_error: Mapped[str | None] = mapped_column(String(1000))
+    announcement_ingestion_status: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="not_applicable",
+        server_default="not_applicable",
+    )
+    announcement_ingestion_error: Mapped[str | None] = mapped_column(String(1000))
+    ingestion_lease_token: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    ingestion_lease_owner: Mapped[str | None] = mapped_column(String(200))
+    ingestion_lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
     etag: Mapped[str | None] = mapped_column(String(500))
     last_modified: Mapped[str | None] = mapped_column(String(500))
     last_discovered_at: Mapped[datetime] = mapped_column(
@@ -406,7 +449,7 @@ class ConversationEvent(Base):
     content: Mapped[str | None] = mapped_column(Text)
     event_metadata: Mapped[dict[str, object]] = mapped_column(
         "metadata",
-        JSONB,
+        JSON().with_variant(JSONB, "postgresql"),
         nullable=False,
         default=dict,
     )

@@ -3,8 +3,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import signal
+import threading
+from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path
+from collections.abc import Callable, Iterator
 from typing import Any, cast
 
 from nptu_assistant.core.settings import (
@@ -16,6 +20,32 @@ from nptu_assistant.crawlers.config import load_source_configs
 from nptu_assistant.db.repositories import get_or_create_source
 from nptu_assistant.main import create_app
 from nptu_assistant.wiring import build_services
+
+
+@contextmanager
+def _install_stop_handlers(callback: Callable[[], None]) -> Iterator[None]:
+    """將 SIGINT/SIGTERM 轉成可測試且可恢復的 graceful-stop callback。"""
+
+    previous: dict[int, Any] = {}
+
+    def handle_signal(_signum: int, _frame: Any) -> None:
+        callback()
+
+    for name in ("SIGINT", "SIGTERM"):
+        signum = getattr(signal, name, None)
+        if signum is None:
+            continue
+        try:
+            previous[signum] = signal.getsignal(signum)
+            signal.signal(signum, handle_signal)
+        except ValueError:
+            # signal handlers can only be installed from the main thread.
+            continue
+    try:
+        yield
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -90,7 +120,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "crawl-worker":
         worker = cast(Any, services["refresh_scheduler"])
         if args.loop:
-            asyncio.run(worker.run_loop(dry_run=args.dry_run))
+            with _install_stop_handlers(worker.stop):
+                asyncio.run(worker.run_loop(dry_run=args.dry_run))
             return 0
         report = worker.run_once(dry_run=args.dry_run)
         print(json.dumps(report, ensure_ascii=False, default=str))
@@ -107,12 +138,15 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps({"dry_run": True, **store.status()}, default=str))
             return 0
         if args.loop:
-            worker.run_loop(
-                poll_interval_seconds=args.poll_interval_seconds,
-                max_pages=args.max_pages,
-                max_duration_seconds=args.max_duration_seconds,
-                batch_size=args.batch_size,
-            )
+            stop_event = threading.Event()
+            with _install_stop_handlers(stop_event.set):
+                worker.run_loop(
+                    poll_interval_seconds=args.poll_interval_seconds,
+                    max_pages=args.max_pages,
+                    max_duration_seconds=args.max_duration_seconds,
+                    batch_size=args.batch_size,
+                    stop_event=stop_event,
+                )
             return 0
         result = worker.run_once(batch_size=args.batch_size)
         print(

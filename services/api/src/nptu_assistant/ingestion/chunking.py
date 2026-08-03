@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import cast
+from collections.abc import Sequence
 
 import tiktoken
 
@@ -28,7 +30,11 @@ def chunk_text(
         encoding = tiktoken.get_encoding("cl100k_base")
     except Exception:
         encoding = None
-    tokens = encoding.encode(text) if encoding else list(text)
+    tokens: list[int] | list[str]
+    if encoding is not None:
+        tokens = encoding.encode(text)
+    else:
+        tokens = list(text)
     heading_boundaries = [
         len(encoding.encode(text[: match.start()])) if encoding else match.start()
         for match in _HEADING.finditer(text)
@@ -47,9 +53,15 @@ def chunk_text(
             if preferred:
                 end = max(preferred)
         current = tokens[start:end]
-        content = (encoding.decode(current) if encoding else "".join(current)).strip()
+        content = (
+            encoding.decode(cast(Sequence[int], current))
+            if encoding is not None
+            else "".join(cast(Sequence[str], current))
+        ).strip()
         if content:
-            chunks.append(TextChunk(sequence=sequence, content=content, token_count=len(current)))
+            chunks.append(
+                TextChunk(sequence=sequence, content=content, token_count=len(current))
+            )
             sequence += 1
         if end >= len(tokens):
             break

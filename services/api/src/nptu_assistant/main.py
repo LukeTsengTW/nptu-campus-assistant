@@ -45,6 +45,16 @@ def _error_responses(*status_codes: int) -> dict[int | str, dict[str, Any]]:
     }
 
 
+def _json_safe(value: object) -> object:
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
 class _UnavailableChat:
     def answer(self, question: str, conversation_id: str | None = None) -> ChatResponse:
         del question, conversation_id
@@ -123,6 +133,7 @@ def create_app(
     crawler_service: Any | None = None,
     site_map_service: Any | None = None,
     refresh_scheduler: Any | None = None,
+    crawl_worker: Any | None = None,
     crawl_admin_service: Any | None = None,
     rate_limiter: RateLimiter | None = None,
 ) -> FastAPI:
@@ -148,6 +159,7 @@ def create_app(
         crawler_service = crawler_service or defaults["crawler_service"]
         site_map_service = site_map_service or defaults["site_map_service"]
         refresh_scheduler = refresh_scheduler or defaults["refresh_scheduler"]
+        crawl_worker = crawl_worker or defaults["crawl_worker"]
         crawl_admin_service = crawl_admin_service or defaults["crawl_admin_service"]
     site_map_service = site_map_service or _UnavailableSiteMap()
     crawl_admin_service = crawl_admin_service or UnavailableCrawlAdmin()
@@ -156,15 +168,22 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
-        if refresh_scheduler is None:
+        tasks: list[asyncio.Task[None]] = []
+        if refresh_scheduler is not None:
+            tasks.append(asyncio.create_task(refresh_scheduler.run()))
+        if crawl_worker is not None:
+            tasks.append(asyncio.create_task(crawl_worker.run_loop()))
+        if not tasks:
             yield
             return
-        task = asyncio.create_task(refresh_scheduler.run())
         try:
             yield
         finally:
-            refresh_scheduler.stop()
-            await task
+            if refresh_scheduler is not None:
+                refresh_scheduler.stop()
+            if crawl_worker is not None:
+                crawl_worker.stop()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     app = FastAPI(
         title="NPTU 校務資訊助理 API",
@@ -235,7 +254,10 @@ def create_app(
         return JSONResponse(
             status_code=422,
             content=error_payload(
-                request, "validation_error", "輸入資料驗證失敗。", exc.errors()
+                request,
+                "validation_error",
+                "輸入資料驗證失敗。",
+                _json_safe(exc.errors()),
             ),
         )
 

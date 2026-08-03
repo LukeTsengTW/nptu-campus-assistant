@@ -4,8 +4,8 @@ import uuid
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import func, insert, not_, or_, select, update
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy import String, cast as sql_cast, func, insert, not_, or_, select, update
+from sqlalchemy.orm import Session, aliased, sessionmaker
 from sqlalchemy.sql.elements import ColumnElement
 
 from nptu_assistant.crawlers.crawl_policy import NON_HTML_RESOURCE_SUFFIXES
@@ -13,7 +13,7 @@ from nptu_assistant.crawlers.crawl_scheduler import (
     CrawlClaim,
     FailureDecision,
 )
-from nptu_assistant.crawlers.site_map import SiteCrawlStatus
+from nptu_assistant.crawlers.site_map import FrontierPolicy, SiteCrawlStatus
 from nptu_assistant.db.crawl_models import SiteCrawlAttempt
 from nptu_assistant.db.models import SitePage
 
@@ -22,35 +22,88 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def due_pages_statement(*, now: datetime, limit: int):
+def due_pages_statement(
+    *,
+    now: datetime,
+    limit: int,
+    frontier_policy: FrontierPolicy | None = None,
+    urls: tuple[str, ...] = (),
+):
     """Build the PostgreSQL claim query; kept public for SQL-level tests."""
 
     if limit <= 0:
         raise ValueError("claim 數量必須大於零")
+    policy = frontier_policy or FrontierPolicy()
+    candidate = aliased(SitePage, name="frontier_candidate")
+    active = aliased(SitePage, name="frontier_active")
     non_html = or_(
-        *(SitePage.path.ilike(f"%{suffix}") for suffix in NON_HTML_RESOURCE_SUFFIXES)
+        *(candidate.path.ilike(f"%{suffix}") for suffix in NON_HTML_RESOURCE_SUFFIXES)
+    )
+    active_count = (
+        select(func.count(active.id))
+        .where(
+            active.host == candidate.host,
+            active.is_active.is_(True),
+            active.crawl_lease_expires_at > now,
+            active.id != candidate.id,
+        )
+        .correlate(candidate)
+        .scalar_subquery()
+    )
+    due_filters = (
+        candidate.is_active.is_(True),
+        candidate.is_indexable.is_(True),
+        not_(non_html),
+        candidate.crawl_status.not_in(
+            [
+                SiteCrawlStatus.BLOCKED.value,
+                SiteCrawlStatus.EXCLUDED.value,
+            ]
+        ),
+        candidate.next_crawl_at.is_not(None),
+        candidate.next_crawl_at <= now,
+        or_(
+            candidate.crawl_lease_expires_at.is_(None),
+            candidate.crawl_lease_expires_at <= now,
+        ),
+        candidate.minimum_depth <= policy.max_depth,
+        active_count < policy.per_host_active_cap,
+    )
+    if urls:
+        due_filters = (*due_filters, candidate.canonical_url.in_(urls))
+    host_rank = func.row_number().over(
+        partition_by=candidate.host,
+        order_by=(
+            candidate.crawl_priority.desc(),
+            candidate.next_crawl_at.asc().nulls_first(),
+            candidate.minimum_depth.asc(),
+            candidate.failure_count.asc(),
+            candidate.id.asc(),
+        ),
+    )
+    ranked = (
+        select(
+            candidate.id.label("page_id"),
+            host_rank.label("host_rank"),
+            active_count.label("active_count"),
+        )
+        .where(*due_filters)
+        .subquery("ranked_frontier")
+    )
+    available_host_slots = func.least(
+        policy.per_host_due_cap,
+        policy.per_host_active_cap - ranked.c.active_count,
     )
     return (
         select(SitePage)
-        .where(
-            SitePage.is_active.is_(True),
-            SitePage.is_indexable.is_(True),
-            not_(non_html),
-            SitePage.crawl_status.not_in(
-                [
-                    SiteCrawlStatus.BLOCKED.value,
-                    SiteCrawlStatus.EXCLUDED.value,
-                ]
-            ),
-            or_(SitePage.next_crawl_at.is_(None), SitePage.next_crawl_at <= now),
-            or_(
-                SitePage.crawl_lease_expires_at.is_(None),
-                SitePage.crawl_lease_expires_at <= now,
-            ),
-        )
+        .join(ranked, ranked.c.page_id == SitePage.id)
+        .where(ranked.c.host_rank <= available_host_slots)
         .order_by(
+            ranked.c.host_rank.asc(),
             SitePage.crawl_priority.desc(),
             SitePage.next_crawl_at.asc().nulls_first(),
+            SitePage.minimum_depth.asc(),
+            SitePage.failure_count.asc(),
             SitePage.id.asc(),
         )
         .limit(limit)
@@ -66,9 +119,11 @@ class SqlCrawlSchedulerRepository:
         factory: sessionmaker[Session],
         *,
         clock: Callable[[], datetime] = _now,
+        frontier_policy: FrontierPolicy | None = None,
     ) -> None:
         self._factory = factory
         self._clock = clock
+        self._frontier_policy = frontier_policy or FrontierPolicy()
 
     def claim_due(
         self,
@@ -77,6 +132,7 @@ class SqlCrawlSchedulerRepository:
         limit: int,
         lease_duration: timedelta,
         now: datetime | None = None,
+        urls: tuple[str, ...] = (),
     ) -> tuple[CrawlClaim, ...]:
         self._validate_owner(owner)
         if limit <= 0:
@@ -91,40 +147,55 @@ class SqlCrawlSchedulerRepository:
                     due_pages_statement(
                         now=checked_at,
                         limit=limit,
+                        frontier_policy=self._frontier_policy,
+                        urls=urls,
                     )
                     .with_only_columns(SitePage.id)
                     .cte("due_pages")
+                    .prefix_with("MATERIALIZED")
                 )
-                batch_token = uuid.uuid4()
-                # A batch token is safe because page id is also part of every
-                # completion predicate.  It keeps claim and lease metadata in
-                # one UPDATE ... RETURNING statement.
+                page_token = sql_cast(
+                    func.md5(
+                        SitePage.id.cast(String) + func.clock_timestamp().cast(String)
+                    ),
+                    SitePage.crawl_lease_token.type,
+                )
                 rows = (
                     session.execute(
                         update(SitePage)
-                        .where(SitePage.id == due.c.id)
+                        .where(
+                            SitePage.id == due.c.id,
+                            or_(
+                                SitePage.crawl_lease_expires_at.is_(None),
+                                SitePage.crawl_lease_expires_at <= checked_at,
+                            ),
+                            SitePage.next_crawl_at <= checked_at,
+                        )
                         .values(
                             crawl_lease_owner=owner,
-                            crawl_lease_token=batch_token,
+                            crawl_lease_token=page_token,
                             crawl_lease_expires_at=expires_at,
                             crawl_status=SiteCrawlStatus.FETCHING.value,
                             last_scheduled_at=checked_at,
                         )
                         .returning(
-                            SitePage.id,
-                            SitePage.crawl_lease_token,
-                            SitePage.canonical_url,
-                            SitePage.host,
-                            SitePage.page_type,
-                            SitePage.unit,
-                            SitePage.minimum_depth,
-                            SitePage.etag,
-                            SitePage.last_modified,
-                            SitePage.content_hash,
-                            SitePage.title,
-                            SitePage.crawl_priority,
-                            SitePage.next_crawl_at,
-                            SitePage.failure_count,
+                            SitePage.id.label("page_id"),
+                            SitePage.crawl_lease_token.label("lease_token"),
+                            SitePage.canonical_url.label("canonical_url"),
+                            SitePage.host.label("host"),
+                            SitePage.page_type.label("page_type"),
+                            SitePage.unit.label("unit"),
+                            SitePage.minimum_depth.label("minimum_depth"),
+                            SitePage.etag.label("etag"),
+                            SitePage.last_modified.label("last_modified"),
+                            SitePage.content_hash.label("content_hash"),
+                            SitePage.title.label("title"),
+                            SitePage.crawl_priority.label("crawl_priority"),
+                            SitePage.next_crawl_at.label("next_crawl_at"),
+                            SitePage.failure_count.label("failure_count"),
+                            SitePage.changed_streak.label("changed_streak"),
+                            SitePage.unchanged_streak.label("unchanged_streak"),
+                            SitePage.last_retry_after_at.label("last_retry_after_at"),
                         )
                     )
                     .mappings()
@@ -133,8 +204,8 @@ class SqlCrawlSchedulerRepository:
                 claims = []
                 attempts = []
                 for row in rows:
-                    page_id = row["id"]
-                    token = row["crawl_lease_token"]
+                    page_id = row["page_id"]
+                    token = row["lease_token"]
                     claims.append(
                         CrawlClaim(
                             page_id=page_id,
@@ -153,6 +224,9 @@ class SqlCrawlSchedulerRepository:
                             last_modified=row["last_modified"],
                             content_hash=row["content_hash"],
                             title=row["title"],
+                            changed_streak=row["changed_streak"],
+                            unchanged_streak=row["unchanged_streak"],
+                            last_retry_after_at=row["last_retry_after_at"],
                         )
                     )
                     attempts.append(
@@ -170,8 +244,14 @@ class SqlCrawlSchedulerRepository:
             # SQLite test fallback.  Production PostgreSQL takes the single
             # UPDATE ... RETURNING path above.
             claims: list[CrawlClaim] = []
+            attempts: list[dict[str, object]] = []
             pages = session.scalars(
-                due_pages_statement(now=checked_at, limit=limit)
+                due_pages_statement(
+                    now=checked_at,
+                    limit=limit,
+                    frontier_policy=self._frontier_policy,
+                    urls=urls,
+                )
             ).all()
             for page in pages:
                 token = uuid.uuid4()
@@ -180,13 +260,13 @@ class SqlCrawlSchedulerRepository:
                 page.crawl_lease_expires_at = expires_at
                 page.crawl_status = SiteCrawlStatus.FETCHING.value
                 page.last_scheduled_at = checked_at
-                session.add(
-                    SiteCrawlAttempt(
-                        site_page_id=page.id,
-                        lease_token=token,
-                        worker_id=owner,
-                        outcome="running",
-                    )
+                attempts.append(
+                    {
+                        "site_page_id": page.id,
+                        "lease_token": token,
+                        "worker_id": owner,
+                        "outcome": "running",
+                    }
                 )
                 claims.append(
                     CrawlClaim(
@@ -206,8 +286,13 @@ class SqlCrawlSchedulerRepository:
                         last_modified=page.last_modified,
                         content_hash=page.content_hash,
                         title=page.title,
+                        changed_streak=page.changed_streak,
+                        unchanged_streak=page.unchanged_streak,
+                        last_retry_after_at=page.last_retry_after_at,
                     )
                 )
+            if attempts:
+                session.execute(insert(SiteCrawlAttempt), attempts)
         return tuple(claims)
 
     def renew(
@@ -241,6 +326,9 @@ class SqlCrawlSchedulerRepository:
         outcome: str | None = None,
         etag: str | None = None,
         last_modified: str | None = None,
+        content_type: str | None = None,
+        content_length: int | None = None,
+        final_url: str | None = None,
     ) -> bool:
         checked_at = now or self._clock()
         with self._factory.begin() as session:
@@ -280,6 +368,11 @@ class SqlCrawlSchedulerRepository:
                 content_changed=content_changed,
                 links_discovered=links_discovered,
                 ingestion_performed=ingestion_performed,
+                content_type=content_type,
+                content_length=content_length,
+                final_url=final_url,
+                etag=etag,
+                last_modified=last_modified,
             )
             self._clear_lease(page)
             return True
@@ -294,6 +387,12 @@ class SqlCrawlSchedulerRepository:
         error_kind: str | None = None,
         error_message: str | None = None,
         retry_after: str | None = None,
+        content_type: str | None = None,
+        content_length: int | None = None,
+        final_url: str | None = None,
+        etag: str | None = None,
+        last_modified: str | None = None,
+        ingestion_performed: bool = False,
     ) -> bool:
         checked_at = now or self._clock()
         with self._factory.begin() as session:
@@ -326,6 +425,12 @@ class SqlCrawlSchedulerRepository:
                 http_status=http_status,
                 error_kind=error_kind,
                 error_message=error_message or decision.reason,
+                content_type=content_type,
+                content_length=content_length,
+                final_url=final_url,
+                etag=etag,
+                last_modified=last_modified,
+                ingestion_performed=ingestion_performed,
             )
             self._clear_lease(page)
         return True
@@ -371,24 +476,38 @@ class SqlCrawlSchedulerRepository:
     def status(self, *, now: datetime | None = None) -> dict[str, object]:
         checked_at = now or self._clock()
         with self._factory.begin() as session:
+            eligible = (
+                SitePage.is_active.is_(True),
+                SitePage.is_indexable.is_(True),
+                SitePage.crawl_status.not_in(
+                    [
+                        SiteCrawlStatus.BLOCKED.value,
+                        SiteCrawlStatus.EXCLUDED.value,
+                    ]
+                ),
+            )
+            lease_available = or_(
+                SitePage.crawl_lease_expires_at.is_(None),
+                SitePage.crawl_lease_expires_at <= checked_at,
+            )
             due = (
                 session.scalar(
                     select(func.count())
                     .select_from(SitePage)
                     .where(
-                        SitePage.is_active.is_(True),
-                        SitePage.is_indexable.is_(True),
-                        SitePage.crawl_status.not_in(
-                            [
-                                SiteCrawlStatus.BLOCKED.value,
-                                SiteCrawlStatus.EXCLUDED.value,
-                            ]
-                        ),
-                        or_(
-                            SitePage.next_crawl_at.is_(None),
-                            SitePage.next_crawl_at <= checked_at,
-                        ),
+                        *eligible,
+                        lease_available,
+                        SitePage.next_crawl_at.is_not(None),
+                        SitePage.next_crawl_at <= checked_at,
                     )
+                )
+                or 0
+            )
+            pending = (
+                session.scalar(
+                    select(func.count())
+                    .select_from(SitePage)
+                    .where(*eligible, lease_available)
                 )
                 or 0
             )
@@ -397,6 +516,17 @@ class SqlCrawlSchedulerRepository:
                     select(func.count())
                     .select_from(SitePage)
                     .where(SitePage.crawl_lease_expires_at > checked_at)
+                )
+                or 0
+            )
+            active_workers = (
+                session.scalar(
+                    select(func.count(func.distinct(SitePage.crawl_lease_owner)))
+                    .select_from(SitePage)
+                    .where(
+                        SitePage.crawl_lease_owner.is_not(None),
+                        SitePage.crawl_lease_expires_at > checked_at,
+                    )
                 )
                 or 0
             )
@@ -416,13 +546,26 @@ class SqlCrawlSchedulerRepository:
                 )
                 or 0
             )
+            pending_ingestion = (
+                session.scalar(
+                    select(func.count())
+                    .select_from(SitePage)
+                    .where(
+                        SitePage.content_hash.is_not(None),
+                        or_(
+                            SitePage.ingestion_status != "success",
+                            SitePage.announcement_ingestion_status.in_(
+                                ["pending", "failed"]
+                            ),
+                        ),
+                    )
+                )
+                or 0
+            )
             next_due = session.scalar(
                 select(func.min(SitePage.next_crawl_at)).where(
-                    SitePage.is_active.is_(True),
-                    SitePage.is_indexable.is_(True),
-                    SitePage.crawl_status.not_in(
-                        [SiteCrawlStatus.BLOCKED.value, SiteCrawlStatus.EXCLUDED.value]
-                    ),
+                    *eligible,
+                    lease_available,
                 )
             )
             recent_attempt_rows = session.execute(
@@ -432,11 +575,13 @@ class SqlCrawlSchedulerRepository:
             ).all()
             return {
                 "due": int(due),
+                "pending": int(pending),
                 "leased": int(leased),
                 "failed": int(failed),
                 "blocked": int(blocked),
+                "pending_ingestion": int(pending_ingestion),
                 "next_due_at": next_due,
-                "active_workers": 0,
+                "active_workers": int(active_workers),
                 "recent_attempts": {
                     outcome: int(count) for outcome, count in recent_attempt_rows
                 },
@@ -480,12 +625,21 @@ class SqlCrawlSchedulerRepository:
         ingestion_performed: bool = False,
         error_kind: str | None = None,
         error_message: str | None = None,
+        content_type: str | None = None,
+        content_length: int | None = None,
+        final_url: str | None = None,
+        etag: str | None = None,
+        last_modified: str | None = None,
     ) -> None:
         attempt = session.scalar(
             select(SiteCrawlAttempt)
+            .join(SitePage, SitePage.id == SiteCrawlAttempt.site_page_id)
             .where(
                 SiteCrawlAttempt.site_page_id == claim.page_id,
                 SiteCrawlAttempt.lease_token == claim.token,
+                SitePage.crawl_lease_owner == claim.owner,
+                SitePage.crawl_lease_token == claim.token,
+                SitePage.crawl_lease_expires_at > finished_at,
             )
             .with_for_update()
         )
@@ -494,6 +648,13 @@ class SqlCrawlSchedulerRepository:
         attempt.finished_at = finished_at
         attempt.outcome = outcome
         attempt.http_status = http_status
+        attempt.content_type = (content_type or "")[:255] or None
+        attempt.content_length = (
+            max(0, content_length) if content_length is not None else None
+        )
+        attempt.final_url = (final_url or "")[:2000] or None
+        attempt.etag = (etag or "")[:500] or None
+        attempt.last_modified = (last_modified or "")[:500] or None
         attempt.content_changed = content_changed
         attempt.links_discovered = max(0, links_discovered)
         attempt.ingestion_performed = ingestion_performed
@@ -510,12 +671,28 @@ class SqlCrawlSchedulerRepository:
         claim: CrawlClaim,
         finished_at: datetime,
     ) -> None:
+        current_live_lease = (
+            select(SitePage.id)
+            .where(
+                SitePage.id == claim.page_id,
+                SitePage.crawl_lease_owner == claim.owner,
+                SitePage.crawl_lease_token == claim.token,
+                SitePage.crawl_lease_expires_at > finished_at,
+            )
+            .exists()
+        )
         attempt = session.scalar(
             select(SiteCrawlAttempt)
             .where(
                 SiteCrawlAttempt.site_page_id == claim.page_id,
                 SiteCrawlAttempt.lease_token == claim.token,
+                SiteCrawlAttempt.worker_id == claim.owner,
                 SiteCrawlAttempt.outcome == "running",
+                # The attempt row is immutable lease identity.  Allow its
+                # terminal tombstone only when that exact page/owner/token
+                # lease is no longer live (expired or replaced), so a new
+                # lease cannot be touched by the stale worker.
+                not_(current_live_lease),
             )
             .with_for_update()
         )

@@ -83,7 +83,9 @@ class AnnouncementRefreshCoordinator:
                     source_name,
                     attempted=False,
                     succeeded=True,
-                    canonical_urls=self._repository.canonical_urls_for_source(source_name),
+                    canonical_urls=self._repository.canonical_urls_for_source(
+                        source_name
+                    ),
                 )
             run_result = self._crawler.run_with_urls([source_name])
             summary = run_result.summary
@@ -95,7 +97,9 @@ class AnnouncementRefreshCoordinator:
                     succeeded=False,
                     warning=REFRESH_FAILURE_WARNING,
                     summary=summary,
-                    canonical_urls=self._repository.canonical_urls_for_source(source_name),
+                    canonical_urls=self._repository.canonical_urls_for_source(
+                        source_name
+                    ),
                 )
             if source_name not in run_result.persisted_source_snapshots:
                 self._repository.record_source_refresh(

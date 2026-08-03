@@ -32,9 +32,7 @@ def test_live_scholarship_listing_contract_without_database_writes(
     expected_title_term: str,
 ) -> None:
     config = next(
-        item
-        for item in load_source_configs(CONFIG_PATH)
-        if item.name == source_name
+        item for item in load_source_configs(CONFIG_PATH) if item.name == source_name
     )
     client = CrawlHttpClient(
         "NPTU-Campus-Assistant-Unit-Source-Smoke/0.1",
@@ -51,9 +49,7 @@ def test_live_scholarship_listing_contract_without_database_writes(
             {},
             allowed_hosts=config.allowed_hosts,
         )
-        content = (
-            f'<div id="{config.dynamic_listing.wrapper_id}">{fragment}</div>'
-        )
+        content = f'<div id="{config.dynamic_listing.wrapper_id}">{fragment}</div>'
         items = build_adapter(config).parse_listing(content)
     finally:
         client.close()
@@ -61,5 +57,8 @@ def test_live_scholarship_listing_contract_without_database_writes(
     assert items
     assert len(items) <= config.max_items
     assert all(item.unit == expected_unit for item in items)
-    assert all(item.canonical_url.startswith("https://staf-life.nptu.edu.tw/") for item in items)
+    assert all(
+        item.canonical_url.startswith("https://staf-life.nptu.edu.tw/")
+        for item in items
+    )
     assert any(expected_title_term in item.title for item in items)

@@ -19,7 +19,10 @@ def test_administrative_units_knowledge_document_has_official_metadata_and_units
     )
     text = parse_document(DOCUMENT)
 
-    assert str(metadata.source_url) == "https://www.nptu.edu.tw/p/412-1000-86.php?Lang=zh-tw"
+    assert (
+        str(metadata.source_url)
+        == "https://www.nptu.edu.tw/p/412-1000-86.php?Lang=zh-tw"
+    )
     assert metadata.document_type == "administrative_units_snapshot"
     for office in (
         "校長室",

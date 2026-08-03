@@ -7,7 +7,10 @@ import httpx
 import pytest
 
 from nptu_assistant.crawlers.adapters.nptu_search import NptuAssociationSearchAdapter
-from nptu_assistant.crawlers.config import KeywordSearchConfig, load_keyword_search_config
+from nptu_assistant.crawlers.config import (
+    KeywordSearchConfig,
+    load_keyword_search_config,
+)
 from nptu_assistant.crawlers.http import CrawlHttpClient
 from nptu_assistant.crawlers.models import AnnouncementCandidate
 from nptu_assistant.crawlers.search import (
@@ -42,7 +45,9 @@ def keyword_config(**overrides: object) -> KeywordSearchConfig:
 
 
 def test_keyword_search_config_and_alias_expansion() -> None:
-    config = load_keyword_search_config(WORKSPACE_ROOT / "data/sources/announcements.yaml")
+    config = load_keyword_search_config(
+        WORKSPACE_ROOT / "data/sources/announcements.yaml"
+    )
     expansion = KeywordAliasResolver(config.aliases).expand("電科系 獎學金")
 
     assert config.search_types == ["part", "com"]
@@ -55,7 +60,10 @@ def test_keyword_search_config_and_alias_expansion() -> None:
         "電腦科學與人工智慧學系 獎學金",
     )
     assert expansion.retrieval_query == "電腦科學與人工智慧學系 獎學金"
-    assert KeywordAliasResolver(config.aliases).normalize("電科系") == "電腦科學與人工智慧學系"
+    assert (
+        KeywordAliasResolver(config.aliases).normalize("電科系")
+        == "電腦科學與人工智慧學系"
+    )
 
 
 @pytest.mark.parametrize(
@@ -131,7 +139,9 @@ def test_keyword_aliases_normalize_requested_department_names(
     alias: str,
     canonical: str,
 ) -> None:
-    config = load_keyword_search_config(WORKSPACE_ROOT / "data/sources/announcements.yaml")
+    config = load_keyword_search_config(
+        WORKSPACE_ROOT / "data/sources/announcements.yaml"
+    )
 
     assert KeywordAliasResolver(config.aliases).normalize(alias) == canonical
 
@@ -146,7 +156,9 @@ def test_search_adapter_parses_form_and_results() -> None:
         FORM_FIXTURE.read_text(encoding="utf-8"),
         "https://www.nptu.edu.tw/app/index.php?Plugin=asso&Action=assosearch",
     )
-    results = adapter.parse_results(RESULT_FIXTURE.read_text(encoding="utf-8"), form.action_url)
+    results = adapter.parse_results(
+        RESULT_FIXTURE.read_text(encoding="utf-8"), form.action_url
+    )
 
     assert bootstrap.method == "post"
     assert bootstrap.hidden_fields == {
@@ -174,7 +186,9 @@ def test_search_adapter_rejects_unsafe_or_changed_pages() -> None:
     with pytest.raises(ValueError, match="allowlist"):
         adapter.parse_form(unsafe, "https://www.nptu.edu.tw/app/index.php")
     with pytest.raises(ValueError, match="搜尋結果區塊"):
-        adapter.parse_results("<html><body><nav>導覽</nav></body></html>", "https://www.nptu.edu.tw/")
+        adapter.parse_results(
+            "<html><body><nav>導覽</nav></body></html>", "https://www.nptu.edu.tw/"
+        )
 
 
 def test_http_client_submits_get_and_post_forms_with_session_cookie() -> None:
@@ -185,7 +199,12 @@ def test_http_client_submits_get_and_post_forms_with_session_cookie() -> None:
         if request.url.path == "/robots.txt":
             return httpx.Response(200, text="User-agent: *\nAllow: /", request=request)
         if request.url.path == "/landing":
-            return httpx.Response(200, headers={"Set-Cookie": "session=abc; Path=/"}, text="landing", request=request)
+            return httpx.Response(
+                200,
+                headers={"Set-Cookie": "session=abc; Path=/"},
+                text="landing",
+                request=request,
+            )
         assert request.headers["cookie"] == "session=abc"
         return httpx.Response(200, text="results", request=request)
 
@@ -197,8 +216,18 @@ def test_http_client_submits_get_and_post_forms_with_session_cookie() -> None:
     )
     try:
         client.get("https://www.nptu.edu.tw/landing")
-        assert client.submit_form("get", "https://www.nptu.edu.tw/search", {"SchKey": "電科系"}) == "results"
-        assert client.submit_form("post", "https://www.nptu.edu.tw/search", {"SchType": "part"}) == "results"
+        assert (
+            client.submit_form(
+                "get", "https://www.nptu.edu.tw/search", {"SchKey": "電科系"}
+            )
+            == "results"
+        )
+        assert (
+            client.submit_form(
+                "post", "https://www.nptu.edu.tw/search", {"SchType": "part"}
+            )
+            == "results"
+        )
     finally:
         client.close()
 
@@ -254,7 +283,9 @@ class SearchHttpClient:
         return RESULT_FIXTURE.read_text(encoding="utf-8")
 
 
-def test_keyword_search_service_refreshes_form_and_retries_transient_auth_failure() -> None:
+def test_keyword_search_service_refreshes_form_and_retries_transient_auth_failure() -> (
+    None
+):
     class ExpiringFormHttpClient(SearchHttpClient):
         def __init__(self) -> None:
             super().__init__()
@@ -325,7 +356,9 @@ def test_keyword_search_service_submits_variants_deduplicates_and_ingests() -> N
 
 def test_keyword_search_service_reports_partial_and_total_failures() -> None:
     partial = KeywordAnnouncementSearchService(
-        keyword_config(), MemoryAnnouncementRepository(), SearchHttpClient(failed_types={"com"})
+        keyword_config(),
+        MemoryAnnouncementRepository(),
+        SearchHttpClient(failed_types={"com"}),
     ).ingest("電科系")
 
     class LandingFailureHttpClient(SearchHttpClient):
@@ -347,12 +380,17 @@ def test_keyword_search_service_reports_partial_and_total_failures() -> None:
     assert "hidden" not in " ".join(failed.summary.errors).lower()
 
 
-def test_keyword_search_service_returns_empty_scope_for_successful_empty_search() -> None:
+def test_keyword_search_service_returns_empty_scope_for_successful_empty_search() -> (
+    None
+):
     class EmptySearchHttpClient(SearchHttpClient):
         def submit_form(self, method: str, url: str, fields: dict[str, str]) -> str:
             if "Action=mobileloadmod" in url:
                 return BOOTSTRAP_FIXTURE.read_text(encoding="utf-8")
-            return FORM_FIXTURE.read_text(encoding="utf-8") + '<div data-search-results></div>'
+            return (
+                FORM_FIXTURE.read_text(encoding="utf-8")
+                + "<div data-search-results></div>"
+            )
 
     result = KeywordAnnouncementSearchService(
         keyword_config(aliases={}),
@@ -375,7 +413,10 @@ def test_keyword_search_service_limits_unique_results_before_detail_fetch() -> N
             if "Action=mobileloadmod" in url:
                 return BOOTSTRAP_FIXTURE.read_text(encoding="utf-8")
             self.submissions.append((fields["SchKey"], fields["SchType"]))
-            return FORM_FIXTURE.read_text(encoding="utf-8") + f'<div data-search-results><table>{rows}</table></div>'
+            return (
+                FORM_FIXTURE.read_text(encoding="utf-8")
+                + f"<div data-search-results><table>{rows}</table></div>"
+            )
 
     repository = MemoryAnnouncementRepository()
     result = KeywordAnnouncementSearchService(
@@ -399,7 +440,10 @@ def test_keyword_search_service_respects_requested_limit_before_detail_fetch() -
             if "Action=mobileloadmod" in url:
                 return BOOTSTRAP_FIXTURE.read_text(encoding="utf-8")
             self.submissions.append((fields["SchKey"], fields["SchType"]))
-            return FORM_FIXTURE.read_text(encoding="utf-8") + f'<div data-search-results><table>{rows}</table></div>'
+            return (
+                FORM_FIXTURE.read_text(encoding="utf-8")
+                + f"<div data-search-results><table>{rows}</table></div>"
+            )
 
     repository = MemoryAnnouncementRepository()
     result = KeywordAnnouncementSearchService(

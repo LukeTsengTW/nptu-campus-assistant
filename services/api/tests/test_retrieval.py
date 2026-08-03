@@ -459,7 +459,9 @@ def test_document_multi_query_retrieval_generalizes_to_dormitory_billing() -> No
     assert evidence[0].score >= 0.58
 
 
-def test_document_retrieval_keeps_high_confidence_primary_results_without_variants() -> None:
+def test_document_retrieval_keeps_high_confidence_primary_results_without_variants() -> (
+    None
+):
     session = FakeSession(
         result_batches=[
             [

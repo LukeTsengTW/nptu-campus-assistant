@@ -162,9 +162,12 @@ class CrawlStatusResponse(BaseModel):
     next_run_at: datetime | None = None
     pending_schedule_id: str | None = None
     dry_run: bool = False
+    pending: int = 0
     due: int = 0
     leased: int = 0
+    failed: int = 0
     blocked: int = 0
+    pending_ingestion: int = 0
     active_workers: int = 0
     next_due_at: datetime | None = None
     recent_attempts: dict[str, int] = Field(default_factory=dict)

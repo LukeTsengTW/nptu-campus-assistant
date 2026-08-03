@@ -544,7 +544,7 @@ class NptuSiteSearchService:
                 fetch_failure_scores.append(relevance)
                 if self._site_map is not None and not search_deadline.expired():
                     try:
-                        self._site_map.record_crawl_failure(url)
+                        self._site_map.record_crawl_failure(url, allow_unleased=True)
                     except Exception:
                         logger.exception("site map crawl failure state 寫入失敗")
                 logger.exception(

@@ -17,6 +17,10 @@ from nptu_assistant.crawlers.config import (
     load_keyword_search_config,
     load_source_configs,
 )
+from nptu_assistant.crawlers.announcement_adapter import (
+    AnnouncementSourceIdentity,
+    IncrementalAnnouncementAdapter,
+)
 from nptu_assistant.crawlers.crawl_ingestion import CrawlIngestionService
 from nptu_assistant.crawlers.crawl_scheduler import CrawlScheduler
 from nptu_assistant.crawlers.http import CrawlHttpClient
@@ -62,6 +66,9 @@ from nptu_assistant.providers.protocols import EmbeddingProvider
 from nptu_assistant.rag.conversation import SqlConversationStore
 from nptu_assistant.rag.retrieval import SqlRetriever
 from nptu_assistant.rag.service import ChatService, LlmProvider
+from nptu_assistant.core.security import is_allowed_source_url
+from collections.abc import Sequence
+from urllib.parse import urlsplit
 
 
 class UnavailableEmbeddingProvider:
@@ -91,6 +98,42 @@ class _IncrementalWorkerCoordinator:
     def ensure_fresh(self, source_name: str) -> object:
         del source_name
         return self._worker.run_once()
+
+
+def _resolve_incremental_announcement_source(
+    page_url: str,
+    unit: str | None,
+    source_configs: Sequence[object],
+) -> AnnouncementSourceIdentity | None:
+    """Resolve announcement identity only from configured allowlist data."""
+    if not unit:
+        return None
+    host = (urlsplit(page_url).hostname or "").casefold().rstrip(".")
+    matches = []
+    for config in source_configs:
+        if (
+            not getattr(config, "enabled", False)
+            or getattr(config, "unit", None) != unit
+        ):
+            continue
+        allowed_hosts = tuple(getattr(config, "allowed_hosts", ()) or ())
+        if not is_allowed_source_url(page_url, allowed_hosts):
+            continue
+        config_host = (
+            (urlsplit(getattr(config, "url", "")).hostname or "").casefold().rstrip(".")
+        )
+        matches.append((config_host == host, str(getattr(config, "name", "")), config))
+    if not matches:
+        return None
+    _exact_host, _name, config = sorted(
+        matches, key=lambda item: (not item[0], item[1])
+    )[0]
+    return AnnouncementSourceIdentity(
+        name=config.name,
+        url=config.url,
+        unit=config.unit,
+        interval_minutes=config.crawl_interval_minutes,
+    )
 
 
 def build_services(settings: Settings) -> dict[str, object]:
@@ -218,6 +261,14 @@ def build_services(settings: Settings) -> dict[str, object]:
         document_repository,
         embedding,
         default_unit="國立屏東大學",
+        announcement_adapter=IncrementalAnnouncementAdapter(announcement_repository),
+        announcement_source_resolver=lambda page, unit: (
+            _resolve_incremental_announcement_source(
+                page.canonical_url,
+                unit,
+                source_configs,
+            )
+        ),
     )
     crawl_lease_repository = SqlCrawlSchedulerRepository(factory)
     crawl_scheduler = CrawlScheduler(crawl_lease_repository)

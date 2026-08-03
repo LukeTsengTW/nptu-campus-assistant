@@ -20,7 +20,16 @@ def normalize_text(text: str) -> str:
 
 def extract_clean_html(html: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
-    for selector in ("script", "iframe", "style", "noscript", "nav", "header", "footer", "aside"):
+    for selector in (
+        "script",
+        "iframe",
+        "style",
+        "noscript",
+        "nav",
+        "header",
+        "footer",
+        "aside",
+    ):
         for node in soup.select(selector):
             node.decompose()
     for node in list(soup.find_all(True)):

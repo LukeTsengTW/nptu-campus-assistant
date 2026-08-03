@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from datetime import date
+from typing import cast
+
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -20,9 +23,17 @@ class HealthService:
         except Exception:
             database = "error"
         llm = "configured" if self._settings.is_llm_configured else "not_configured"
-        embeddings = "configured" if self._settings.is_embedding_configured else "not_configured"
-        status = "unhealthy" if database == "error" else (
-            "ok" if llm == "configured" and embeddings == "configured" else "degraded"
+        embeddings = (
+            "configured" if self._settings.is_embedding_configured else "not_configured"
+        )
+        status = (
+            "unhealthy"
+            if database == "error"
+            else (
+                "ok"
+                if llm == "configured" and embeddings == "configured"
+                else "degraded"
+            )
         )
         return {
             "status": status,
@@ -35,4 +46,11 @@ class AnnouncementService:
         self._repository = repository
 
     def list(self, **kwargs: object) -> object:
-        return self._repository.list(**kwargs)
+        return self._repository.list(
+            q=cast(str | None, kwargs.get("q")),
+            unit=cast(str | None, kwargs.get("unit")),
+            date_from=cast(date | None, kwargs.get("date_from")),
+            date_to=cast(date | None, kwargs.get("date_to")),
+            page=cast(int, kwargs.get("page", 1)),
+            page_size=cast(int, kwargs.get("page_size", 20)),
+        )

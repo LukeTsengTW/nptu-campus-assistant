@@ -19,7 +19,9 @@ WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
 
 
 def test_live_keyword_search_form_and_result_contract() -> None:
-    config = load_keyword_search_config(WORKSPACE_ROOT / "data/sources/announcements.yaml")
+    config = load_keyword_search_config(
+        WORKSPACE_ROOT / "data/sources/announcements.yaml"
+    )
     adapter = NptuAssociationSearchAdapter()
     client = CrawlHttpClient("NPTU-Campus-Assistant-Live-Smoke/0.1", interval_seconds=1)
     try:

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 from typing import Protocol
 from urllib.parse import urlsplit
@@ -18,7 +18,13 @@ from nptu_assistant.crawlers.adapters.nptu_site import (
     UnitAnnouncementPageRole,
 )
 from nptu_assistant.crawlers.config import CrawlerSourceConfig, SiteSearchConfig
-from nptu_assistant.crawlers.crawl_policy import DOCUMENT_RESOURCE_SUFFIXES
+from nptu_assistant.crawlers.crawl_policy import (
+    DOCUMENT_RESOURCE_SUFFIXES,
+    canonicalize_frontier_url,
+    is_bounded_frontier_url,
+    is_document_resource_url,
+    is_frontier_trap_url,
+)
 from nptu_assistant.crawlers.official_units import (
     DocumentSearchScope,
     OfficialUnitDirectory,
@@ -75,6 +81,10 @@ NPTU_ROOT_UNIT = "國立屏東大學"
 NPTU_ROOT_ALIASES = (NPTU_ROOT_UNIT, "屏東大學", "屏大", "nptu")
 
 
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 class SiteMapQueryTimeout(SearchDeadlineExceeded):
     """Site-map SQL exhausted its bounded sub-budget."""
 
@@ -88,6 +98,90 @@ PAGE_TYPE_PRIORITY: Mapping[SitePageType, int] = {
     SitePageType.SEARCH_RESULT: 20,
     SitePageType.UNKNOWN: 0,
 }
+
+
+@dataclass(frozen=True, slots=True)
+class FrontierPolicy:
+    """可注入的 bounded frontier 規則。"""
+
+    max_depth: int = 3
+    per_page_link_cap: int = 64
+    per_host_pending_cap: int = 128
+    per_host_due_cap: int = 1
+    per_host_active_cap: int = 1
+    max_pending_total: int = 2_000
+    new_target_delay: timedelta = timedelta(seconds=30)
+    page_type_priority: Mapping[SitePageType, int] = field(
+        default_factory=lambda: dict(PAGE_TYPE_PRIORITY)
+    )
+    max_query_params: int = 6
+    max_query_length: int = 512
+    max_path_segments: int = 32
+    max_repeated_path_segment: int = 3
+
+    def __post_init__(self) -> None:
+        if self.max_depth < 0:
+            raise ValueError("frontier max depth 不得小於零")
+        for name in (
+            "per_page_link_cap",
+            "per_host_pending_cap",
+            "per_host_due_cap",
+            "per_host_active_cap",
+            "max_pending_total",
+            "max_query_params",
+            "max_query_length",
+            "max_path_segments",
+            "max_repeated_path_segment",
+        ):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"frontier {name} 必須大於零")
+        if self.new_target_delay < timedelta(0):
+            raise ValueError("frontier new target delay 不得小於零")
+
+    def priority(self, page_type: SitePageType) -> int:
+        return int(self.page_type_priority.get(page_type, 0))
+
+    def new_target_due_at(self, now: datetime) -> datetime:
+        return now + self.new_target_delay
+
+    def normalize_target(
+        self,
+        url: str,
+        *,
+        allowed_hosts: Collection[str] | None,
+        allow_document: bool = False,
+    ) -> str | None:
+        try:
+            normalized = canonicalize_frontier_url(canonicalize_nptu_url(url))
+        except ValueError:
+            return None
+        if not is_allowed_nptu_url(normalized):
+            return None
+        if allowed_hosts is not None and not is_allowed_source_url(
+            normalized, allowed_hosts
+        ):
+            return None
+        if is_frontier_trap_url(
+            normalized,
+            max_query_params=self.max_query_params,
+            max_query_length=self.max_query_length,
+            max_path_segments=self.max_path_segments,
+            max_repeated_path_segment=self.max_repeated_path_segment,
+        ):
+            return None
+        if allow_document and is_document_resource_url(normalized):
+            return normalized
+        if not is_bounded_frontier_url(
+            normalized,
+            allowed_hosts=allowed_hosts,
+            max_query_params=self.max_query_params,
+            max_query_length=self.max_query_length,
+            max_path_segments=self.max_path_segments,
+            max_repeated_path_segment=self.max_repeated_path_segment,
+        ):
+            return None
+        return normalized
+
 
 DISCOVERY_SOURCE_PRIORITY: Mapping[SiteDiscoverySource, int] = {
     SiteDiscoverySource.OFFICIAL_UNIT: 100,
@@ -112,6 +206,7 @@ class SitePageUpsert:
     crawl_priority: int = 0
     minimum_depth: int = 0
     is_indexable: bool = True
+    next_crawl_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,6 +246,7 @@ class SiteMapBatchWriteResult:
     links_created: int = 0
     links_updated: int = 0
     statement_count: int = 0
+    frontier_skipped: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,6 +263,8 @@ class SiteMapSyncSummary:
     skipped: int = 0
     failed: int = 0
     links_created: int = 0
+    frontier_skipped: int = 0
+    skipped_by_reason: dict[str, int] = field(default_factory=dict)
     breakdown: dict[str, SiteMapSyncSummary] = field(default_factory=dict, repr=False)
 
     def add(self, result: SiteMapWriteResult) -> None:
@@ -182,6 +280,11 @@ class SiteMapSyncSummary:
         self.created += int(result.source_created) + result.target_created
         self.updated += int(result.source_updated) + result.target_updated
         self.links_created += result.links_created
+        self.frontier_skipped += result.frontier_skipped
+        if result.frontier_skipped:
+            self.skipped_by_reason["frontier_cap"] = (
+                self.skipped_by_reason.get("frontier_cap", 0) + result.frontier_skipped
+            )
 
     def merge(self, other: SiteMapSyncSummary) -> None:
         self.seen += other.seen
@@ -190,6 +293,11 @@ class SiteMapSyncSummary:
         self.skipped += other.skipped
         self.failed += other.failed
         self.links_created += other.links_created
+        self.frontier_skipped += other.frontier_skipped
+        for reason, count in other.skipped_by_reason.items():
+            self.skipped_by_reason[reason] = (
+                self.skipped_by_reason.get(reason, 0) + count
+            )
 
 
 class SiteMapRepository(Protocol):
@@ -214,8 +322,11 @@ class SiteMapRepository(Protocol):
         etag: str | None = None,
         last_modified: str | None = None,
         links: Sequence[SiteLinkUpsert] = (),
+        page_id: UUID | None = None,
         lease_owner: str | None = None,
         lease_token: UUID | None = None,
+        lease_expires_at: datetime | None = None,
+        allow_unleased: bool = False,
     ) -> SiteMapBatchWriteResult: ...
 
     def record_crawl_success(
@@ -227,6 +338,7 @@ class SiteMapRepository(Protocol):
         http_status: int | None,
         etag: str | None = None,
         last_modified: str | None = None,
+        allow_unleased: bool = False,
     ) -> SiteMapWriteResult: ...
 
     def record_crawl_failure(
@@ -235,6 +347,7 @@ class SiteMapRepository(Protocol):
         *,
         http_status: int | None = None,
         status: SiteCrawlStatus = SiteCrawlStatus.FAILED,
+        allow_unleased: bool = False,
     ) -> SiteMapWriteResult: ...
 
     def find_candidates(
@@ -362,11 +475,15 @@ class SiteMapService:
         official_units: OfficialUnitDirectory,
         source_configs: Sequence[CrawlerSourceConfig],
         site_config: SiteSearchConfig,
+        frontier_policy: FrontierPolicy | None = None,
+        clock: Callable[[], datetime] = utc_now,
     ) -> None:
         self._repository = repository
         self._official_units = official_units
         self._source_configs = tuple(source_configs)
         self._site_config = site_config
+        self._frontier_policy = frontier_policy or FrontierPolicy()
+        self._clock = clock
 
     def find_candidates(
         self,
@@ -418,10 +535,11 @@ class SiteMapService:
             SitePageUpsert(
                 canonical_url=normalized,
                 title=title.strip() if title and title.strip() else None,
+                next_crawl_at=self._frontier_policy.new_target_due_at(self._clock()),
                 unit=unit,
                 page_type=page_type,
                 discovery_source=source,
-                crawl_priority=PAGE_TYPE_PRIORITY[page_type],
+                crawl_priority=self._frontier_policy.priority(page_type),
                 minimum_depth=max(0, depth),
             )
         )
@@ -436,8 +554,10 @@ class SiteMapService:
         http_status: int | None = 200,
         etag: str | None = None,
         last_modified: str | None = None,
+        page_id: UUID | None = None,
         lease_owner: str | None = None,
         lease_token: UUID | None = None,
+        lease_expires_at: datetime | None = None,
     ) -> SiteMapSyncSummary:
         from nptu_assistant.ingestion.cleaning import content_hash
 
@@ -449,24 +569,36 @@ class SiteMapService:
             unit=unit,
             page_type=page_type,
             discovery_source=source,
-            crawl_priority=PAGE_TYPE_PRIORITY[page_type],
+            crawl_priority=self._frontier_policy.priority(page_type),
             minimum_depth=max(0, depth),
         )
         links_by_target: dict[str, SiteLinkUpsert] = {}
         skipped_links = 0
-        for link, anchor_text in page.link_texts or tuple(
-            (link, "") for link in page.links
-        ):
-            target = self._normalize_url(link)
-            if target is None or not is_allowed_source_url(target, allowed_hosts):
+        skipped_by_reason: dict[str, int] = {}
+        link_details = page.link_texts or tuple((link, "") for link in page.links)
+        if depth >= self._frontier_policy.max_depth:
+            skipped_links += len(link_details)
+            skipped_by_reason["max_depth"] = len(link_details)
+            link_details = ()
+        for link, anchor_text in link_details:
+            target = self._frontier_policy.normalize_target(
+                link,
+                allowed_hosts=allowed_hosts,
+                allow_document=True,
+            )
+            if target is None:
                 skipped_links += 1
+                skipped_by_reason["policy"] = skipped_by_reason.get("policy", 0) + 1
                 continue
             is_announcement = target in {
                 item.canonical_url for item in page.announcement_items
             }
+            is_document = is_document_resource_url(target)
             target_type = (
                 SitePageType.ANNOUNCEMENT_DETAIL
                 if is_announcement
+                else SitePageType.OFFICIAL_DOCUMENT
+                if is_document
                 else SitePageType.UNKNOWN
             )
             target_source = SiteDiscoverySource.INTERNAL_LINK
@@ -476,11 +608,10 @@ class SiteMapService:
                 unit=unit,
                 page_type=target_type,
                 discovery_source=target_source,
-                crawl_priority=PAGE_TYPE_PRIORITY[target_type],
+                crawl_priority=self._frontier_policy.priority(target_type),
                 minimum_depth=max(0, depth + 1),
-                is_indexable=not target.lower().endswith(
-                    (".pdf", ".doc", ".docx", ".xls", ".xlsx")
-                ),
+                next_crawl_at=self._frontier_policy.new_target_due_at(self._clock()),
+                is_indexable=not is_document,
             )
             incoming_link = SiteLinkUpsert(
                 target=target_page,
@@ -494,6 +625,9 @@ class SiteMapService:
             previous_link = links_by_target.get(target)
             if previous_link is not None:
                 skipped_links += 1
+                skipped_by_reason["duplicate"] = (
+                    skipped_by_reason.get("duplicate", 0) + 1
+                )
                 if not previous_link.anchor_text and incoming_link.anchor_text:
                     links_by_target[target] = incoming_link
                 elif (
@@ -508,7 +642,32 @@ class SiteMapService:
                 continue
             links_by_target[target] = incoming_link
         links = tuple(links_by_target.values())
-        if lease_owner is not None or lease_token is not None:
+        if len(links) > self._frontier_policy.per_page_link_cap:
+            ranked_links = sorted(
+                enumerate(links),
+                key=lambda item: (
+                    -self._frontier_policy.priority(item[1].target.page_type),
+                    item[0],
+                ),
+            )
+            kept_indexes = {
+                index
+                for index, _link in ranked_links[
+                    : self._frontier_policy.per_page_link_cap
+                ]
+            }
+            links = tuple(
+                link for index, link in enumerate(links) if index in kept_indexes
+            )
+            skipped_links += len(links_by_target) - len(links)
+            skipped_by_reason["per_page_link_cap"] = (
+                skipped_by_reason.get("per_page_link_cap", 0)
+                + len(links_by_target)
+                - len(links)
+            )
+        if page_id is not None or any(
+            value is not None for value in (lease_owner, lease_token, lease_expires_at)
+        ):
             result = self._repository.persist_fetched_page(
                 source_page,
                 title=page.title,
@@ -517,8 +676,10 @@ class SiteMapService:
                 etag=etag,
                 last_modified=last_modified,
                 links=links,
+                page_id=page_id,
                 lease_owner=lease_owner,
                 lease_token=lease_token,
+                lease_expires_at=lease_expires_at,
             )
         else:
             result = self._repository.persist_fetched_page(
@@ -529,11 +690,16 @@ class SiteMapService:
                 etag=etag,
                 last_modified=last_modified,
                 links=links,
+                allow_unleased=True,
             )
         summary = SiteMapSyncSummary()
         summary.add_batch(result)
         summary.seen += skipped_links
         summary.skipped += skipped_links
+        for reason, count in skipped_by_reason.items():
+            summary.skipped_by_reason[reason] = (
+                summary.skipped_by_reason.get(reason, 0) + count
+            )
         return summary
 
     def record_crawl_failure(
@@ -542,6 +708,7 @@ class SiteMapService:
         *,
         http_status: int | None = None,
         status: SiteCrawlStatus = SiteCrawlStatus.FAILED,
+        allow_unleased: bool = False,
     ) -> SiteMapWriteResult:
         normalized = self._normalize_url(canonical_url)
         if normalized is None:
@@ -550,6 +717,7 @@ class SiteMapService:
             normalized,
             http_status=http_status,
             status=status,
+            allow_unleased=allow_unleased,
         )
 
     def sync(self) -> SiteMapSyncSummary:
@@ -630,17 +798,10 @@ class SiteMapService:
         *,
         allowed_hosts: Collection[str] | None = None,
     ) -> str | None:
-        try:
-            normalized = canonicalize_nptu_url(url)
-        except ValueError:
-            return None
-        if not is_allowed_nptu_url(normalized):
-            return None
-        if allowed_hosts is not None and not is_allowed_source_url(
-            normalized, allowed_hosts
-        ):
-            return None
-        return normalized
+        return self._frontier_policy.normalize_target(
+            url,
+            allowed_hosts=allowed_hosts,
+        )
 
 
 def source_priority(source: SiteDiscoverySource) -> int:
@@ -649,7 +810,3 @@ def source_priority(source: SiteDiscoverySource) -> int:
 
 def page_priority(page_type: SitePageType) -> int:
     return PAGE_TYPE_PRIORITY[page_type]
-
-
-def utc_now() -> datetime:
-    return datetime.now(timezone.utc)

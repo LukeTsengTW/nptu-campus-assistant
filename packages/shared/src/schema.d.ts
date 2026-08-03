@@ -413,6 +413,11 @@ export interface components {
              */
             dry_run: boolean;
             /**
+             * Pending
+             * @default 0
+             */
+            pending: number;
+            /**
              * Due
              * @default 0
              */
@@ -423,10 +428,20 @@ export interface components {
              */
             leased: number;
             /**
+             * Failed
+             * @default 0
+             */
+            failed: number;
+            /**
              * Blocked
              * @default 0
              */
             blocked: number;
+            /**
+             * Pending Ingestion
+             * @default 0
+             */
+            pending_ingestion: number;
             /**
              * Active Workers
              * @default 0

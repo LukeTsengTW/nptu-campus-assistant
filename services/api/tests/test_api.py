@@ -150,6 +150,45 @@ def test_app_lifespan_starts_and_stops_refresh_scheduler() -> None:
     assert scheduler.stopped is True
 
 
+def test_app_lifespan_starts_and_stops_site_map_worker() -> None:
+    class StubCrawlWorker:
+        def __init__(self) -> None:
+            self.started = False
+            self.stopped = False
+            self._stop = asyncio.Event()
+
+        async def run_loop(self) -> None:
+            self.started = True
+            await self._stop.wait()
+
+        def stop(self) -> None:
+            self.stopped = True
+            self._stop.set()
+
+    worker = StubCrawlWorker()
+    settings = Settings(
+        _env_file=None,
+        admin_api_enabled=True,
+        admin_api_key="test-admin-key",
+        cors_allowed_origins="http://localhost:3000",
+        openai_api_key=None,
+    )
+    app = create_app(
+        settings=settings,
+        health_service=StubHealth(),
+        chat_service=StubChat(),
+        announcement_service=StubAnnouncements(),
+        ingestion_service=StubOperation(),
+        crawler_service=StubOperation(),
+        crawl_worker=worker,
+    )
+
+    with TestClient(app):
+        assert worker.started is True
+
+    assert worker.stopped is True
+
+
 def test_health_returns_degraded_without_llm() -> None:
     response = make_client().get("/health")
 

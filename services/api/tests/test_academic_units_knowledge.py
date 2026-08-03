@@ -19,7 +19,10 @@ def test_academic_units_knowledge_document_has_official_metadata_and_departments
     )
     text = parse_document(DOCUMENT)
 
-    assert str(metadata.source_url) == "https://www.nptu.edu.tw/p/412-1000-2972.php?Lang=zh-tw"
+    assert (
+        str(metadata.source_url)
+        == "https://www.nptu.edu.tw/p/412-1000-2972.php?Lang=zh-tw"
+    )
     assert metadata.document_type == "academic_units_snapshot"
     for college in (
         "管理學院",
