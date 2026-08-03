@@ -64,6 +64,25 @@ homepage intent 直接由 registry 建立 deterministic config-backed official e
 
 搜尋診斷將高相關成功、高相關失敗與無關失敗分開。只有高排名候選失敗且可能影響答案時才附 partial warning；正常零結果不視為網路錯誤，已有高可信資料庫 evidence 時也不執行 live crawl。
 
+## P4 DB-first completeness policy
+
+`DbFirstCompletenessPolicy` 是純函式：它只接收 retrieval evidence 的 current/superseded 狀態、scope、SitePage 的最後成功抓取時間、hash/ingestion 狀態、有效 lease、公告 source coverage 與固定的 request deadline，輸出固定的 action 和 reason code。它不做 HTTP、embedding、寫入或讀取時間全域狀態。`SqlRetrievalCompletenessFacts` 對已取得的 canonical URLs 以至多兩條 set-based SQL 查詢取得 metadata；PostgreSQL 在每條 statement 前都重新以 request 剩餘時間套用 transaction-local timeout。公告 evidence 同時必須位於 source 最近一次成功的 canonical snapshot，並以 `Announcement.last_crawled_at` 判斷 detail freshness；沒有對應 `SitePage` 時不會假裝 hash 已同步，`Announcement.warning` 一律視為 retryable incomplete。資料庫錯誤採保守 incomplete decision，不能把錯誤視為完整。
+
+```text
+DB retrieval
+  → completeness facts
+  → fresh/current/exact evidence: USE_DB
+  → stale but usable / pending / failed: USE_DB_AND_SCHEDULE_REFRESH
+  → active worker or terminal undated announcement: USE_DB_WITH_INCOMPLETE_WARNING
+  → genuinely insufficient: USE_BOUNDED_LIVE_FALLBACK
+```
+
+`CompletenessRefreshScheduler` 對 SitePage 呼叫既有 `CrawlScheduler.schedule_pages()` 的單條 conditional `UPDATE`，並以 Source watermark 的單條 conditional `UPDATE` 為沒有 SitePage 的公告來源寫入 durable due signal；兩者都不啟動 worker、不等待 crawl。SitePage 排程不推遲較早的 `next_crawl_at`，也不覆寫 blocked、excluded 或持有 live crawl/ingestion lease 的 target；Source worker 在 HTTP 前取得 PostgreSQL session advisory lease，完成後以 crawl-start watermark 的單調檢查提交 snapshot，避免跨程序重複 fetch 與晚到舊快照覆寫。它們同樣受 shared deadline 的 transaction-local timeout 保護；零筆更新不會宣稱 background refresh 已排程。refresh target 上限獨立於 live candidate 上限，預設為 220；超限會明確失敗而非只排前一部分。
+
+P4 的 `enforce` 預設在 `announcements.yaml`，`shadow` 只記錄 policy 與 legacy 是否會 live 的差異，`off` 完整保留 legacy 流程。結構化事件不記錄原始 query、HTML、embedding 或憑證，只包含 query kind/intent、scope、decision/reason、evidence/freshness/coverage/lease 計數、deadline policy latency，以及 fallback/schedule outcome。所有 live path 繼續共用原始 absolute `SearchDeadline`；P4 只會 cap，絕不建立第二個完整 deadline。
+
+文件 fallback 最多 6 個頁面、16 個 candidates、depth 1、8 秒。公告 scoped fallback 使用同一 deadline 與 limits，detail 最多 4 筆；generic/keyword announcement 的 P4 fallback 經 deadline-aware official form client 與同樣受限的 site search，再重新從資料庫查回已持久化 evidence。terminal undated announcement 是 `incomplete` terminal state，只顯示 incomplete warning，不會因此同步重抓。
+
 ## P3.1.1 frontier persistence statement benchmark
 
 `tests/integration/test_frontier_persistence_acceptance.py` 是 opt-in 的真實 PostgreSQL acceptance benchmark，不使用 SQLite 代替 PostgreSQL。它把一次 fetched page persistence 視為一個 transaction，並以 SQLAlchemy engine trace 實測 `transaction_count`、實際 `statement_count`、commit／rollback、執行時間、建立的 targets 與 edges；repository 回傳的 `statement_count` 不能取代這份 SQL trace。

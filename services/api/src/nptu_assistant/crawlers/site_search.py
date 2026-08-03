@@ -35,6 +35,7 @@ from nptu_assistant.crawlers.site_models import (
     CandidatePage,
     SearchDeadline,
     SearchDeadlineExceeded,
+    SearchExecutionLimits,
     SearchDiagnostics,
     SearchPlan,
 )
@@ -197,7 +198,14 @@ class NptuSiteSearchService:
         limit: int,
         use_discovery: bool,
         scope: DocumentSearchScope | None,
+        limits: SearchExecutionLimits | None = None,
     ) -> dict[str, object]:
+        effective_limits = limits or SearchExecutionLimits(
+            max_pages=self._config.max_pages,
+            max_candidate_urls=self._config.max_candidate_urls,
+            max_depth=self._config.max_depth,
+            max_pages_per_host=self._config.max_pages_per_host,
+        )
         allowed_hosts = (
             scope.allowed_hosts if scope is not None else self._config.allowed_hosts
         )
@@ -216,6 +224,10 @@ class NptuSiteSearchService:
             "seed_urls": list(seed_urls),
             "discovery_enabled": effective_discovery,
             "scoring_version": SITE_SEARCH_SCORING_VERSION,
+            "max_pages": effective_limits.max_pages,
+            "max_candidate_urls": effective_limits.max_candidate_urls,
+            "max_depth": effective_limits.max_depth,
+            "max_pages_per_host": effective_limits.max_pages_per_host,
         }
 
     def _cache_key(
@@ -225,6 +237,7 @@ class NptuSiteSearchService:
         limit: int,
         use_discovery: bool,
         scope: DocumentSearchScope | None,
+        limits: SearchExecutionLimits | None = None,
     ) -> str:
         return site_search_cache_key(
             self._cache_payload(
@@ -232,6 +245,7 @@ class NptuSiteSearchService:
                 limit=limit,
                 use_discovery=use_discovery,
                 scope=scope,
+                limits=limits,
             )
         )
 
@@ -244,6 +258,7 @@ class NptuSiteSearchService:
         deadline: SearchDeadline | None = None,
         scope: DocumentSearchScope | None = None,
         execution_context: RetrievalExecutionContext | None = None,
+        limits: SearchExecutionLimits | None = None,
     ) -> SiteSearchResult:
         search_deadline = deadline or self.new_deadline()
         requested_limit = self._config.max_items if max_items is None else max_items
@@ -254,11 +269,18 @@ class NptuSiteSearchService:
         if search_plan.limit != limit:
             search_plan = search_plan.model_copy(update={"limit": limit})
         effective_discovery = True if use_discovery is None else use_discovery
+        effective_limits = limits or SearchExecutionLimits(
+            max_pages=self._config.max_pages,
+            max_candidate_urls=self._config.max_candidate_urls,
+            max_depth=self._config.max_depth,
+            max_pages_per_host=self._config.max_pages_per_host,
+        )
         cache_key = self._cache_key(
             search_plan,
             limit=limit,
             use_discovery=effective_discovery,
             scope=scope,
+            limits=effective_limits,
         )
         cached_entry = self._result_cache.get(cache_key)
         if cached_entry is not None:
@@ -300,6 +322,7 @@ class NptuSiteSearchService:
                     deadline=search_deadline,
                     scope=scope,
                     execution_context=execution_context,
+                    limits=effective_limits,
                 )
                 if (
                     self._config.cache_ttl_seconds
@@ -322,6 +345,7 @@ class NptuSiteSearchService:
             deadline=search_deadline,
             scope=scope,
             execution_context=execution_context,
+            limits=effective_limits,
         )
         if (
             self._config.cache_ttl_seconds
@@ -340,6 +364,7 @@ class NptuSiteSearchService:
         deadline: SearchDeadline,
         scope: DocumentSearchScope | None,
         execution_context: RetrievalExecutionContext | None,
+        limits: SearchExecutionLimits,
     ) -> SiteSearchResult:
         search_deadline = deadline
         allowed_hosts = (
@@ -385,7 +410,7 @@ class NptuSiteSearchService:
                     return
             if (
                 url not in discovered_urls
-                and len(discovered_urls) >= self._config.max_candidate_urls
+                and len(discovered_urls) >= limits.max_candidate_urls
             ):
                 skipped_candidate_count += 1
                 return
@@ -406,7 +431,7 @@ class NptuSiteSearchService:
                     search_plan,
                     scope=scope,
                     allowed_hosts=allowed_hosts,
-                    limit=self._config.max_candidate_urls,
+                    limit=limits.max_candidate_urls,
                     deadline=search_deadline,
                 )
                 site_map_sufficient = self._site_map.has_sufficient_candidates(
@@ -475,7 +500,7 @@ class NptuSiteSearchService:
                 search_deadline.raise_if_expired()
                 for item in self._discovery.discover(
                     search_plan,
-                    max_items=self._config.max_candidate_urls,
+                    max_items=limits.max_candidate_urls,
                     deadline=search_deadline,
                 ):
                     enqueue(
@@ -509,7 +534,7 @@ class NptuSiteSearchService:
                 },
             )
 
-        while queue and len(visited) < self._config.max_pages:
+        while queue and len(visited) < limits.max_pages:
             if search_deadline.expired():
                 query_timed_out = True
                 timed_out_scores.extend(queued_scores.values())
@@ -524,7 +549,7 @@ class NptuSiteSearchService:
                 skipped_candidate_count += 1
                 continue
             host = urlsplit(url).hostname or ""
-            if pages_per_host.get(host, 0) >= self._config.max_pages_per_host:
+            if pages_per_host.get(host, 0) >= limits.max_pages_per_host:
                 skipped_candidate_count += 1
                 continue
             visited.add(url)
@@ -580,7 +605,7 @@ class NptuSiteSearchService:
                 ),
             )
             preliminary_scores.append(preliminary)
-            if candidate.depth < self._config.max_depth:
+            if candidate.depth < limits.max_depth:
                 link_details = page.link_texts or tuple(
                     (link, "") for link in page.links
                 )
@@ -694,6 +719,7 @@ class ScopedAnnouncementRepository(Protocol):
         source_unit: str,
         interval_minutes: int,
         crawled_at: datetime,
+        advance_freshness: bool = True,
     ) -> list[str]: ...
 
 
@@ -764,6 +790,7 @@ class SitePageIngestionService:
         deadline: SearchDeadline | None = None,
         scope: DocumentSearchScope | None = None,
         execution_context: RetrievalExecutionContext | None = None,
+        limits: SearchExecutionLimits | None = None,
     ) -> SitePageIngestionResult:
         deadline = deadline or self.new_deadline()
         search_result = self._search.search(
@@ -772,6 +799,7 @@ class SitePageIngestionService:
             deadline=deadline,
             scope=scope,
             execution_context=execution_context,
+            limits=limits,
         )
         diagnostics = search_result.diagnostics
         summary = IngestionSummary()
@@ -914,14 +942,20 @@ class SitePageIngestionService:
         deadline: SearchDeadline,
         sort: object = "newest",
         topic: str | None = None,
+        limits: SearchExecutionLimits | None = None,
     ) -> ScopedAnnouncementIngestionResult:
         search_limit = min(self._config.max_items, max(max_items, 3))
+        if limits is not None:
+            # The listing/search stage and detail stage have separate bounded
+            # budgets.  The caller caps details; this caps candidate fetching.
+            search_limit = min(search_limit, limits.max_pages)
         result = self._search.search(
             plan,
             max_items=search_limit,
             use_discovery=False,
             deadline=deadline,
             scope=scope,
+            limits=limits,
         )
         canonical_unit = scope.canonical_unit
         if not canonical_unit:
@@ -1032,29 +1066,43 @@ class SitePageIngestionService:
             scope.seed_urls[0] if scope.seed_urls else ""
         )
         source_name = f"unit-scoped:{canonical_unit}"
-        persisted_urls: list[str] = []
         crawled_at = datetime.now(timezone.utc)
-        for candidate in candidates[:max_items]:
+        selected_candidates = candidates[:max_items]
+        if selected_candidates:
             try:
                 deadline.raise_if_expired()
-                self._announcement_repository.merge_source_announcements(
-                    [candidate],
+                outcomes = self._announcement_repository.merge_source_announcements(
+                    selected_candidates,
                     source_name=source_name,
                     source_url=source_url,
                     source_unit=canonical_unit,
                     interval_minutes=60,
                     crawled_at=crawled_at,
+                    # A request-scoped candidate subset is never a complete
+                    # source listing.  It may enrich DB records, but only the
+                    # background crawler may advance Source freshness/snapshot.
+                    advance_freshness=False,
                 )
-                persisted_urls.append(candidate.canonical_url)
+                if len(outcomes) != len(selected_candidates):
+                    raise RuntimeError("公告 repository 回傳數量不一致")
+                persisted_urls = [
+                    candidate.canonical_url for candidate in selected_candidates
+                ]
             except SearchDeadlineExceeded:
                 timed_out = True
-                break
+                persisted_urls = []
             except Exception:
-                failed_count += 1
+                failed_count += len(selected_candidates)
+                persisted_urls = []
                 logger.exception(
-                    "單位公告持久化失敗",
-                    extra={"unit": canonical_unit, "url": candidate.canonical_url},
+                    "單位公告批次持久化失敗",
+                    extra={
+                        "unit": canonical_unit,
+                        "candidate_count": len(selected_candidates),
+                    },
                 )
+        else:
+            persisted_urls = []
 
         found_count = len(detail_pages)
         incomplete = bool(

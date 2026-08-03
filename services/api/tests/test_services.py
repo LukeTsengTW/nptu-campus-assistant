@@ -165,6 +165,14 @@ class MemoryAnnouncementRepository:
             for candidate in candidates
         ]
 
+    def merge_source_announcements(
+        self,
+        candidates: list[AnnouncementCandidate],
+        **values: object,
+    ) -> list[str]:
+        values.pop("advance_freshness", None)
+        return self.commit_source_refresh(candidates, **values)
+
 
 class UnusedHttpClient:
     def get(self, url: str) -> str:
@@ -598,8 +606,12 @@ def test_crawler_preserves_feed_description_and_records_detail_warning(
         workspace_root=tmp_path,
     )
 
-    summary = service.run()
+    result = service.run_with_urls()
+    summary = result.summary
 
     assert summary.created == 1
+    assert summary.failed == 1
     assert repository.candidates[0].body == "摘要內容"
     assert repository.candidates[0].warning is not None
+    assert "live-fixture" in result.partial_source_snapshots
+    assert "live-fixture" not in result.persisted_source_snapshots

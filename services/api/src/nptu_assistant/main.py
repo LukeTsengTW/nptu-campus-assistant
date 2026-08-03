@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import date
@@ -215,6 +216,7 @@ def create_app(
         request.state.request_id = (
             incoming if _SAFE_REQUEST_ID.fullmatch(incoming) else str(uuid.uuid4())
         )
+        started_at = time.perf_counter()
         response = await call_next(request)
         response.headers["X-Request-ID"] = request.state.request_id
         logger.info(
@@ -224,6 +226,7 @@ def create_app(
                 "method": request.method,
                 "path": request.url.path,
                 "status_code": response.status_code,
+                "duration_ms": round((time.perf_counter() - started_at) * 1_000, 3),
             },
         )
         return response

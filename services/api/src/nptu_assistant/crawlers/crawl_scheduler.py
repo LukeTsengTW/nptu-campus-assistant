@@ -5,10 +5,11 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from hashlib import sha256
-from typing import Protocol, cast
+from typing import Protocol
 from uuid import UUID
 
 from nptu_assistant.crawlers.site_map import SiteCrawlStatus
+from nptu_assistant.crawlers.site_models import SearchDeadline
 
 Jitter = Callable[[float], float]
 
@@ -248,6 +249,26 @@ class CrawlLeaseRepository(Protocol):
         last_modified: str | None = None,
         ingestion_performed: bool = False,
     ) -> bool:
+        raise NotImplementedError
+
+    def schedule_pages(
+        self,
+        *,
+        urls: tuple[str, ...] = (),
+        unit: str | None = None,
+        host: str | None = None,
+        page_type: str | None = None,
+        run_at: datetime | None = None,
+        deadline: SearchDeadline | None = None,
+    ) -> int:
+        raise NotImplementedError
+
+    def schedule_announcement_sources(
+        self,
+        *,
+        source_names: tuple[str, ...],
+        deadline: SearchDeadline | None = None,
+    ) -> int:
         raise NotImplementedError
 
 
@@ -626,6 +647,7 @@ class CrawlScheduler:
         host: str | None = None,
         page_type: str | None = None,
         run_at: datetime | None = None,
+        deadline: SearchDeadline | None = None,
     ) -> int:
         """Persist explicit targets before claiming them.
 
@@ -633,19 +655,26 @@ class CrawlScheduler:
         fairness path as normal due-page work.
         """
 
-        schedule = getattr(self._repository, "schedule_pages", None)
-        if not callable(schedule):
-            raise RuntimeError(
-                "crawl lease repository 不支援 durable target scheduling"
-            )
-        result = schedule(
+        result = self._repository.schedule_pages(
             urls=urls,
             unit=unit,
             host=host,
             page_type=page_type,
             run_at=run_at or self._now(),
+            deadline=deadline,
         )
-        return int(cast(int, result))
+        return result
+
+    def schedule_announcement_sources(
+        self,
+        *,
+        source_names: tuple[str, ...],
+        deadline: SearchDeadline | None = None,
+    ) -> int:
+        return self._repository.schedule_announcement_sources(
+            source_names=source_names,
+            deadline=deadline,
+        )
 
     def renew(self, claim: CrawlClaim, *, lease_duration: timedelta) -> bool:
         return self._repository.renew(

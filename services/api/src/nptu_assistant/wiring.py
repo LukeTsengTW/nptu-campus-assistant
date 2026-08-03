@@ -43,7 +43,10 @@ from nptu_assistant.crawlers.search import KeywordAnnouncementSearchService
 from nptu_assistant.crawlers.service import CrawlerService
 from nptu_assistant.crawlers.site_discovery import NptuOfficialSearchDiscovery
 from nptu_assistant.crawlers.site_map import SiteMapService
-from nptu_assistant.crawlers.site_models import ProgressiveRetrievalPolicy
+from nptu_assistant.crawlers.site_models import (
+    ProgressiveRetrievalPolicy,
+    SearchExecutionLimits,
+)
 from nptu_assistant.crawlers.site_scoring import HybridCandidateScorer
 from nptu_assistant.crawlers.site_search import (
     NptuSiteSearchService,
@@ -67,6 +70,13 @@ from nptu_assistant.providers.fake import FakeEmbeddingProvider, FakeLlmProvider
 from nptu_assistant.providers.openai import OpenAIEmbeddingProvider, OpenAILlmProvider
 from nptu_assistant.providers.protocols import EmbeddingProvider
 from nptu_assistant.rag.conversation import SqlConversationStore
+from nptu_assistant.rag.completeness import (
+    CompletenessConfig,
+    CompletenessMode,
+    DbFirstCompletenessPolicy,
+)
+from nptu_assistant.rag.completeness_facts import SqlRetrievalCompletenessFacts
+from nptu_assistant.rag.completeness_refresh import CompletenessRefreshScheduler
 from nptu_assistant.rag.retrieval import SqlRetriever
 from nptu_assistant.rag.service import ChatService, LlmProvider
 from nptu_assistant.core.security import is_allowed_source_url
@@ -278,6 +288,56 @@ def build_services(settings: Settings) -> dict[str, object]:
         crawl_lease_repository,
         identity=canonical_crawl_identity,
     )
+    completeness_settings = keyword_search_config.completeness_policy
+    completeness_policy = DbFirstCompletenessPolicy(
+        CompletenessConfig(
+            min_strong_evidence=completeness_settings.min_strong_evidence,
+            exact_scope_min_score=completeness_settings.exact_scope_min_score,
+            minimum_score_margin=completeness_settings.minimum_score_margin,
+            minimum_remaining_deadline_seconds=(
+                completeness_settings.minimum_remaining_deadline_seconds
+            ),
+            minimum_source_coverage_ratio=(
+                completeness_settings.minimum_source_coverage_ratio
+            ),
+            document_soft_stale_minutes=(
+                completeness_settings.document_soft_stale_minutes
+            ),
+            document_hard_stale_minutes=(
+                completeness_settings.document_hard_stale_minutes
+            ),
+            announcement_soft_stale_minutes=(
+                completeness_settings.announcement_soft_stale_minutes
+            ),
+            announcement_hard_stale_minutes=(
+                completeness_settings.announcement_hard_stale_minutes
+            ),
+            live_fallback_enabled=completeness_settings.live_fallback_enabled,
+            live_fallback_max_details=(completeness_settings.live_fallback_max_details),
+            rollout_mode=CompletenessMode(completeness_settings.rollout_mode),
+        )
+    )
+    completeness_facts = SqlRetrievalCompletenessFacts(
+        factory,
+        announcement_source_targets=tuple(
+            (config.name, config.url, config.unit)
+            for config in source_configs
+            if config.enabled
+        ),
+    )
+    completeness_refresh_scheduler = CompletenessRefreshScheduler(
+        crawl_scheduler,
+        max_targets=completeness_settings.refresh_schedule_max_targets,
+    )
+    live_fallback_limits = SearchExecutionLimits(
+        max_pages=completeness_settings.live_fallback_max_pages,
+        max_candidate_urls=completeness_settings.live_fallback_max_candidate_urls,
+        max_depth=completeness_settings.live_fallback_max_depth,
+        max_pages_per_host=min(
+            completeness_settings.live_fallback_max_pages,
+            site_config.max_pages_per_host if site_config else 1,
+        ),
+    )
     incremental_crawler = IncrementalCrawler(
         http_client,
         site_map_service,
@@ -321,6 +381,11 @@ def build_services(settings: Settings) -> dict[str, object]:
                     official_units,
                 ),
                 site_page_ingestor,
+                completeness_policy,
+                completeness_facts,
+                completeness_refresh_scheduler,
+                live_fallback_limits,
+                completeness_settings.live_fallback_max_seconds,
             )
             if llm
             else None
@@ -338,6 +403,7 @@ def build_services(settings: Settings) -> dict[str, object]:
         "crawl_admin_service": crawl_worker,
         "crawl_scheduler": crawl_scheduler,
         "crawl_lease_repository": crawl_lease_repository,
+        "completeness_policy": completeness_policy,
         "incremental_crawler": incremental_crawler,
         "site_map_service": site_map_service,
         "session_factory": factory,

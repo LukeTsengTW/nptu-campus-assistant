@@ -4,7 +4,19 @@ import uuid
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import String, cast as sql_cast, func, insert, not_, or_, select, update
+from sqlalchemy import (
+    String,
+    case,
+    cast as sql_cast,
+    func,
+    insert,
+    literal,
+    not_,
+    or_,
+    select,
+    text,
+    update,
+)
 from sqlalchemy.orm import Session, aliased, sessionmaker
 from sqlalchemy.sql.elements import ColumnElement
 
@@ -14,12 +26,25 @@ from nptu_assistant.crawlers.crawl_scheduler import (
     FailureDecision,
 )
 from nptu_assistant.crawlers.site_map import FrontierPolicy, SiteCrawlStatus
+from nptu_assistant.crawlers.site_models import SearchDeadline
 from nptu_assistant.db.crawl_models import SiteCrawlAttempt
-from nptu_assistant.db.models import SitePage
+from nptu_assistant.db.models import SitePage, Source
 
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _apply_statement_deadline(
+    session: Session, deadline: SearchDeadline | None
+) -> None:
+    if deadline is None:
+        return
+    deadline.raise_if_expired()
+    if session.get_bind().dialect.name != "postgresql":
+        return
+    remaining_ms = max(1, int(deadline.remaining_seconds() * 1_000))
+    session.execute(text(f"SET LOCAL statement_timeout = {remaining_ms}"))
 
 
 def due_pages_statement(
@@ -443,6 +468,7 @@ class SqlCrawlSchedulerRepository:
         host: str | None = None,
         page_type: str | None = None,
         run_at: datetime | None = None,
+        deadline: SearchDeadline | None = None,
     ) -> int:
         checked_at = run_at or self._clock()
         conditions: list[ColumnElement[bool]] = [SitePage.is_active.is_(True)]
@@ -454,24 +480,100 @@ class SqlCrawlSchedulerRepository:
             conditions.append(SitePage.host == host.casefold().rstrip("."))
         if page_type:
             conditions.append(SitePage.page_type == page_type)
+        conditions.extend(
+            (
+                SitePage.is_indexable.is_(True),
+                not_(
+                    or_(
+                        *(
+                            SitePage.path.ilike(f"%{suffix}")
+                            for suffix in NON_HTML_RESOURCE_SUFFIXES
+                        )
+                    )
+                ),
+                SitePage.crawl_status.not_in(
+                    [
+                        SiteCrawlStatus.BLOCKED.value,
+                        SiteCrawlStatus.EXCLUDED.value,
+                    ]
+                ),
+                or_(
+                    SitePage.crawl_lease_expires_at.is_(None),
+                    SitePage.crawl_lease_expires_at <= checked_at,
+                ),
+                or_(
+                    SitePage.ingestion_lease_expires_at.is_(None),
+                    SitePage.ingestion_lease_expires_at <= checked_at,
+                ),
+            )
+        )
+        # A single conditional UPDATE is both the fencing point and the durable
+        # scheduling transaction.  It never delays an earlier due time and it
+        # never queues a page currently owned by a live crawl/ingestion lease.
+        statement = (
+            update(SitePage)
+            .where(*conditions)
+            .values(
+                next_crawl_at=case(
+                    (
+                        or_(
+                            SitePage.next_crawl_at.is_(None),
+                            SitePage.next_crawl_at > checked_at,
+                        ),
+                        checked_at,
+                    ),
+                    else_=SitePage.next_crawl_at,
+                ),
+                last_scheduled_at=checked_at,
+                crawl_status=SiteCrawlStatus.QUEUED.value,
+            )
+        )
         with self._factory.begin() as session:
-            pages = session.scalars(
-                select(SitePage).where(*conditions).with_for_update()
-            ).all()
-            scheduled = 0
-            for page in pages:
-                if not page.is_indexable or not is_crawlable_page_path(page.path):
-                    continue
-                if page.next_crawl_at is None or checked_at < page.next_crawl_at:
-                    page.next_crawl_at = checked_at
-                page.last_scheduled_at = checked_at
-                if page.crawl_status not in {
-                    SiteCrawlStatus.BLOCKED.value,
-                    SiteCrawlStatus.EXCLUDED.value,
-                }:
-                    page.crawl_status = SiteCrawlStatus.QUEUED.value
-                scheduled += 1
-            return scheduled
+            _apply_statement_deadline(session, deadline)
+            result = session.execute(statement)
+        return int(getattr(result, "rowcount", 0) or 0)
+
+    def schedule_announcement_sources(
+        self,
+        *,
+        source_names: tuple[str, ...],
+        deadline: SearchDeadline | None = None,
+    ) -> int:
+        """Durably make announcement sources due without executing HTTP.
+
+        Source-only announcement crawls do not necessarily have a matching
+        ``SitePage`` row, so a page update alone cannot reliably trigger their
+        background worker.  Clearing the successful watermark is the existing
+        source scheduler's durable due signal; its next tick claims the source
+        behind the cross-process advisory lease.
+        """
+
+        names = tuple(dict.fromkeys(source_names))
+        if not names:
+            return 0
+        statement = (
+            update(Source)
+            .where(
+                Source.name.in_(names),
+                Source.crawl_enabled.is_(True),
+                Source.source_type == "announcement",
+                # The source worker holds this same session-level key across
+                # HTTP.  A due signal must never clear its watermark midway
+                # through a live crawl, or that older worker could commit over
+                # a newer snapshot after the artificial NULL.
+                func.pg_try_advisory_xact_lock(
+                    func.hashtextextended(
+                        literal("nptu-source-refresh:") + Source.name,
+                        0,
+                    )
+                ),
+            )
+            .values(last_successful_crawl_at=None)
+        )
+        with self._factory.begin() as session:
+            _apply_statement_deadline(session, deadline)
+            result = session.execute(statement)
+        return int(getattr(result, "rowcount", 0) or 0)
 
     def status(self, *, now: datetime | None = None) -> dict[str, object]:
         checked_at = now or self._clock()

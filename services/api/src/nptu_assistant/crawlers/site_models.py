@@ -50,6 +50,20 @@ class SearchDeadline:
     def expired(self) -> bool:
         return self.remaining_seconds() <= 0.0
 
+    def capped(self, seconds: float) -> "SearchDeadline":
+        """Return an earlier cap while preserving this deadline's clock.
+
+        This is intentionally not a new request budget: the resulting expiry is
+        always the earlier of the existing absolute deadline and the cap.
+        """
+
+        if seconds <= 0:
+            raise ValueError("deadline cap 必須大於零")
+        return SearchDeadline(
+            expires_at=min(self.expires_at, self._clock() + seconds),
+            _clock=self._clock,
+        )
+
     def raise_if_expired(self) -> None:
         if self.expired():
             raise SearchDeadlineExceeded("網站搜尋時間額度已耗盡")
@@ -168,6 +182,26 @@ class ProgressiveRetrievalPolicy:
     min_results: int = 2
     min_score: float = 0.58
     min_content_chars: int = 160
+
+
+@dataclass(frozen=True, slots=True)
+class SearchExecutionLimits:
+    """Per-request upper bounds; never expands configured crawler limits."""
+
+    max_pages: int
+    max_candidate_urls: int
+    max_depth: int
+    max_pages_per_host: int
+
+    def __post_init__(self) -> None:
+        if self.max_pages < 1:
+            raise ValueError("max_pages 必須至少為 1")
+        if self.max_candidate_urls < self.max_pages:
+            raise ValueError("max_candidate_urls 不得低於 max_pages")
+        if self.max_depth < 0:
+            raise ValueError("max_depth 不可為負數")
+        if self.max_pages_per_host < 1:
+            raise ValueError("max_pages_per_host 必須至少為 1")
 
 
 @dataclass(frozen=True, slots=True)

@@ -434,3 +434,54 @@ def test_postgres_migration_roundtrip_preserves_ingestion_semantics() -> None:
         command.upgrade(config, "head")
         cleanup(factory, prefix)
         engine.dispose()
+
+
+def test_postgres_0009_repairs_a_physically_legacy_0008_schema() -> None:
+    """Verify 0009 upgrades an old stamped-0008 shape, not just its SQL text."""
+
+    _factory, engine = make_factory()
+    config = Config(str(Path(__file__).resolve().parents[2] / "alembic.ini"))
+    try:
+        command.downgrade(config, "20260803_0008")
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "ALTER TABLE site_pages "
+                    "DROP CONSTRAINT IF EXISTS "
+                    "ck_site_pages_announcement_ingestion_status"
+                )
+            )
+            connection.execute(
+                text(
+                    "ALTER TABLE site_pages "
+                    "DROP COLUMN IF EXISTS announcement_ingestion_error"
+                )
+            )
+            connection.execute(
+                text(
+                    "ALTER TABLE site_pages "
+                    "DROP COLUMN IF EXISTS announcement_ingestion_status"
+                )
+            )
+
+        command.upgrade(config, "head")
+
+        columns = {
+            column["name"] for column in inspect(engine).get_columns("site_pages")
+        }
+        checks = {
+            check["name"]
+            for check in inspect(engine).get_check_constraints("site_pages")
+        }
+        assert {
+            "ingestion_attempt_hash",
+            "announcement_ingestion_status",
+            "announcement_ingestion_error",
+        } <= columns
+        assert {
+            "ck_site_pages_ingestion_status",
+            "ck_site_pages_announcement_ingestion_status",
+        } <= checks
+    finally:
+        command.upgrade(config, "head")
+        engine.dispose()

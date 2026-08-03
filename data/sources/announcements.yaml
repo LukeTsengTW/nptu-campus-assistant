@@ -10,6 +10,18 @@ keyword_search:
   max_items: 20
   unit: 國立屏東大學
   category: 關鍵字搜尋
+  completeness_policy:
+    # P4 defaults to enforce: request paths are DB-first, while a bounded
+    # official live fallback remains available for genuinely insufficient DB data.
+    rollout_mode: enforce
+    live_fallback_enabled: true
+    minimum_remaining_deadline_seconds: 2
+    live_fallback_max_pages: 6
+    live_fallback_max_candidate_urls: 16
+    live_fallback_max_depth: 1
+    live_fallback_max_seconds: 8
+    live_fallback_max_details: 4
+    refresh_schedule_max_targets: 220
   site_search:
     enabled: true
     name: nptu-domain-search

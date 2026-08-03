@@ -87,37 +87,56 @@ class AnnouncementRefreshCoordinator:
                         source_name
                     ),
                 )
-            run_result = self._crawler.run_with_urls([source_name])
-            summary = run_result.summary
-            canonical_urls = run_result.canonical_urls.get(source_name)
-            if summary.failed or canonical_urls is None:
+
+            def run_once() -> RefreshResult:
+                # Recheck the durable watermark immediately before delegating
+                # to the crawler, which owns the cross-process source lease.
+                if not self._is_due(config, self._now()):
+                    return RefreshResult(
+                        source_name,
+                        attempted=False,
+                        succeeded=True,
+                        canonical_urls=self._repository.canonical_urls_for_source(
+                            source_name
+                        ),
+                    )
+                run_result = self._crawler.run_with_urls([source_name])
+                summary = run_result.summary
+                canonical_urls = run_result.canonical_urls.get(source_name)
+                if (
+                    summary.failed
+                    or canonical_urls is None
+                    or source_name in run_result.partial_source_snapshots
+                ):
+                    return RefreshResult(
+                        source_name,
+                        attempted=True,
+                        succeeded=False,
+                        warning=REFRESH_FAILURE_WARNING,
+                        summary=summary,
+                        canonical_urls=self._repository.canonical_urls_for_source(
+                            source_name
+                        ),
+                    )
+                if source_name not in run_result.persisted_source_snapshots:
+                    self._repository.record_source_refresh(
+                        source_name=config.name,
+                        source_url=config.url,
+                        unit=config.unit,
+                        interval_minutes=config.crawl_interval_minutes,
+                        canonical_urls=canonical_urls,
+                        crawled_at=checked_at,
+                    )
+                self._last_success[source_name] = checked_at
                 return RefreshResult(
                     source_name,
                     attempted=True,
-                    succeeded=False,
-                    warning=REFRESH_FAILURE_WARNING,
+                    succeeded=True,
                     summary=summary,
-                    canonical_urls=self._repository.canonical_urls_for_source(
-                        source_name
-                    ),
-                )
-            if source_name not in run_result.persisted_source_snapshots:
-                self._repository.record_source_refresh(
-                    source_name=config.name,
-                    source_url=config.url,
-                    unit=config.unit,
-                    interval_minutes=config.crawl_interval_minutes,
                     canonical_urls=canonical_urls,
-                    crawled_at=checked_at,
                 )
-            self._last_success[source_name] = checked_at
-            return RefreshResult(
-                source_name,
-                attempted=True,
-                succeeded=True,
-                summary=summary,
-                canonical_urls=canonical_urls,
-            )
+
+            return run_once()
 
     def refresh_due_sources(self) -> list[RefreshResult]:
         return [

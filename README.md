@@ -154,6 +154,8 @@ corepack pnpm build
 
 P3.1.1 frontier persistence acceptance 必須使用真實 PostgreSQL；測試會追蹤實際 transaction／SQL statement、執行時間、targets／edges，並驗證 canonical URL 去重、frontier cap、並行 advisory lock 與 rollback。執行方式與固定 statement scaling contract 見 `docs/architecture.md` 的「P3.1.1 frontier persistence statement benchmark」。
 
+P4 的預設 rollout 是 `enforce`：文件與公告先依資料庫 current evidence、來源 freshness、ingestion 狀態、scope 與 coverage 判定完整性。公告還必須位於來源最近成功的 snapshot，並以 detail 的最後 crawl 時間判定 freshness；detail 失敗或 warning 不會推進 snapshot／freshness。資料足夠時不在 request 內抓站；可用但過期時只寫入 durable crawl 與 source-due schedule；真正不足時才使用受 `max_pages=6`、`max_candidate_urls=16`、`max_depth=1`、`max_seconds=8`、公告 detail 最多 4 筆限制的官方 live fallback。設定集中於 `data/sources/announcements.yaml` 的 `keyword_search.completeness_policy`，其 refresh schedule 上限獨立固定為 220（超限明確失敗、不靜默截斷）；可改為 `shadow` 觀測或 `off` 作緊急 rollback；詳細 decision reason 與 PostgreSQL acceptance 見 `docs/architecture.md` 與 `docs/testing.md`。
+
 若要執行真正的 PostgreSQL/pgvector 整合流程（不使用 SQLite）：
 
 ```powershell

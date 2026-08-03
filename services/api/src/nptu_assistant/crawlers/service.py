@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, cast
 
 from nptu_assistant.api.schemas import CrawlSummary
 from nptu_assistant.crawlers.adapters.factory import build_adapter
@@ -24,12 +25,36 @@ class AnnouncementRepository(Protocol):
         crawled_at: datetime,
     ) -> list[str]: ...
 
+    def merge_source_announcements(
+        self,
+        candidates: list[AnnouncementCandidate],
+        *,
+        source_name: str,
+        source_url: str,
+        source_unit: str,
+        interval_minutes: int,
+        crawled_at: datetime,
+        advance_freshness: bool = False,
+    ) -> list[str]: ...
+
+
+class SourceRefreshLease(Protocol):
+    def __enter__(self) -> object: ...
+
+    def __exit__(
+        self,
+        exc_type: object,
+        exc_value: object,
+        traceback: object,
+    ) -> None: ...
+
 
 @dataclass(frozen=True, slots=True)
 class CrawlRunResult:
     summary: CrawlSummary
     canonical_urls: dict[str, tuple[str, ...]]
     persisted_source_snapshots: frozenset[str] = frozenset()
+    partial_source_snapshots: frozenset[str] = frozenset()
 
 
 class CrawlerService:
@@ -53,6 +78,7 @@ class CrawlerService:
         summary = CrawlSummary()
         canonical_urls: dict[str, tuple[str, ...]] = {}
         persisted_source_snapshots: set[str] = set()
+        partial_source_snapshots: set[str] = set()
         reset_robots = getattr(self._http, "reset_robots", None)
         if callable(reset_robots):
             reset_robots()
@@ -73,8 +99,38 @@ class CrawlerService:
         ]
         for config in selected:
             try:
-                canonical_urls[config.name] = self._crawl_source(config, summary)
-                persisted_source_snapshots.add(config.name)
+                acquire = cast(
+                    Callable[[str], SourceRefreshLease | None] | None,
+                    getattr(
+                        self._repository,
+                        "try_acquire_source_refresh_lease",
+                        None,
+                    ),
+                )
+                lease = acquire(config.name) if acquire is not None else None
+                if acquire is not None and lease is None:
+                    summary.failed += 1
+                    summary.errors.append(
+                        f"{config.name}: source refresh 已由其他 worker 執行"
+                    )
+                    continue
+                if lease is None:
+                    urls, source_snapshot_persisted = self._crawl_source(
+                        config, summary
+                    )
+                else:
+                    with lease:
+                        urls, source_snapshot_persisted = self._crawl_source(
+                            config,
+                            summary,
+                        )
+                canonical_urls[config.name] = urls
+                if source_snapshot_persisted:
+                    persisted_source_snapshots.add(config.name)
+                else:
+                    partial_source_snapshots.add(config.name)
+                    summary.failed += 1
+                    summary.errors.append(f"{config.name}: 公告詳情未完整取得")
             except Exception as exc:
                 summary.failed += 1
                 summary.errors.append(f"{config.name}: {type(exc).__name__}: {exc}")
@@ -82,13 +138,15 @@ class CrawlerService:
             summary,
             canonical_urls,
             frozenset(persisted_source_snapshots),
+            frozenset(partial_source_snapshots),
         )
 
     def _crawl_source(
         self,
         config: CrawlerSourceConfig,
         summary: CrawlSummary,
-    ) -> tuple[str, ...]:
+    ) -> tuple[tuple[str, ...], bool]:
+        crawl_started_at = datetime.now(timezone.utc)
         adapter = build_adapter(config)
         if config.adapter == "fixture":
             fixture_path = self._workspace_root / config.url
@@ -109,6 +167,7 @@ class CrawlerService:
         else:
             listing = self._http.get(config.url)
         resolved_candidates: list[AnnouncementCandidate] = []
+        detail_failed = False
         for candidate in adapter.parse_listing(listing)[: config.max_items]:
             resolved = candidate
             if config.adapter == "fixture" and self._detail_enabled(config):
@@ -132,6 +191,7 @@ class CrawlerService:
                     )
                     resolved = self._with_body(candidate, adapter.parse_detail(detail))
                 except Exception:
+                    detail_failed = True
                     resolved = self._with_warning(
                         candidate, "公告詳情暫時無法取得，使用列表內容"
                     )
@@ -142,21 +202,34 @@ class CrawlerService:
             if config.adapter == "fixture" and resolved_candidates
             else config.url
         )
-        results = self._repository.commit_source_refresh(
-            resolved_candidates,
-            source_name=config.name,
-            source_url=source_url,
-            source_unit=config.unit,
-            interval_minutes=config.crawl_interval_minutes,
-            crawled_at=datetime.now(timezone.utc),
-        )
+        if detail_failed:
+            results = self._repository.merge_source_announcements(
+                resolved_candidates,
+                source_name=config.name,
+                source_url=source_url,
+                source_unit=config.unit,
+                interval_minutes=config.crawl_interval_minutes,
+                crawled_at=crawl_started_at,
+                advance_freshness=False,
+            )
+        else:
+            results = self._repository.commit_source_refresh(
+                resolved_candidates,
+                source_name=config.name,
+                source_url=source_url,
+                source_unit=config.unit,
+                interval_minutes=config.crawl_interval_minutes,
+                # Snapshot order is based on crawl start, not completion, so
+                # a delayed stale worker cannot overwrite a newer run.
+                crawled_at=crawl_started_at,
+            )
         if len(results) != len(resolved_candidates):
             raise RuntimeError("announcement repository 回傳的批次結果數量不一致")
         canonical_urls: list[str] = []
         for resolved, result in zip(resolved_candidates, results, strict=True):
             setattr(summary, result, getattr(summary, result) + 1)
             canonical_urls.append(resolved.canonical_url)
-        return tuple(dict.fromkeys(canonical_urls))
+        return tuple(dict.fromkeys(canonical_urls)), not detail_failed
 
     @staticmethod
     def _detail_enabled(config: CrawlerSourceConfig) -> bool:

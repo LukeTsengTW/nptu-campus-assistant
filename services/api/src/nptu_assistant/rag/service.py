@@ -11,6 +11,9 @@ from nptu_assistant.api.schemas import (
     SourceReference,
 )
 from nptu_assistant.crawlers.resolution import UnitSourceResolver
+from nptu_assistant.crawlers.site_models import SearchExecutionLimits
+from nptu_assistant.rag.completeness import DbFirstCompletenessPolicy
+from nptu_assistant.rag.completeness_refresh import CompletenessRefreshScheduler
 from nptu_assistant.rag.models import (
     ConversationContext,
     Evidence,
@@ -21,6 +24,7 @@ from nptu_assistant.rag.models import (
 from nptu_assistant.rag.prompts import SYSTEM_INSTRUCTIONS
 from nptu_assistant.rag.tools import (
     AnnouncementRefresher,
+    CompletenessFactsProvider,
     KeywordAnnouncementIngestor,
     SitePageIngestor,
     StructuredRetriever,
@@ -101,6 +105,11 @@ class ChatService:
         keyword_announcement_ingestor: KeywordAnnouncementIngestor | None = None,
         unit_source_resolver: UnitSourceResolver | None = None,
         site_page_ingestor: SitePageIngestor | None = None,
+        completeness_policy: DbFirstCompletenessPolicy | None = None,
+        completeness_facts: CompletenessFactsProvider | None = None,
+        refresh_scheduler: CompletenessRefreshScheduler | None = None,
+        live_fallback_limits: SearchExecutionLimits | None = None,
+        live_fallback_max_seconds: float | None = None,
     ) -> None:
         self._llm = llm
         self._conversation_store = conversation_store
@@ -110,6 +119,11 @@ class ChatService:
             keyword_announcement_ingestor,
             unit_source_resolver,
             site_page_ingestor,
+            completeness_policy,
+            completeness_facts,
+            refresh_scheduler,
+            live_fallback_limits,
+            live_fallback_max_seconds,
         )
 
     def delete_conversation(self, conversation_id: str) -> bool:
@@ -125,6 +139,7 @@ class ChatService:
         tool_events: list[dict[str, object]] = []
         tool_warnings: list[str] = []
         tool_rounds = 0
+        request_deadline = self._tool_executor.new_deadline()
 
         while True:
             turn = self._llm.create_turn(
@@ -143,7 +158,11 @@ class ChatService:
                     )
                 tool_rounds += 1
                 for call in calls:
-                    result = self._tool_executor.execute(call.name, call.arguments)
+                    result = self._tool_executor.execute(
+                        call.name,
+                        call.arguments,
+                        deadline=request_deadline,
+                    )
                     for item in result.evidence:
                         evidence_by_id[item.id] = item
                     if result.warning and result.warning not in tool_warnings:

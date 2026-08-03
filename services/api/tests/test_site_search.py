@@ -344,14 +344,13 @@ class MemoryAnnouncementRepository:
         candidates: list[AnnouncementCandidate],
         **kwargs: object,
     ) -> list[str]:
-        assert len(candidates) == 1
-        candidate = candidates[0]
-        if candidate.canonical_url in self.fail_urls:
+        if any(candidate.canonical_url in self.fail_urls for candidate in candidates):
             raise RuntimeError("persistence failed")
-        self.items[candidate.canonical_url] = candidate
-        self.order.append(candidate.canonical_url)
+        for candidate in candidates:
+            self.items[candidate.canonical_url] = candidate
+            self.order.append(candidate.canonical_url)
         self.source_names.append(str(kwargs["source_name"]))
-        return ["created"]
+        return ["created" for _candidate in candidates]
 
 
 class ScopedSearchFixture:
@@ -451,10 +450,7 @@ def test_scoped_announcements_fetch_details_sort_and_persist_only_dated_items() 
     assert result.undated_count == 1
     assert result.warning == SITE_SEARCH_PARTIAL_WARNING
     assert set(result.canonical_urls) == set(repository.items)
-    assert repository.source_names == [
-        "unit-scoped:資訊工程學系",
-        "unit-scoped:資訊工程學系",
-    ]
+    assert repository.source_names == ["unit-scoped:資訊工程學系"]
 
     service.search_unit_announcements(
         SearchPlan.from_query("資訊工程學系 最新公告", limit=3),
@@ -486,9 +482,9 @@ def test_scoped_announcements_fetch_details_sort_and_persist_only_dated_items() 
         deadline=SearchDeadline.after(10),
         sort="newest",
     )
-    assert partial.canonical_urls == (ai_url,)
-    assert partial.failed_count == 1
-    assert partial.warning == SITE_SEARCH_PARTIAL_WARNING
+    assert partial.canonical_urls == ()
+    assert partial.failed_count == 2
+    assert partial.warning == SITE_SEARCH_FAILURE_WARNING
 
     failed_repository = MemoryAnnouncementRepository(fail_urls={new_url, ai_url})
     failed_service = SitePageIngestionService(

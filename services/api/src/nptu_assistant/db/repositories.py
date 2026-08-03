@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import date, datetime, timezone
 from uuid import UUID
 from urllib.parse import urlsplit
@@ -21,6 +22,46 @@ from nptu_assistant.db.models import (
 from nptu_assistant.ingestion.chunking import TextChunk
 from nptu_assistant.ingestion.cleaning import content_hash
 from nptu_assistant.ingestion.metadata import DocumentMetadata
+
+
+logger = logging.getLogger(__name__)
+
+
+class SourceRefreshLease:
+    """A PostgreSQL session advisory lock held across one source HTTP crawl."""
+
+    def __init__(self, session: Session, key: str) -> None:
+        self._session = session
+        self._key = key
+        self._released = False
+
+    def __enter__(self) -> SourceRefreshLease:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.release()
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        try:
+            self._session.execute(
+                text("SELECT pg_advisory_unlock(hashtextextended(:key, 0))"),
+                {"key": self._key},
+            )
+        except Exception:
+            logger.exception("來源 refresh advisory lock 釋放失敗")
+        finally:
+            self._session.close()
+
+
+class _NoopSourceRefreshLease:
+    def __enter__(self) -> _NoopSourceRefreshLease:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        return None
 
 
 def _base_url(url: str) -> str:
@@ -554,6 +595,7 @@ def _upsert_announcement(
     source: Source,
     now: datetime,
     completeness: tuple[int, ...] | tuple[bool, bool, bool] | None = None,
+    advance_last_crawled_at: bool = True,
 ) -> str:
     digest = content_hash("\n".join([candidate.title, candidate.body]))
     existing = session.scalar(
@@ -566,7 +608,8 @@ def _upsert_announcement(
             completeness is not None and len(existing.body.strip()) > completeness[0]
         )
         if incoming_is_weaker:
-            existing.last_crawled_at = now
+            if advance_last_crawled_at:
+                existing.last_crawled_at = now
             return "unchanged"
         if not incoming_is_weaker:
             existing.title = candidate.title
@@ -576,7 +619,8 @@ def _upsert_announcement(
             existing.deadline_at = candidate.deadline_at
             existing.body = candidate.body
             existing.warning = candidate.warning
-        existing.last_crawled_at = now
+        if advance_last_crawled_at:
+            existing.last_crawled_at = now
         if existing.content_hash == digest:
             return "unchanged"
         existing.content_hash = digest
@@ -613,6 +657,7 @@ def _upsert_announcement(
             source,
             now,
             completeness=completeness,
+            advance_last_crawled_at=advance_last_crawled_at,
         )
     return "created"
 
@@ -656,8 +701,44 @@ class SqlAnnouncementRepository:
                 crawl_enabled=True,
                 crawl_interval_minutes=interval_minutes,
             )
+            if (
+                source.last_successful_crawl_at is not None
+                and source.last_successful_crawl_at > crawled_at
+            ):
+                return
             source.canonical_urls = list(dict.fromkeys(canonical_urls))
             source.last_successful_crawl_at = crawled_at
+
+    def try_acquire_source_refresh_lease(
+        self, source_name: str
+    ) -> SourceRefreshLease | _NoopSourceRefreshLease | None:
+        """Fence a whole source crawl before it performs any external HTTP.
+
+        This is deliberately a session-scoped PostgreSQL advisory lock rather
+        than a transaction lock: the lease spans listing/detail fetches and is
+        released in ``finally`` by the refresh coordinator.  Persisted source
+        snapshots retain their transaction lock and monotonic watermark check.
+        """
+
+        session = self._factory()
+        if session.get_bind().dialect.name != "postgresql":
+            session.close()
+            return _NoopSourceRefreshLease()
+        key = f"nptu-source-refresh:{source_name}"
+        try:
+            acquired = bool(
+                session.scalar(
+                    text("SELECT pg_try_advisory_lock(hashtextextended(:key, 0))"),
+                    {"key": key},
+                )
+            )
+        except Exception:
+            session.close()
+            raise
+        if not acquired:
+            session.close()
+            return None
+        return SourceRefreshLease(session, key)
 
     def upsert(
         self,
@@ -718,6 +799,11 @@ class SqlAnnouncementRepository:
                 crawl_enabled=True,
                 crawl_interval_minutes=interval_minutes,
             )
+            if (
+                source.last_successful_crawl_at is not None
+                and source.last_successful_crawl_at > crawled_at
+            ):
+                return ["unchanged"] * len(candidates)
             results = [
                 _upsert_announcement(session, candidate, source, crawled_at)
                 for candidate in candidates
@@ -737,8 +823,15 @@ class SqlAnnouncementRepository:
         source_unit: str,
         interval_minutes: int,
         crawled_at: datetime,
+        advance_freshness: bool = False,
     ) -> list[str]:
-        """Upsert a bounded scoped result without evicting the source cache."""
+        """Upsert a bounded scoped result without evicting the source cache.
+
+        A partially fetched listing may persist the candidates that were
+        successfully parsed, but it must not advance the source freshness
+        watermark.  Otherwise a later DB-first query could treat an incomplete
+        source as fresh and incorrectly skip recovery.
+        """
         with self._factory.begin() as session:
             source = get_or_create_source(
                 session,
@@ -750,13 +843,23 @@ class SqlAnnouncementRepository:
                 crawl_interval_minutes=interval_minutes,
             )
             results = [
-                _upsert_announcement(session, candidate, source, crawled_at)
+                _upsert_announcement(
+                    session,
+                    candidate,
+                    source,
+                    crawled_at,
+                    advance_last_crawled_at=advance_freshness,
+                )
                 for candidate in candidates
             ]
-            existing_urls = [str(url) for url in (source.canonical_urls or [])]
-            candidate_urls = [candidate.canonical_url for candidate in candidates]
-            source.canonical_urls = list(dict.fromkeys(existing_urls + candidate_urls))
-            source.last_successful_crawl_at = crawled_at
+            if advance_freshness:
+                # Only a caller that has parsed a whole listing may advance a
+                # source snapshot.  Scoped/live subsets must leave both the
+                # watermark and its canonical URL snapshot untouched.
+                source.canonical_urls = list(
+                    dict.fromkeys(candidate.canonical_url for candidate in candidates)
+                )
+                source.last_successful_crawl_at = crawled_at
             return results
 
     def upsert_incremental_announcement(

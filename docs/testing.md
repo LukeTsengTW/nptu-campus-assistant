@@ -37,6 +37,16 @@ uv run pytest ../../tests/integration
 
 未設定 `RUN_POSTGRES_INTEGRATION=1` 時，該組測試會明確顯示 skipped，不會改用 SQLite。GitHub Actions 會啟動 `pgvector/pgvector:pg17`，執行兩次 migration、兩次 seed、完整整合測試、OpenAPI drift 檢查與 Extension test/build。
 
+P4 DB-first completeness acceptance 使用真實 PostgreSQL schema、`SqlRetriever`、`SitePage`、`Document`、`SqlRetrievalCompletenessFacts` 與 `SqlCrawlSchedulerRepository`；不會連線 NPTU 官網：
+
+```powershell
+$env:RUN_POSTGRES_INTEGRATION="1"
+cd services/api
+uv run pytest ../../tests/integration/test_p4_completeness.py --import-mode=importlib -q -rP
+```
+
+此組驗證 fresh warm DB 不進入 live ingestion、fresh scoped announcement 直接讀取已持久化 source snapshot、soft-stale evidence 只以 durable conditional update 排程、active lease 不競爭 live ingestion，以及 truly insufficient document 只使用 bounded fixture HTTP fallback。它還會建立 10,000 `site_pages`、5,000 current Documents、1,000 superseded Documents、2,000 announcements、20 hosts 與 100-query workload，輸出 production completeness facts SQL 的 `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)`、statement count 與 p50/p95。`services/api/tests/test_completeness_policy.py`、`test_completeness_facts.py` 和 `test_db_first_tools.py` 另覆蓋 false-complete matrix、snapshot/detail freshness、deadline、active lease、terminal incomplete、shadow/enforce 與 bounded document/announcement fallback；未設定 PostgreSQL 時 integration skip 不是 acceptance 通過。
+
 所有自動化測試使用 Fake LLM 與 Fake Embedding Provider。live OpenAI 與 NPTU smoke tests 必須另外標示，不能成為預設測試的必要條件。
 
 一般官方網頁搜尋的主要回歸測試在 `tests/test_semantic_site_search.py`，使用固定 HTML fixture、deterministic embedding provider 與 fake discovery，覆蓋中文無空格、不同用語、對話追問、父頁面相關性傳遞、warning 語意、正常零結果、外部 URL／資源拒絕與禁止招生種類專用 production branch；預設測試不依賴 NPTU live network。

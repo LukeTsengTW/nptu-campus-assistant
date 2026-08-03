@@ -80,6 +80,12 @@ jobs:
           tests/integration/test_site_map.py
           --import-mode=importlib -q -rP
 
+      - name: P4 DB-first completeness acceptance
+        run: >-
+          uv run --project services/api pytest
+          tests/integration/test_p4_completeness.py
+          --import-mode=importlib -q -rP
+
       - name: Verify generated API contracts
         run: |
           uv run --project services/api nptu-assistant export-openapi --output packages/shared/openapi.json

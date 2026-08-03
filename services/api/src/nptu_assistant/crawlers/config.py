@@ -262,6 +262,42 @@ class SiteSearchConfig(BaseModel):
         return self
 
 
+class DbFirstCompletenessConfig(BaseModel):
+    """Central P4 request-path policy and bounded fallback settings."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    rollout_mode: Literal["off", "shadow", "enforce"] = "enforce"
+    live_fallback_enabled: bool = True
+    min_strong_evidence: int = Field(default=2, ge=1, le=20)
+    exact_scope_min_score: float = Field(default=0.82, ge=0, le=1)
+    minimum_score_margin: float = Field(default=0.04, ge=0, le=1)
+    minimum_source_coverage_ratio: float = Field(default=0.60, ge=0, le=1)
+    minimum_remaining_deadline_seconds: float = Field(default=2.0, ge=0, le=30)
+    document_soft_stale_minutes: int = Field(default=360, ge=1, le=43_200)
+    document_hard_stale_minutes: int = Field(default=1_440, ge=1, le=86_400)
+    announcement_soft_stale_minutes: int = Field(default=90, ge=1, le=43_200)
+    announcement_hard_stale_minutes: int = Field(default=360, ge=1, le=86_400)
+    live_fallback_max_pages: int = Field(default=6, ge=1, le=8)
+    live_fallback_max_candidate_urls: int = Field(default=16, ge=1, le=20)
+    live_fallback_max_depth: int = Field(default=1, ge=0, le=1)
+    live_fallback_max_seconds: float = Field(default=8.0, ge=1, le=30)
+    live_fallback_max_details: int = Field(default=4, ge=1, le=8)
+    refresh_schedule_max_targets: int = Field(default=220, ge=1, le=256)
+
+    @model_validator(mode="after")
+    def validate_freshness_windows(self) -> "DbFirstCompletenessConfig":
+        if self.document_soft_stale_minutes > self.document_hard_stale_minutes:
+            raise ValueError("文件 soft stale 不得晚於 hard stale")
+        if self.announcement_soft_stale_minutes > self.announcement_hard_stale_minutes:
+            raise ValueError("公告 soft stale 不得晚於 hard stale")
+        if self.live_fallback_max_candidate_urls < self.live_fallback_max_pages:
+            raise ValueError("live fallback candidate 上限不得低於 page 上限")
+        if self.refresh_schedule_max_targets < self.live_fallback_max_candidate_urls:
+            raise ValueError("背景排程 target 上限不得低於 live candidate 上限")
+        return self
+
+
 class KeywordSearchConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
@@ -278,6 +314,9 @@ class KeywordSearchConfig(BaseModel):
     source_routes: dict[str, str] = Field(default_factory=dict)
     crawl_interval_minutes: int = Field(default=60, ge=1)
     site_search: SiteSearchConfig | None = None
+    completeness_policy: DbFirstCompletenessConfig = Field(
+        default_factory=DbFirstCompletenessConfig
+    )
 
     @field_validator("session_url", "bootstrap_url", "url")
     @classmethod

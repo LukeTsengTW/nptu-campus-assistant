@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import date
-from typing import Protocol
+import inspect
+from typing import Any, Protocol, cast
 
 from nptu_assistant.api.schemas import CrawlSummary
 from nptu_assistant.crawlers.aliases import AliasNormalizer
@@ -17,6 +18,11 @@ from nptu_assistant.crawlers.models import AnnouncementCandidate
 from nptu_assistant.crawlers.site_search import (
     NptuSiteSearchService,
     site_page_to_announcement_result,
+)
+from nptu_assistant.crawlers.site_models import (
+    SearchDeadline,
+    SearchDeadlineExceeded,
+    SearchExecutionLimits,
 )
 
 
@@ -62,9 +68,23 @@ class AnnouncementRepository(Protocol):
 
 
 class SearchHttpClient(Protocol):
-    def get(self, url: str) -> str: ...
+    def get(
+        self,
+        url: str,
+        *,
+        timeout_seconds: float | None = None,
+        deadline: SearchDeadline | None = None,
+    ) -> str: ...
 
-    def submit_form(self, method: str, url: str, fields: Mapping[str, str]) -> str: ...
+    def submit_form(
+        self,
+        method: str,
+        url: str,
+        fields: Mapping[str, str],
+        *,
+        timeout_seconds: float | None = None,
+        deadline: SearchDeadline | None = None,
+    ) -> str: ...
 
 
 class KeywordAnnouncementSearchService:
@@ -86,12 +106,49 @@ class KeywordAnnouncementSearchService:
     def normalize(self, text: str) -> str:
         return self._resolver.normalize(text)
 
-    def _load_form(self) -> SearchForm:
-        self._http.get(self._config.session_url)
-        bootstrap_content = self._http.submit_form(
+    def _request_kwargs(
+        self,
+        method: Callable[..., object],
+        deadline: SearchDeadline | None,
+    ) -> dict[str, Any]:
+        if deadline is None:
+            return {}
+        deadline.raise_if_expired()
+        parameters = inspect.signature(method).parameters
+        kwargs: dict[str, object] = {}
+        if "timeout_seconds" in parameters:
+            kwargs["timeout_seconds"] = deadline.remaining_seconds()
+        if "deadline" in parameters:
+            kwargs["deadline"] = deadline
+        return kwargs
+
+    def _get(self, url: str, *, deadline: SearchDeadline | None) -> str:
+        method = cast(Callable[..., str], self._http.get)
+        return method(url, **self._request_kwargs(method, deadline))
+
+    def _submit_form(
+        self,
+        method: str,
+        url: str,
+        fields: Mapping[str, str],
+        *,
+        deadline: SearchDeadline | None,
+    ) -> str:
+        submit = cast(Callable[..., str], self._http.submit_form)
+        return submit(
+            method,
+            url,
+            fields,
+            **self._request_kwargs(submit, deadline),
+        )
+
+    def _load_form(self, *, deadline: SearchDeadline | None = None) -> SearchForm:
+        self._get(self._config.session_url, deadline=deadline)
+        bootstrap_content = self._submit_form(
             self._config.bootstrap_method,
             self._config.bootstrap_url,
             {},
+            deadline=deadline,
         )
         bootstrap = self._adapter.parse_bootstrap_form(
             bootstrap_content,
@@ -105,7 +162,12 @@ class KeywordAnnouncementSearchService:
         )
 
     def ingest(
-        self, query: str, *, max_items: int | None = None
+        self,
+        query: str,
+        *,
+        max_items: int | None = None,
+        deadline: SearchDeadline | None = None,
+        limits: SearchExecutionLimits | None = None,
     ) -> KeywordIngestionResult:
         expansion = self._resolver.expand(query)
         summary = CrawlSummary()
@@ -117,28 +179,41 @@ class KeywordAnnouncementSearchService:
         form: SearchForm | None = None
         successful_searches = 0
         try:
-            form = self._load_form()
+            form = self._load_form(deadline=deadline)
         except Exception as exc:
             summary.failed = 1
             summary.errors.append(f"官方搜尋表單無法載入：{type(exc).__name__}")
 
         results: list[AnnouncementSearchResult] = []
         if form is not None:
-            for search_term in expansion.search_terms:
-                for search_type in self._config.search_types:
+            search_terms = (
+                expansion.search_terms[:1]
+                if limits is not None
+                else expansion.search_terms
+            )
+            search_types = (
+                self._config.search_types[:2]
+                if limits is not None
+                else self._config.search_types
+            )
+            for search_term in search_terms:
+                for search_type in search_types:
                     last_error: Exception | None = None
                     for _attempt in range(2):
                         try:
                             if form is None:
-                                form = self._load_form()
+                                form = self._load_form(deadline=deadline)
                             if search_type not in form.search_types:
                                 raise ValueError(f"官網搜尋表單缺少分類：{search_type}")
                             fields = dict(form.hidden_fields)
                             fields.update(
                                 {"SchKey": search_term, "SchType": search_type}
                             )
-                            content = self._http.submit_form(
-                                form.method, form.action_url, fields
+                            content = self._submit_form(
+                                form.method,
+                                form.action_url,
+                                fields,
+                                deadline=deadline,
                             )
                             parsed_results = self._adapter.parse_results(
                                 content, form.action_url
@@ -153,6 +228,8 @@ class KeywordAnnouncementSearchService:
                         except Exception as exc:
                             last_error = exc
                             form = None
+                            if isinstance(exc, SearchDeadlineExceeded):
+                                break
                     else:
                         summary.failed += 1
                         error_name = (
@@ -160,12 +237,14 @@ class KeywordAnnouncementSearchService:
                         )
                         summary.errors.append(f"{search_type} 搜尋失敗：{error_name}")
 
-        if self._site_searcher is not None:
+        if self._site_searcher is not None and not (deadline and deadline.expired()):
             try:
                 site_result = self._site_searcher.search(
                     expansion.retrieval_query,
                     max_items=item_limit,
                     use_discovery=False,
+                    deadline=deadline,
+                    limits=limits,
                 )
                 results.extend(
                     site_page_to_announcement_result(
@@ -200,6 +279,10 @@ class KeywordAnnouncementSearchService:
 
         ingested_urls: list[str] = []
         for result in ordered:
+            if deadline is not None and deadline.expired():
+                summary.failed += 1
+                summary.errors.append("公告搜尋時間額度已耗盡")
+                break
             if result.published_at is None:
                 summary.failed += 1
                 summary.errors.append(f"公告缺少發布日期：{result.title}")
@@ -207,7 +290,9 @@ class KeywordAnnouncementSearchService:
             warning: str | None = None
             body = result.body
             try:
-                body = self._adapter.parse_detail(self._http.get(result.canonical_url))
+                body = self._adapter.parse_detail(
+                    self._get(result.canonical_url, deadline=deadline)
+                )
             except Exception:
                 warning = "公告詳情暫時無法取得，已保留搜尋結果摘要。"
             candidate = AnnouncementCandidate(

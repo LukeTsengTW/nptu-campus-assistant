@@ -4,10 +4,11 @@ import inspect
 import json
 import logging
 import re
+import time
 import uuid
-from collections.abc import Collection
+from collections.abc import Callable, Collection
 from dataclasses import dataclass, replace
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from enum import StrEnum
 from typing import Any, Protocol, cast
 
@@ -38,6 +39,7 @@ from nptu_assistant.crawlers.site_search import (
 from nptu_assistant.crawlers.site_models import (
     SearchDeadline,
     SearchDeadlineExceeded,
+    SearchExecutionLimits,
     SearchPlan,
 )
 from nptu_assistant.crawlers.unit_intents import (
@@ -47,9 +49,23 @@ from nptu_assistant.crawlers.unit_intents import (
 )
 from nptu_assistant.rag.models import Evidence
 from nptu_assistant.rag.embedding_cache import RetrievalExecutionContext
+from nptu_assistant.rag.completeness import (
+    CompletenessAction,
+    CompletenessDecision,
+    CompletenessFacts,
+    CompletenessMode,
+    DbFirstCompletenessPolicy,
+    QueryIntent,
+)
+from nptu_assistant.rag.completeness_refresh import (
+    CompletenessRefreshScheduler,
+    RefreshScheduleResult,
+)
 
 
 logger = logging.getLogger(__name__)
+
+DB_REFRESH_SCHEDULED_WARNING = "以下內容來自已收錄的官方資料，背景更新已排程。"
 
 
 class AnnouncementSort(StrEnum):
@@ -204,7 +220,14 @@ class AnnouncementRefresher(Protocol):
 
 
 class KeywordAnnouncementIngestor(Protocol):
-    def ingest(self, query: str, *, max_items: int) -> KeywordIngestionResult:
+    def ingest(
+        self,
+        query: str,
+        *,
+        max_items: int,
+        deadline: SearchDeadline | None = None,
+        limits: SearchExecutionLimits | None = None,
+    ) -> KeywordIngestionResult:
         raise NotImplementedError
 
     def normalize(self, text: str) -> str:
@@ -225,6 +248,7 @@ class SitePageIngestor(Protocol):
         max_items: int,
         deadline: SearchDeadline,
         scope: DocumentSearchScope | None = None,
+        limits: SearchExecutionLimits | None = None,
     ) -> SitePageIngestionResult:
         raise NotImplementedError
 
@@ -237,8 +261,38 @@ class SitePageIngestor(Protocol):
         deadline: SearchDeadline,
         sort: object = "newest",
         topic: str | None = None,
+        limits: SearchExecutionLimits | None = None,
     ) -> ScopedAnnouncementIngestionResult:
         raise NotImplementedError
+
+
+class CompletenessFactsProvider(Protocol):
+    def document_facts(
+        self,
+        evidence: Collection[Evidence],
+        *,
+        scope: DocumentSearchScope | None,
+        now: datetime,
+        strong_score: float,
+        min_content_chars: int,
+        soft_stale: timedelta,
+        hard_stale: timedelta,
+        deadline: SearchDeadline | None = None,
+    ) -> CompletenessFacts: ...
+
+    def announcement_facts(
+        self,
+        evidence: Collection[Evidence],
+        *,
+        unit: str | None,
+        now: datetime,
+        strong_score: float,
+        min_content_chars: int,
+        soft_stale: timedelta,
+        hard_stale: timedelta,
+        source_target_limit: int = 20,
+        deadline: SearchDeadline | None = None,
+    ) -> CompletenessFacts: ...
 
 
 _GENERIC_ANNOUNCEMENT_PHRASES = frozenset(
@@ -352,12 +406,24 @@ class ToolExecutor:
         keyword_ingestor: KeywordAnnouncementIngestor | None = None,
         unit_resolver: UnitSourceResolver | None = None,
         site_page_ingestor: SitePageIngestor | None = None,
+        completeness_policy: DbFirstCompletenessPolicy | None = None,
+        completeness_facts: CompletenessFactsProvider | None = None,
+        refresh_scheduler: CompletenessRefreshScheduler | None = None,
+        live_fallback_limits: SearchExecutionLimits | None = None,
+        live_fallback_max_seconds: float | None = None,
+        now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ) -> None:
         self._retriever = retriever
         self._refresher = refresher
         self._keyword_ingestor = keyword_ingestor
         self._unit_resolver = unit_resolver
         self._site_page_ingestor = site_page_ingestor
+        self._completeness_policy = completeness_policy
+        self._completeness_facts = completeness_facts
+        self._refresh_scheduler = refresh_scheduler
+        self._live_fallback_limits = live_fallback_limits
+        self._live_fallback_max_seconds = live_fallback_max_seconds
+        self._now = now
 
     def _resolve_unit(
         self,
@@ -397,6 +463,260 @@ class ToolExecutor:
             )
         return resolution
 
+    def _is_enforcing_policy(self) -> bool:
+        return bool(
+            self._completeness_policy
+            and self._completeness_policy.config.rollout_mode
+            is CompletenessMode.ENFORCE
+        )
+
+    def _is_shadow_policy(self) -> bool:
+        return bool(
+            self._completeness_policy
+            and self._completeness_policy.config.rollout_mode is CompletenessMode.SHADOW
+        )
+
+    def _bounded_keyword_ingest(
+        self,
+        query: str,
+        *,
+        max_items: int,
+        deadline: SearchDeadline,
+    ) -> KeywordIngestionResult:
+        if self._keyword_ingestor is None:
+            raise RuntimeError("keyword announcement ingestor 未設定")
+        method = cast(Any, self._keyword_ingestor.ingest)
+        kwargs: dict[str, object] = {"max_items": max_items}
+        parameters = inspect.signature(method).parameters
+        if "deadline" in parameters:
+            kwargs["deadline"] = deadline
+        if "limits" in parameters and self._live_fallback_limits is not None:
+            kwargs["limits"] = self._live_fallback_limits
+        return cast(KeywordIngestionResult, method(query, **kwargs))
+
+    def new_deadline(self) -> SearchDeadline | None:
+        """Create the single absolute request deadline when live search exists."""
+
+        if self._site_page_ingestor is None:
+            return None
+        return self._site_page_ingestor.new_deadline()
+
+    @staticmethod
+    def _filter_announcement_unit(
+        evidence: Collection[Evidence],
+        unit: str | None,
+    ) -> list[Evidence]:
+        if unit is None:
+            return list(evidence)
+        return [item for item in evidence if item.unit == unit]
+
+    def _fallback_facts(
+        self,
+        evidence: Collection[Evidence],
+        *,
+        exact_scope: bool,
+    ) -> CompletenessFacts:
+        policy = self._completeness_policy
+        if policy is None or policy.config.rollout_mode is CompletenessMode.OFF:
+            return CompletenessFacts()
+        config = policy.config
+        scores = sorted((item.score for item in evidence), reverse=True)
+        strong = sum(
+            item.score >= config.exact_scope_min_score
+            and len(item.content.strip()) >= 160
+            for item in evidence
+        )
+        return CompletenessFacts(
+            evidence_count=len(evidence),
+            unique_url_count=len({item.url for item in evidence}),
+            strong_evidence_count=strong,
+            top_score=scores[0] if scores else 0.0,
+            score_margin=(
+                scores[0] - scores[1]
+                if len(scores) > 1
+                else (scores[0] if scores else 0.0)
+            ),
+            current_document_count=len(evidence),
+            exact_scope_match_count=len(evidence) if exact_scope else 0,
+            fresh_count=len(evidence),
+            content_hash_in_sync_count=len(evidence),
+            source_coverage_ratio=1.0 if evidence else 0.0,
+            canonical_urls=tuple(dict.fromkeys(item.url for item in evidence)),
+        )
+
+    def _document_completeness_decision(
+        self,
+        evidence: Collection[Evidence],
+        *,
+        scope: DocumentSearchScope | None,
+        deadline: SearchDeadline,
+    ) -> CompletenessDecision | None:
+        policy = self._completeness_policy
+        if policy is None or policy.config.rollout_mode is CompletenessMode.OFF:
+            return None
+        started_at = time.perf_counter()
+        config = policy.config
+        if self._completeness_facts is None:
+            facts = self._fallback_facts(evidence, exact_scope=scope is not None)
+        else:
+            facts = self._completeness_facts.document_facts(
+                evidence,
+                scope=scope,
+                now=self._now(),
+                strong_score=config.exact_scope_min_score,
+                min_content_chars=160,
+                soft_stale=timedelta(minutes=config.document_soft_stale_minutes),
+                hard_stale=timedelta(minutes=config.document_hard_stale_minutes),
+                deadline=deadline,
+            )
+        return self._record_completeness_decision(
+            policy.decide(
+                facts=facts,
+                intent=(
+                    QueryIntent.SCOPED_TOPIC if scope is not None else QueryIntent.TOPIC
+                ),
+                remaining_deadline_seconds=deadline.remaining_seconds(),
+            ),
+            facts=facts,
+            query_kind="document",
+            query_intent="scoped" if scope is not None else "topic",
+            canonical_unit=scope.canonical_unit if scope is not None else None,
+            policy_duration_ms=(time.perf_counter() - started_at) * 1_000,
+        )
+
+    def _announcement_completeness_decision(
+        self,
+        evidence: Collection[Evidence],
+        *,
+        unit: str | None,
+        intent: QueryIntent,
+        deadline: SearchDeadline | None,
+    ) -> CompletenessDecision | None:
+        policy = self._completeness_policy
+        if policy is None or policy.config.rollout_mode is CompletenessMode.OFF:
+            return None
+        started_at = time.perf_counter()
+        config = policy.config
+        if self._completeness_facts is None:
+            facts = self._fallback_facts(evidence, exact_scope=unit is not None)
+        else:
+            facts = self._completeness_facts.announcement_facts(
+                evidence,
+                unit=unit,
+                now=self._now(),
+                strong_score=config.exact_scope_min_score,
+                min_content_chars=40,
+                soft_stale=timedelta(minutes=config.announcement_soft_stale_minutes),
+                hard_stale=timedelta(minutes=config.announcement_hard_stale_minutes),
+                deadline=deadline,
+            )
+        return self._record_completeness_decision(
+            policy.decide(
+                facts=facts,
+                intent=intent,
+                remaining_deadline_seconds=(
+                    deadline.remaining_seconds() if deadline is not None else 0.0
+                ),
+            ),
+            facts=facts,
+            query_kind="announcement",
+            query_intent=intent.value,
+            canonical_unit=unit,
+            policy_duration_ms=(time.perf_counter() - started_at) * 1_000,
+        )
+
+    def _record_completeness_decision(
+        self,
+        decision: CompletenessDecision,
+        *,
+        facts: CompletenessFacts,
+        query_kind: str,
+        query_intent: str,
+        canonical_unit: str | None,
+        policy_duration_ms: float,
+    ) -> CompletenessDecision:
+        logger.info(
+            "db_first_completeness_decision",
+            extra={
+                "query_kind": query_kind,
+                "query_intent": query_intent,
+                "scope_type": "unit" if canonical_unit else "global",
+                "canonical_unit": canonical_unit,
+                "decision_action": decision.action.value,
+                "decision_reason_codes": list(decision.reason_codes),
+                "evidence_count": facts.evidence_count,
+                "strong_evidence_count": facts.strong_evidence_count,
+                "top_score": round(facts.top_score, 4),
+                "score_margin": round(facts.score_margin, 4),
+                "fresh_count": facts.fresh_count,
+                "soft_stale_count": facts.soft_stale_count,
+                "hard_stale_count": facts.hard_stale_count,
+                "pending_ingestion_count": facts.pending_ingestion_count,
+                "failed_ingestion_count": facts.failed_ingestion_count,
+                "incomplete_announcement_count": facts.incomplete_announcement_count,
+                "coverage_ratio": round(facts.source_coverage_ratio, 4),
+                "active_refresh_count": facts.active_refresh_count,
+                "live_fallback_attempted": False,
+                "live_fallback_skipped_reason": (
+                    None
+                    if decision.action is CompletenessAction.USE_BOUNDED_LIVE_FALLBACK
+                    else decision.reason_codes[0]
+                    if decision.reason_codes
+                    else "policy"
+                ),
+                "refresh_scheduled": False,
+                "policy_duration_ms": round(policy_duration_ms, 3),
+            },
+        )
+        return decision
+
+    def _record_completeness_outcome(
+        self,
+        decision: CompletenessDecision,
+        *,
+        live_fallback_attempted: bool,
+        live_fallback_skipped_reason: str | None = None,
+        refresh_scheduled: bool = False,
+    ) -> None:
+        logger.info(
+            "db_first_completeness_outcome",
+            extra={
+                "decision_action": decision.action.value,
+                "decision_reason_codes": list(decision.reason_codes),
+                "live_fallback_attempted": live_fallback_attempted,
+                "live_fallback_skipped_reason": live_fallback_skipped_reason,
+                "refresh_scheduled": refresh_scheduled,
+            },
+        )
+
+    def _schedule_refresh(
+        self,
+        decision: CompletenessDecision,
+        *,
+        unit: str | None,
+        deadline: SearchDeadline | None,
+    ) -> RefreshScheduleResult | None:
+        if self._refresh_scheduler is None:
+            return None
+        result = self._refresh_scheduler.schedule(
+            urls=decision.schedule_targets,
+            source_names=decision.schedule_source_names,
+            unit=unit,
+            reason=decision.reason_codes[0] if decision.reason_codes else "unknown",
+            deadline=deadline,
+        )
+        logger.info(
+            "db_first_refresh_schedule",
+            extra={
+                "refresh_schedule_attempted": result.attempted,
+                "refresh_schedule_succeeded": result.succeeded,
+                "refresh_schedule_target_count": result.target_count,
+                "refresh_schedule_scheduled_count": result.scheduled_count,
+                "refresh_schedule_reason": result.reason,
+            },
+        )
+        return result
+
     def _refresh_overview(
         self, parsed: SearchAnnouncementsArguments
     ) -> RefreshResult | None:
@@ -415,6 +735,8 @@ class ToolExecutor:
     def _search_announcements(
         self,
         parsed: SearchAnnouncementsArguments,
+        *,
+        deadline: SearchDeadline | None = None,
     ) -> tuple[list[Evidence], str | None]:
         resolution = self._resolve_unit(parsed)
         generic_latest = False
@@ -445,9 +767,152 @@ class ToolExecutor:
         arguments = parsed.model_dump()
         arguments["canonical_urls"] = None
         warning: str | None = None
+        canonical_unit = resolution.canonical_unit if resolution is not None else None
+        if canonical_unit is not None:
+            arguments["unit"] = canonical_unit
+        announcement_deadline = deadline or self.new_deadline()
+        announcement_intent = (
+            QueryIntent.LATEST
+            if generic_latest
+            else QueryIntent.KEYWORD_ANNOUNCEMENT
+            if parsed.query and resolution is None
+            else QueryIntent.ANNOUNCEMENT
+        )
+        decision: CompletenessDecision | None = None
+        cached_for_policy: list[Evidence] = []
+        bounded_fallback = False
+        live_deadline: SearchDeadline | None = None
+        live_max_items = parsed.limit
+        if (
+            policy := self._completeness_policy
+        ) is not None and policy.config.rollout_mode is not CompletenessMode.OFF:
+            cached_for_policy = self._retriever.search_announcements(**arguments)
+            if canonical_unit is not None:
+                cached_for_policy = [
+                    item for item in cached_for_policy if item.unit == canonical_unit
+                ]
+            decision = self._announcement_completeness_decision(
+                cached_for_policy,
+                unit=canonical_unit,
+                intent=announcement_intent,
+                deadline=announcement_deadline,
+            )
+            if self._is_enforcing_policy() and decision is not None:
+                if decision.action is CompletenessAction.USE_DB:
+                    self._record_completeness_outcome(
+                        decision,
+                        live_fallback_attempted=False,
+                        live_fallback_skipped_reason="sufficient_database_evidence",
+                    )
+                    return cached_for_policy, None
+                if decision.action is CompletenessAction.USE_DB_AND_SCHEDULE_REFRESH:
+                    scheduled = self._schedule_refresh(
+                        decision,
+                        unit=canonical_unit,
+                        deadline=announcement_deadline,
+                    )
+                    self._record_completeness_outcome(
+                        decision,
+                        live_fallback_attempted=False,
+                        live_fallback_skipped_reason="background_refresh",
+                        refresh_scheduled=bool(scheduled and scheduled.succeeded),
+                    )
+                    return (
+                        cached_for_policy,
+                        (
+                            DB_REFRESH_SCHEDULED_WARNING
+                            if scheduled is None or scheduled.succeeded
+                            else SITE_SEARCH_PARTIAL_WARNING
+                        ),
+                    )
+                if decision.action is CompletenessAction.USE_DB_WITH_INCOMPLETE_WARNING:
+                    self._record_completeness_outcome(
+                        decision,
+                        live_fallback_attempted=False,
+                        live_fallback_skipped_reason=decision.reason_codes[0],
+                    )
+                    return cached_for_policy, SITE_SEARCH_PARTIAL_WARNING
+                if announcement_deadline is None:
+                    self._record_completeness_outcome(
+                        decision,
+                        live_fallback_attempted=False,
+                        live_fallback_skipped_reason="missing_shared_deadline",
+                    )
+                    return cached_for_policy, SITE_SEARCH_FAILURE_WARNING
+                bounded_fallback = True
+                live_deadline = announcement_deadline.capped(
+                    self._live_fallback_max_seconds
+                    if self._live_fallback_max_seconds is not None
+                    else announcement_deadline.remaining_seconds()
+                )
+                config = policy.config
+                live_max_items = min(
+                    parsed.limit,
+                    config.live_fallback_max_details,
+                )
+            elif self._is_shadow_policy() and decision is not None:
+                logger.info(
+                    "db_first_completeness_shadow",
+                    extra={
+                        "query_kind": "announcement",
+                        "query_intent": announcement_intent.value,
+                        "legacy_would_live": bool(
+                            self._refresher is not None
+                            or self._keyword_ingestor is not None
+                            or self._site_page_ingestor is not None
+                        ),
+                        "policy_would_live": (
+                            decision.action
+                            is CompletenessAction.USE_BOUNDED_LIVE_FALLBACK
+                        ),
+                        "decision_disagrees": (
+                            decision.action
+                            is not CompletenessAction.USE_BOUNDED_LIVE_FALLBACK
+                        ),
+                        "decision_reason_codes": list(decision.reason_codes),
+                    },
+                )
+        if bounded_fallback and (
+            resolution is None
+            or resolution.status is not UnitResolutionStatus.KNOWN_WITH_SCOPED_SEARCH
+        ):
+            if self._keyword_ingestor is None or live_deadline is None:
+                assert decision is not None
+                self._record_completeness_outcome(
+                    decision,
+                    live_fallback_attempted=False,
+                    live_fallback_skipped_reason="bounded_keyword_fallback_unavailable",
+                )
+                return cached_for_policy, SITE_SEARCH_FAILURE_WARNING
+            try:
+                query = parsed.query or "公告"
+                ingestion = self._bounded_keyword_ingest(
+                    query,
+                    max_items=live_max_items,
+                    deadline=live_deadline,
+                )
+                arguments["query"] = ingestion.retrieval_query
+                arguments["canonical_urls"] = ingestion.canonical_urls
+                evidence = self._filter_announcement_unit(
+                    self._retriever.search_announcements(**arguments),
+                    canonical_unit,
+                )
+                assert decision is not None
+                self._record_completeness_outcome(
+                    decision,
+                    live_fallback_attempted=True,
+                )
+                return evidence or cached_for_policy, ingestion.warning
+            except Exception:
+                assert decision is not None
+                self._record_completeness_outcome(
+                    decision,
+                    live_fallback_attempted=True,
+                    live_fallback_skipped_reason="bounded_keyword_fallback_failed",
+                )
+                return cached_for_policy, SITE_SEARCH_FAILURE_WARNING
         if resolution is not None:
             canonical_unit = resolution.canonical_unit or ""
-            arguments["unit"] = canonical_unit
             if resolution.status is UnitResolutionStatus.KNOWN_WITH_SCOPED_SEARCH:
                 official_unit = resolution.official_unit
                 if official_unit is None or directory is None:
@@ -459,7 +924,17 @@ class ToolExecutor:
                 scoped_ingestion: ScopedAnnouncementIngestionResult | None = None
                 scoped_search_completed = False
                 if self._site_page_ingestor is not None:
-                    deadline = self._site_page_ingestor.new_deadline()
+                    # ChatService passes one absolute deadline to every tool
+                    # round.  Shadow/off preserve their legacy candidate
+                    # selection but must never mint another full request
+                    # budget for a scoped live search.
+                    deadline = (
+                        live_deadline
+                        if bounded_fallback and live_deadline is not None
+                        else announcement_deadline
+                        or self._site_page_ingestor.new_deadline()
+                    )
+                    max_items = live_max_items if bounded_fallback else parsed.limit
                     search_text = " ".join(
                         value
                         for value in (
@@ -470,15 +945,26 @@ class ToolExecutor:
                         if value
                     )
                     try:
-                        scoped_ingestion = (
-                            self._site_page_ingestor.search_unit_announcements(
-                                SearchPlan.from_query(search_text, limit=parsed.limit),
-                                scope=scope,
-                                max_items=parsed.limit,
-                                deadline=deadline,
-                                sort=parsed.sort,
-                                topic=parsed.query,
-                            )
+                        method = cast(
+                            Any,
+                            self._site_page_ingestor.search_unit_announcements,
+                        )
+                        scoped_kwargs: dict[str, object] = {
+                            "scope": scope,
+                            "max_items": max_items,
+                            "deadline": deadline,
+                            "sort": parsed.sort,
+                            "topic": parsed.query,
+                        }
+                        if (
+                            bounded_fallback
+                            and self._live_fallback_limits is not None
+                            and "limits" in inspect.signature(method).parameters
+                        ):
+                            scoped_kwargs["limits"] = self._live_fallback_limits
+                        scoped_ingestion = method(
+                            SearchPlan.from_query(search_text, limit=max_items),
+                            **scoped_kwargs,
                         )
                         scoped_search_completed = True
                     except Exception:
@@ -497,6 +983,11 @@ class ToolExecutor:
                     evidence = [
                         item for item in evidence if item.unit == canonical_unit
                     ]
+                    if decision is not None and bounded_fallback:
+                        self._record_completeness_outcome(
+                            decision,
+                            live_fallback_attempted=True,
+                        )
                     return evidence, (
                         scoped_ingestion.warning
                         if evidence
@@ -509,7 +1000,19 @@ class ToolExecutor:
                     if item.unit == canonical_unit
                 ]
                 if scoped_ingestion is not None:
+                    if decision is not None and bounded_fallback:
+                        self._record_completeness_outcome(
+                            decision,
+                            live_fallback_attempted=True,
+                            live_fallback_skipped_reason="bounded_scoped_fallback_incomplete",
+                        )
                     return cached, scoped_ingestion.warning
+                if decision is not None and bounded_fallback:
+                    self._record_completeness_outcome(
+                        decision,
+                        live_fallback_attempted=True,
+                        live_fallback_skipped_reason="bounded_scoped_fallback_failed",
+                    )
                 return cached, (
                     None if scoped_search_completed else SITE_SEARCH_FAILURE_WARNING
                 )
@@ -565,6 +1068,8 @@ class ToolExecutor:
     def _search_documents(
         self,
         parsed: SearchDocumentsArguments,
+        *,
+        deadline: SearchDeadline | None = None,
     ) -> tuple[list[Evidence], str | None]:
         execution_context = RetrievalExecutionContext()
 
@@ -638,7 +1143,7 @@ class ToolExecutor:
                 evidence,
                 None,
             )
-        deadline = self._site_page_ingestor.new_deadline()
+        deadline = deadline or self._site_page_ingestor.new_deadline()
         try:
             if scope is None:
                 cached = retrieve(
@@ -655,18 +1160,96 @@ class ToolExecutor:
                 )
         except SearchDeadlineExceeded:
             return [], SITE_SEARCH_FAILURE_WARNING
-        if not self._site_page_ingestor.should_search_live(cached):
+        decision = self._document_completeness_decision(
+            cached,
+            scope=scope,
+            deadline=deadline,
+        )
+        live_limits: SearchExecutionLimits | None = None
+        if self._is_enforcing_policy() and decision is not None:
+            if decision.action is CompletenessAction.USE_DB:
+                self._record_completeness_outcome(
+                    decision,
+                    live_fallback_attempted=False,
+                    live_fallback_skipped_reason="sufficient_database_evidence",
+                )
+                return cached, None
+            if decision.action is CompletenessAction.USE_DB_AND_SCHEDULE_REFRESH:
+                scheduled = self._schedule_refresh(
+                    decision,
+                    unit=scope.canonical_unit if scope is not None else None,
+                    deadline=deadline,
+                )
+                self._record_completeness_outcome(
+                    decision,
+                    live_fallback_attempted=False,
+                    live_fallback_skipped_reason="background_refresh",
+                    refresh_scheduled=bool(scheduled and scheduled.succeeded),
+                )
+                return (
+                    cached,
+                    (
+                        DB_REFRESH_SCHEDULED_WARNING
+                        if scheduled is None or scheduled.succeeded
+                        else SITE_SEARCH_PARTIAL_WARNING
+                    ),
+                )
+            if decision.action is CompletenessAction.USE_DB_WITH_INCOMPLETE_WARNING:
+                self._record_completeness_outcome(
+                    decision,
+                    live_fallback_attempted=False,
+                    live_fallback_skipped_reason=decision.reason_codes[0],
+                )
+                return cached, self._document_search_fallback_warning(cached)
+            if decision.action is CompletenessAction.USE_BOUNDED_LIVE_FALLBACK:
+                live_limits = self._live_fallback_limits
+                if self._live_fallback_max_seconds is not None:
+                    deadline = deadline.capped(self._live_fallback_max_seconds)
+        elif self._is_shadow_policy() and decision is not None:
+            legacy_would_live = self._site_page_ingestor.should_search_live(cached)
+            policy_would_live = (
+                decision.action is CompletenessAction.USE_BOUNDED_LIVE_FALLBACK
+            )
+            logger.info(
+                "db_first_completeness_shadow",
+                extra={
+                    "query_kind": "document",
+                    "query_intent": "scoped" if scope is not None else "topic",
+                    "legacy_would_live": legacy_would_live,
+                    "policy_would_live": policy_would_live,
+                    "decision_disagrees": legacy_would_live is not policy_would_live,
+                    "decision_reason_codes": list(decision.reason_codes),
+                },
+            )
+        if live_limits is None and not self._site_page_ingestor.should_search_live(
+            cached
+        ):
             return cached, None
         if deadline.expired():
+            if decision is not None and live_limits is not None:
+                self._record_completeness_outcome(
+                    decision,
+                    live_fallback_attempted=False,
+                    live_fallback_skipped_reason="deadline_expired_before_fallback",
+                )
             return cached, self._document_search_fallback_warning(cached)
         try:
-            ingestion = ingest(
-                plan=parsed,
-                max_items=parsed.limit,
-                deadline=deadline,
-                scope=scope,
-            )
+            ingest_arguments: dict[str, object] = {
+                "plan": parsed,
+                "max_items": parsed.limit,
+                "deadline": deadline,
+                "scope": scope,
+            }
+            if live_limits is not None:
+                ingest_arguments["limits"] = live_limits
+            ingestion = ingest(**ingest_arguments)
         except Exception:
+            if decision is not None and live_limits is not None:
+                self._record_completeness_outcome(
+                    decision,
+                    live_fallback_attempted=True,
+                    live_fallback_skipped_reason="bounded_document_fallback_failed",
+                )
             return cached, self._document_search_fallback_warning(cached)
         if deadline.expired():
             return cached, self._document_search_warning(
@@ -698,6 +1281,16 @@ class ToolExecutor:
                 used_cached_fallback_after_refresh=False,
             )
         final_evidence = refreshed or cached
+        if decision is not None and live_limits is not None:
+            self._record_completeness_outcome(
+                decision,
+                live_fallback_attempted=True,
+                live_fallback_skipped_reason=(
+                    None
+                    if refreshed
+                    else "bounded_document_fallback_no_persisted_result"
+                ),
+            )
         return final_evidence, self._document_search_warning(
             cached=cached,
             final_evidence=final_evidence,
@@ -737,7 +1330,13 @@ class ToolExecutor:
             return SITE_SEARCH_FAILURE_WARNING
         return ingestion.warning
 
-    def execute(self, name: str, arguments: str) -> ToolExecutionResult:
+    def execute(
+        self,
+        name: str,
+        arguments: str,
+        *,
+        deadline: SearchDeadline | None = None,
+    ) -> ToolExecutionResult:
         validators: dict[str, type[BaseModel]] = {
             "search_announcements": SearchAnnouncementsArguments,
             "search_documents": SearchDocumentsArguments,
@@ -757,10 +1356,16 @@ class ToolExecutor:
         refresh_warning: str | None = None
         try:
             if isinstance(parsed, SearchAnnouncementsArguments):
-                evidence, refresh_warning = self._search_announcements(parsed)
+                evidence, refresh_warning = self._search_announcements(
+                    parsed,
+                    deadline=deadline,
+                )
                 content_limit = 2_000
             elif isinstance(parsed, SearchDocumentsArguments):
-                evidence, refresh_warning = self._search_documents(parsed)
+                evidence, refresh_warning = self._search_documents(
+                    parsed,
+                    deadline=deadline,
+                )
                 content_limit = 2_000
             elif isinstance(parsed, GetAnnouncementArguments):
                 item = self._retriever.get_announcement(parsed.announcement_id)
