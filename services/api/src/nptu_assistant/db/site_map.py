@@ -911,6 +911,7 @@ class SqlSiteMapRepository(SiteMapRepository):
             page_id_column: Any,
             *,
             from_clause: Any = None,
+            filters: Sequence[Any] | None = None,
         ) -> Any:
             branches = []
             for term in contains_terms:
@@ -921,19 +922,35 @@ class SqlSiteMapRepository(SiteMapRepository):
                 statement = select(page_id_column.label("page_id"))
                 if from_clause is not None:
                     statement = statement.select_from(from_clause)
-                branches.append(statement.where(*candidate_filters, predicate))
+                branches.append(
+                    statement.where(
+                        *(candidate_filters if filters is None else filters),
+                        predicate,
+                    )
+                )
             if not branches:
                 return select(literal(None).label("page_id")).where(false())
             return branches[0].union(*branches[1:])
 
         page_title_candidates = union_prefilter(SitePage.title, SitePage.id)
         page_path_candidates = union_prefilter(SitePage.path, SitePage.id)
-        anchor_term_candidates = union_prefilter(
-            SiteLink.anchor_text,
-            SiteLink.target_page_id,
-            from_clause=SiteLink.__table__.join(
-                SitePage, SiteLink.target_page_id == SitePage.id
-            ),
+        anchor_prefilter = (
+            union_prefilter(
+                SiteLink.anchor_text,
+                SiteLink.target_page_id,
+                filters=(),
+            )
+            .cte("site_map_anchor_prefilter")
+            .prefix_with("MATERIALIZED")
+        )
+        anchor_term_candidates = (
+            select(anchor_prefilter.c.page_id)
+            .select_from(
+                anchor_prefilter.join(
+                    SitePage, anchor_prefilter.c.page_id == SitePage.id
+                )
+            )
+            .where(*candidate_filters)
         )
         priority_page_candidates = select(SitePage.id.label("page_id")).where(
             *candidate_filters,
