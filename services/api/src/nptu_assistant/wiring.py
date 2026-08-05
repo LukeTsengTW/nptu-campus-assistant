@@ -69,6 +69,7 @@ from nptu_assistant.ingestion.service import DocumentIngestionService
 from nptu_assistant.providers.fake import FakeEmbeddingProvider, FakeLlmProvider
 from nptu_assistant.providers.openai import OpenAIEmbeddingProvider, OpenAILlmProvider
 from nptu_assistant.providers.protocols import EmbeddingProvider
+from nptu_assistant.rag.announcement_dedup import DeduplicatingSqlRetriever
 from nptu_assistant.rag.conversation import SqlConversationStore
 from nptu_assistant.rag.completeness import (
     CompletenessConfig,
@@ -77,7 +78,6 @@ from nptu_assistant.rag.completeness import (
 )
 from nptu_assistant.rag.completeness_facts import SqlRetrievalCompletenessFacts
 from nptu_assistant.rag.completeness_refresh import CompletenessRefreshScheduler
-from nptu_assistant.rag.retrieval import SqlRetriever
 from nptu_assistant.rag.service import ChatService, LlmProvider
 from nptu_assistant.core.security import is_allowed_source_url
 from collections.abc import Sequence
@@ -365,7 +365,7 @@ def build_services(settings: Settings) -> dict[str, object]:
         "health_service": HealthService(factory, settings),
         "chat_service": (
             ChatService(
-                SqlRetriever(
+                DeduplicatingSqlRetriever(
                     factory,
                     embedding,
                     progressive_policy=progressive_policy,
