@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import hmac
+import re
 from collections.abc import Collection
 from urllib.parse import urlsplit, urlunsplit
+
+
+_NPTU_PATH_COMMA_ALIAS = re.compile(r"%2c", re.IGNORECASE)
 
 
 def is_allowed_nptu_url(url: str) -> bool:
@@ -37,7 +41,8 @@ def canonicalize_nptu_url(url: str) -> str:
         raise ValueError("URL 必須是安全的 NPTU 官方 HTTPS 網址")
     parsed = urlsplit(url)
     host = (parsed.hostname or "").lower().rstrip(".")
-    return urlunsplit(("https", host, parsed.path or "/", parsed.query, ""))
+    path = _NPTU_PATH_COMMA_ALIAS.sub(",", parsed.path or "/")
+    return urlunsplit(("https", host, path, parsed.query, ""))
 
 
 def secrets_match(provided: str | None, expected: str) -> bool:
