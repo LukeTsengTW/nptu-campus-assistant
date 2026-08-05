@@ -15,10 +15,10 @@ def normalize_announcement_text(value: str | None) -> str:
 def announcement_title_identity(
     *,
     title: str,
-    published_at: date,
+    published_at: date | None,
     unit: str | None,
-) -> tuple[str, date, str]:
-    """Return a fallback identity for duplicate announcement listing entries."""
+) -> tuple[str, date | None, str]:
+    """Return a fallback identity for duplicate announcement entries."""
     return (
         normalize_announcement_text(title),
         published_at,
