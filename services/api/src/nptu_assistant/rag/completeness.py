@@ -254,8 +254,7 @@ class DbFirstCompletenessPolicy:
         partial_multi_source_coverage = bool(
             announcement_intent
             and len(facts.source_names) > 1
-            and facts.source_coverage_ratio
-            < self._config.minimum_source_coverage_ratio
+            and facts.source_coverage_ratio < self._config.minimum_source_coverage_ratio
         )
         if partial_multi_source_coverage:
             return self._decision(
