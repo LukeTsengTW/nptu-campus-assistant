@@ -48,9 +48,7 @@ pytestmark = pytest.mark.skipif(
 _FRESH_QUERY_COUNT = 60
 _STALE_QUERY_COUNT = 25
 _INSUFFICIENT_QUERY_COUNT = 15
-_TOTAL_QUERY_COUNT = (
-    _FRESH_QUERY_COUNT + _STALE_QUERY_COUNT + _INSUFFICIENT_QUERY_COUNT
-)
+_TOTAL_QUERY_COUNT = _FRESH_QUERY_COUNT + _STALE_QUERY_COUNT + _INSUFFICIENT_QUERY_COUNT
 
 
 @dataclass(frozen=True, slots=True)
@@ -329,9 +327,15 @@ def _seed_workload(
 
 def _cleanup(factory: sessionmaker[Session], *, prefix: str, token: str) -> None:
     with factory.begin() as session:
-        session.execute(delete(Document).where(Document.canonical_url.like(f"{prefix}%")))
-        session.execute(delete(SitePage).where(SitePage.canonical_url.like(f"{prefix}%")))
-        session.execute(delete(Source).where(Source.name == f"p4-0-1-benchmark-{token}"))
+        session.execute(
+            delete(Document).where(Document.canonical_url.like(f"{prefix}%"))
+        )
+        session.execute(
+            delete(SitePage).where(SitePage.canonical_url.like(f"{prefix}%"))
+        )
+        session.execute(
+            delete(Source).where(Source.name == f"p4-0-1-benchmark-{token}")
+        )
 
 
 def _run_workload(
