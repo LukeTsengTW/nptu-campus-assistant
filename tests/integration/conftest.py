@@ -6,7 +6,7 @@ from collections.abc import Iterator
 
 import pytest
 from sqlalchemy import create_engine, delete, select
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm import sessionmaker
 
 from nptu_assistant.db.models import Document, DocumentChunk
 
