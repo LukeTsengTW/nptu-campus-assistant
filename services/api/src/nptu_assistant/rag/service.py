@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+import json
 import re
 from typing import Protocol
 
@@ -15,7 +17,15 @@ from nptu_assistant.crawlers.resolution import (
     UnitResolutionStatus,
     UnitSourceResolver,
 )
-from nptu_assistant.crawlers.site_models import SearchExecutionLimits
+from nptu_assistant.crawlers.search import (
+    FULL_SEARCH_FAILURE_WARNING,
+    PARTIAL_SEARCH_FAILURE_WARNING,
+)
+from nptu_assistant.crawlers.site_models import SearchDeadline, SearchExecutionLimits
+from nptu_assistant.crawlers.site_search import (
+    SITE_SEARCH_FAILURE_WARNING,
+    SITE_SEARCH_PARTIAL_WARNING,
+)
 from nptu_assistant.crawlers.unit_intents import (
     UnitQueryIntent,
     classify_unit_query,
@@ -49,6 +59,20 @@ _INTERNAL_SOURCE_ID = re.compile(
 )
 _URL = re.compile(r"https?://[^\s<>\"'，。；：、！？）)\]}]+")
 _URL_TRAILING = "，。；：、！？,.!?;:）)]}"
+_REDUNDANT_LATEST_LIVE_WARNINGS = frozenset(
+    {
+        PARTIAL_SEARCH_FAILURE_WARNING,
+        FULL_SEARCH_FAILURE_WARNING,
+        SITE_SEARCH_PARTIAL_WARNING,
+        SITE_SEARCH_FAILURE_WARNING,
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _LatestAnnouncementPreflight:
+    snapshot_ready: bool
+    warning: str | None = None
 
 
 class LlmProvider(Protocol):
@@ -140,32 +164,52 @@ class ChatService:
     def delete_conversation(self, conversation_id: str) -> bool:
         return self._conversation_store.delete(conversation_id)
 
-    def _refresh_global_latest_announcements(self, question: str) -> str | None:
+    def _refresh_global_latest_announcements(
+        self, question: str
+    ) -> _LatestAnnouncementPreflight:
         """Refresh the due overview snapshot before a global latest query.
 
-        The DB-first completeness policy can legitimately reuse a fresh persisted
-        snapshot.  For an explicit global latest request, however, the due-aware
-        overview coordinator must run before that policy evaluates the snapshot;
-        otherwise a stale-but-usable result can be returned before the refresh
-        path is reached.
+        A successful due-aware refresh, including a TTL cache hit, establishes
+        the authoritative overview listing for this request.  The subsequent
+        DB-first tool call must not spend another live-search budget trying to
+        prove the same listing coverage again.
         """
 
         if self._announcement_refresher is None or self._unit_source_resolver is None:
-            return None
+            return _LatestAnnouncementPreflight(False)
         directory = self._unit_source_resolver.official_units
         if directory is None:
-            return None
+            return _LatestAnnouncementPreflight(False)
         resolution = self._unit_source_resolver.resolve(None, question)
         if resolution.status is not UnitResolutionStatus.NONE:
-            return None
+            return _LatestAnnouncementPreflight(False)
         if classify_unit_query(question) is not UnitQueryIntent.ANNOUNCEMENT:
-            return None
+            return _LatestAnnouncementPreflight(False)
         if extract_announcement_topic(question, directory) is not None:
-            return None
+            return _LatestAnnouncementPreflight(False)
         try:
-            return self._announcement_refresher.ensure_fresh("nptu-overview").warning
+            result = self._announcement_refresher.ensure_fresh("nptu-overview")
         except Exception:
-            return REFRESH_FAILURE_WARNING
+            return _LatestAnnouncementPreflight(False, REFRESH_FAILURE_WARNING)
+        return _LatestAnnouncementPreflight(result.succeeded, result.warning)
+
+    @staticmethod
+    def _without_redundant_latest_warning(
+        output: str,
+        warning: str | None,
+        *,
+        snapshot_ready: bool,
+    ) -> tuple[str, str | None]:
+        if not snapshot_ready or warning not in _REDUNDANT_LATEST_LIVE_WARNINGS:
+            return output, warning
+        try:
+            payload = json.loads(output)
+        except json.JSONDecodeError:
+            return output, None
+        if isinstance(payload, dict):
+            payload["warning"] = None
+            output = json.dumps(payload, ensure_ascii=False)
+        return output, None
 
     def answer(self, question: str, conversation_id: str | None = None) -> ChatResponse:
         context = self._conversation_store.load_or_create(conversation_id)
@@ -176,11 +220,16 @@ class ChatService:
         evidence_by_id = {item.id: item for item in context.evidence}
         tool_events: list[dict[str, object]] = []
         tool_warnings: list[str] = []
-        latest_refresh_warning = self._refresh_global_latest_announcements(question)
-        if latest_refresh_warning:
-            tool_warnings.append(latest_refresh_warning)
+        latest_preflight = self._refresh_global_latest_announcements(question)
+        if latest_preflight.warning:
+            tool_warnings.append(latest_preflight.warning)
         tool_rounds = 0
         request_deadline = self._tool_executor.new_deadline()
+        if latest_preflight.snapshot_ready and request_deadline is not None:
+            # The authoritative overview snapshot is already refreshed.  Pass an
+            # exhausted live-search budget so completeness evaluation may reuse
+            # the DB result without launching the redundant bounded fallback.
+            request_deadline = SearchDeadline(expires_at=0.0)
 
         while True:
             turn = self._llm.create_turn(
@@ -204,14 +253,21 @@ class ChatService:
                         call.arguments,
                         deadline=request_deadline,
                     )
+                    result_output, result_warning = (
+                        self._without_redundant_latest_warning(
+                            result.output,
+                            result.warning,
+                            snapshot_ready=latest_preflight.snapshot_ready,
+                        )
+                    )
                     for item in result.evidence:
                         evidence_by_id[item.id] = item
-                    if result.warning and result.warning not in tool_warnings:
-                        tool_warnings.append(result.warning)
+                    if result_warning and result_warning not in tool_warnings:
+                        tool_warnings.append(result_warning)
                     tool_events.append(
                         {
                             "tool_name": call.name,
-                            "output": result.output,
+                            "output": result_output,
                             "evidence": result.evidence,
                         }
                     )
@@ -219,7 +275,7 @@ class ChatService:
                         {
                             "type": "function_call_output",
                             "call_id": call.call_id,
-                            "output": result.output,
+                            "output": result_output,
                         }
                     )
                 continue
