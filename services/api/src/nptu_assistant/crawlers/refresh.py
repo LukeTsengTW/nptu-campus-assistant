@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Protocol
 
 from nptu_assistant.api.schemas import CrawlSummary
-from nptu_assistant.core.security import canonicalize_nptu_url
+from nptu_assistant.core.security import nptu_content_identity
 from nptu_assistant.crawlers.config import CrawlerSourceConfig, load_source_configs
 from nptu_assistant.crawlers.service import CrawlRunResult
 
@@ -68,7 +68,7 @@ def _deduplicate_canonical_url_aliases(
     seen: set[str] = set()
     for url in canonical_urls:
         try:
-            identity = canonicalize_nptu_url(url)
+            identity = nptu_content_identity(url)
         except ValueError:
             identity = url
         if identity in seen:
