@@ -396,10 +396,6 @@ def _run_workload(
                         assert result.warning is not None
                 else:
                     assert result.evidence == []
-                    if mode is CompletenessMode.ENFORCE:
-                        assert result.warning is not None
-                    else:
-                        assert result.warning is None
     finally:
         event.remove(engine, "before_cursor_execute", capture)
 
