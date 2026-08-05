@@ -40,9 +40,7 @@ CONFIG_PATH = (
     Path(__file__).resolve().parents[3] / "data" / "sources" / "announcements.yaml"
 )
 LATEST_URL = "https://www.nptu.edu.tw/p/406-1000-200001.php"
-SCHOLARSHIP_URL = (
-    "https://staf-life.nptu.edu.tw/p/406-1074-198126,r3893.php?Lang=zh-tw"
-)
+SCHOLARSHIP_URL = "https://staf-life.nptu.edu.tw/p/406-1074-198126,r3893.php?Lang=zh-tw"
 
 
 class _RecordingRefresher:
@@ -134,7 +132,9 @@ def test_latest_announcement_preflight_refreshes_authoritative_listing_sources(
 ) -> None:
     refresher = _RecordingRefresher()
 
-    result = _service(refresher, enforce=enforce)._refresh_latest_announcements(question)
+    result = _service(refresher, enforce=enforce)._refresh_latest_announcements(
+        question
+    )
 
     assert result.snapshot_ready is snapshot_ready
     assert result.warning is None
