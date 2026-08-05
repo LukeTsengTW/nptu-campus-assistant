@@ -31,7 +31,10 @@ from nptu_assistant.crawlers.unit_intents import (
     classify_unit_query,
     extract_announcement_topic,
 )
-from nptu_assistant.rag.completeness import DbFirstCompletenessPolicy
+from nptu_assistant.rag.completeness import (
+    CompletenessMode,
+    DbFirstCompletenessPolicy,
+)
 from nptu_assistant.rag.completeness_refresh import CompletenessRefreshScheduler
 from nptu_assistant.rag.models import (
     ConversationContext,
@@ -148,6 +151,10 @@ class ChatService:
         self._conversation_store = conversation_store
         self._announcement_refresher = announcement_refresher
         self._unit_source_resolver = unit_source_resolver
+        self._enforcing_completeness = (
+            completeness_policy is not None
+            and completeness_policy.config.rollout_mode is CompletenessMode.ENFORCE
+        )
         self._tool_executor = ToolExecutor(
             retriever,
             announcement_refresher,
@@ -164,31 +171,48 @@ class ChatService:
     def delete_conversation(self, conversation_id: str) -> bool:
         return self._conversation_store.delete(conversation_id)
 
-    def _refresh_global_latest_announcements(
+    def _refresh_latest_announcements(
         self, question: str
     ) -> _LatestAnnouncementPreflight:
-        """Refresh the due overview snapshot before a global latest query.
+        """Refresh the authoritative listing for a supported latest query.
 
-        A successful due-aware refresh, including a TTL cache hit, establishes
-        the authoritative overview listing for this request.  The subsequent
-        DB-first tool call must not spend another live-search budget trying to
-        prove the same listing coverage again.
+        Global overview queries retain their existing preflight. Configured
+        listing sources only preflight while completeness enforcement is active;
+        otherwise ToolExecutor owns the normal single refresh. A successful
+        due-aware refresh, including a TTL cache hit, lets completeness reuse
+        the refreshed database snapshot instead of launching a second bounded
+        live search for the same listing.
         """
 
         if self._announcement_refresher is None or self._unit_source_resolver is None:
             return _LatestAnnouncementPreflight(False)
-        directory = self._unit_source_resolver.official_units
-        if directory is None:
-            return _LatestAnnouncementPreflight(False)
-        resolution = self._unit_source_resolver.resolve(None, question)
-        if resolution.status is not UnitResolutionStatus.NONE:
-            return _LatestAnnouncementPreflight(False)
         if classify_unit_query(question) is not UnitQueryIntent.ANNOUNCEMENT:
             return _LatestAnnouncementPreflight(False)
-        if extract_announcement_topic(question, directory) is not None:
+
+        resolution = self._unit_source_resolver.resolve(None, question)
+        if (
+            resolution.status
+            in {
+                UnitResolutionStatus.RESOLVED,
+                UnitResolutionStatus.KNOWN_WITH_LISTING,
+            }
+            and resolution.source is not None
+        ):
+            if not self._enforcing_completeness:
+                return _LatestAnnouncementPreflight(False)
+            source_name = resolution.source.name
+        elif resolution.status is UnitResolutionStatus.NONE:
+            directory = self._unit_source_resolver.official_units
+            if directory is None:
+                return _LatestAnnouncementPreflight(False)
+            if extract_announcement_topic(question, directory) is not None:
+                return _LatestAnnouncementPreflight(False)
+            source_name = "nptu-overview"
+        else:
             return _LatestAnnouncementPreflight(False)
+
         try:
-            result = self._announcement_refresher.ensure_fresh("nptu-overview")
+            result = self._announcement_refresher.ensure_fresh(source_name)
         except Exception:
             return _LatestAnnouncementPreflight(False, REFRESH_FAILURE_WARNING)
         return _LatestAnnouncementPreflight(result.succeeded, result.warning)
@@ -220,13 +244,13 @@ class ChatService:
         evidence_by_id = {item.id: item for item in context.evidence}
         tool_events: list[dict[str, object]] = []
         tool_warnings: list[str] = []
-        latest_preflight = self._refresh_global_latest_announcements(question)
+        latest_preflight = self._refresh_latest_announcements(question)
         if latest_preflight.warning:
             tool_warnings.append(latest_preflight.warning)
         tool_rounds = 0
         request_deadline = self._tool_executor.new_deadline()
         if latest_preflight.snapshot_ready and request_deadline is not None:
-            # The authoritative overview snapshot is already refreshed.  Pass an
+            # The authoritative listing snapshot is already refreshed. Pass an
             # exhausted live-search budget so completeness evaluation may reuse
             # the DB result without launching the redundant bounded fallback.
             request_deadline = SearchDeadline(expires_at=0.0)
@@ -257,7 +281,10 @@ class ChatService:
                         self._without_redundant_latest_warning(
                             result.output,
                             result.warning,
-                            snapshot_ready=latest_preflight.snapshot_ready,
+                            snapshot_ready=(
+                                latest_preflight.snapshot_ready
+                                and call.name == "search_announcements"
+                            ),
                         )
                     )
                     for item in result.evidence:

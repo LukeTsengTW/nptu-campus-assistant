@@ -40,6 +40,7 @@ CONFIG_PATH = (
     Path(__file__).resolve().parents[3] / "data" / "sources" / "announcements.yaml"
 )
 LATEST_URL = "https://www.nptu.edu.tw/p/406-1000-200001.php"
+SCHOLARSHIP_URL = "https://staf-life.nptu.edu.tw/p/406-1074-198126,r3893.php?Lang=zh-tw"
 
 
 class _RecordingRefresher:
@@ -74,32 +75,66 @@ def _resolver() -> UnitSourceResolver:
     )
 
 
-def _service(refresher: _RecordingRefresher) -> ChatService:
+def _service(
+    refresher: _RecordingRefresher,
+    *,
+    enforce: bool = False,
+) -> ChatService:
+    policy = (
+        DbFirstCompletenessPolicy(
+            CompletenessConfig(rollout_mode=CompletenessMode.ENFORCE)
+        )
+        if enforce
+        else None
+    )
     return ChatService(
         cast(Any, object()),
         cast(Any, object()),
         cast(Any, object()),
         announcement_refresher=refresher,
         unit_source_resolver=_resolver(),
+        completeness_policy=policy,
     )
 
 
 @pytest.mark.parametrize(
-    ("question", "expected_calls", "snapshot_ready"),
+    ("question", "enforce", "expected_calls", "snapshot_ready"),
     [
-        ("查詢近期最新公告 ", ["nptu-overview"], True),
-        ("查詢近期最新獎學金公告", [], False),
-        ("資訊學院近期最新公告", [], False),
+        ("查詢近期最新公告 ", False, ["nptu-overview"], True),
+        (
+            "查詢近期最新獎學金公告",
+            True,
+            ["student-scholarship-external-html"],
+            True,
+        ),
+        (
+            "查詢校內獎學金公告",
+            True,
+            ["student-scholarship-internal-html"],
+            True,
+        ),
+        (
+            "資訊學院近期最新公告",
+            True,
+            ["information-college-html"],
+            True,
+        ),
+        ("查詢獎學金公告", False, [], False),
+        ("資訊學院近期最新公告", False, [], False),
+        ("獎學金申請資格", True, [], False),
     ],
 )
-def test_latest_announcement_preflight_only_refreshes_global_unfiltered_queries(
+def test_latest_announcement_preflight_refreshes_authoritative_listing_sources(
     question: str,
+    enforce: bool,
     expected_calls: list[str],
     snapshot_ready: bool,
 ) -> None:
     refresher = _RecordingRefresher()
 
-    result = _service(refresher)._refresh_global_latest_announcements(question)
+    result = _service(refresher, enforce=enforce)._refresh_latest_announcements(
+        question
+    )
 
     assert result.snapshot_ready is snapshot_ready
     assert result.warning is None
@@ -110,9 +145,7 @@ def test_failed_latest_preflight_preserves_refresh_warning() -> None:
     warning = "最新公告更新失敗，以下內容來自資料庫最後成功收錄的資料。"
     refresher = _RecordingRefresher(succeeded=False, warning=warning)
 
-    result = _service(refresher)._refresh_global_latest_announcements(
-        "查詢近期最新公告"
-    )
+    result = _service(refresher)._refresh_latest_announcements("查詢近期最新公告")
 
     assert result.snapshot_ready is False
     assert result.warning == warning
@@ -160,8 +193,9 @@ class _Retriever:
 
 
 class _ScriptedProvider:
-    def __init__(self, item: Evidence) -> None:
+    def __init__(self, item: Evidence, *, query: str | None = None) -> None:
         self.item = item
+        self.query = query
         self.inputs: list[list[dict[str, object]]] = []
         self.turn = 0
 
@@ -178,7 +212,7 @@ class _ScriptedProvider:
         if self.turn == 1:
             arguments = json.dumps(
                 {
-                    "query": None,
+                    "query": self.query,
                     "limit": 5,
                     "sort": "newest",
                     "unit": None,
@@ -246,7 +280,7 @@ class _RecordingKeywordIngestor:
         del kwargs
         self.calls.append(query)
         raise AssertionError(
-            "successful overview preflight must skip keyword live fallback"
+            "successful listing preflight must skip keyword live fallback"
         )
 
 
@@ -291,5 +325,45 @@ def test_successful_overview_preflight_skips_redundant_live_fallback_and_warning
     assert keyword_ingestor.calls == []
     assert response.warning is None
     assert response.sources[0].url == LATEST_URL
+    tool_output = json.loads(provider.inputs[1][-1]["output"])
+    assert tool_output["warning"] is None
+
+
+def test_successful_scholarship_preflight_skips_redundant_live_fallback_and_warning() -> (
+    None
+):
+    item = Evidence(
+        id="latest-scholarship",
+        kind=AnswerType.ANNOUNCEMENT,
+        title="115-1 財團法人得力教育基金會清寒獎助學金",
+        url=SCHOLARSHIP_URL,
+        unit="生活輔導組",
+        published_at=date(2026, 8, 5),
+        content="115學年度第1學期清寒獎助學金公告內容",
+        score=0.9,
+    )
+    refresher = _RecordingRefresher()
+    keyword_ingestor = _RecordingKeywordIngestor()
+    provider = _ScriptedProvider(item, query="獎學金公告")
+
+    response = ChatService(
+        _Retriever(item),
+        provider,
+        _ConversationStore(),
+        announcement_refresher=refresher,
+        keyword_announcement_ingestor=keyword_ingestor,
+        unit_source_resolver=_resolver(),
+        site_page_ingestor=cast(Any, _DeadlineSiteIngestor()),
+        completeness_policy=DbFirstCompletenessPolicy(
+            CompletenessConfig(rollout_mode=CompletenessMode.ENFORCE)
+        ),
+        completeness_facts=cast(Any, _WeakAnnouncementFacts()),
+        live_fallback_max_seconds=8.0,
+    ).answer("查詢獎學金公告")
+
+    assert refresher.calls == ["student-scholarship-external-html"]
+    assert keyword_ingestor.calls == []
+    assert response.warning is None
+    assert response.sources[0].url == SCHOLARSHIP_URL
     tool_output = json.loads(provider.inputs[1][-1]["output"])
     assert tool_output["warning"] is None
