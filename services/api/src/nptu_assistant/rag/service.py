@@ -10,8 +10,17 @@ from nptu_assistant.api.schemas import (
     Confidence,
     SourceReference,
 )
-from nptu_assistant.crawlers.resolution import UnitSourceResolver
+from nptu_assistant.crawlers.refresh import REFRESH_FAILURE_WARNING
+from nptu_assistant.crawlers.resolution import (
+    UnitResolutionStatus,
+    UnitSourceResolver,
+)
 from nptu_assistant.crawlers.site_models import SearchExecutionLimits
+from nptu_assistant.crawlers.unit_intents import (
+    UnitQueryIntent,
+    classify_unit_query,
+    extract_announcement_topic,
+)
 from nptu_assistant.rag.completeness import DbFirstCompletenessPolicy
 from nptu_assistant.rag.completeness_refresh import CompletenessRefreshScheduler
 from nptu_assistant.rag.models import (
@@ -113,6 +122,8 @@ class ChatService:
     ) -> None:
         self._llm = llm
         self._conversation_store = conversation_store
+        self._announcement_refresher = announcement_refresher
+        self._unit_source_resolver = unit_source_resolver
         self._tool_executor = ToolExecutor(
             retriever,
             announcement_refresher,
@@ -129,6 +140,33 @@ class ChatService:
     def delete_conversation(self, conversation_id: str) -> bool:
         return self._conversation_store.delete(conversation_id)
 
+    def _refresh_global_latest_announcements(self, question: str) -> str | None:
+        """Refresh the due overview snapshot before a global latest query.
+
+        The DB-first completeness policy can legitimately reuse a fresh persisted
+        snapshot.  For an explicit global latest request, however, the due-aware
+        overview coordinator must run before that policy evaluates the snapshot;
+        otherwise a stale-but-usable result can be returned before the refresh
+        path is reached.
+        """
+
+        if self._announcement_refresher is None or self._unit_source_resolver is None:
+            return None
+        directory = self._unit_source_resolver.official_units
+        if directory is None:
+            return None
+        resolution = self._unit_source_resolver.resolve(None, question)
+        if resolution.status is not UnitResolutionStatus.NONE:
+            return None
+        if classify_unit_query(question) is not UnitQueryIntent.ANNOUNCEMENT:
+            return None
+        if extract_announcement_topic(question, directory) is not None:
+            return None
+        try:
+            return self._announcement_refresher.ensure_fresh("nptu-overview").warning
+        except Exception:
+            return REFRESH_FAILURE_WARNING
+
     def answer(self, question: str, conversation_id: str | None = None) -> ChatResponse:
         context = self._conversation_store.load_or_create(conversation_id)
         input_items: list[dict[str, object]] = [
@@ -138,6 +176,9 @@ class ChatService:
         evidence_by_id = {item.id: item for item in context.evidence}
         tool_events: list[dict[str, object]] = []
         tool_warnings: list[str] = []
+        latest_refresh_warning = self._refresh_global_latest_announcements(question)
+        if latest_refresh_warning:
+            tool_warnings.append(latest_refresh_warning)
         tool_rounds = 0
         request_deadline = self._tool_executor.new_deadline()
 
