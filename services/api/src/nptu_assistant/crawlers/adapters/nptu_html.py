@@ -5,7 +5,11 @@ from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup, Tag
 
-from nptu_assistant.core.security import canonicalize_nptu_url, is_allowed_source_url
+from nptu_assistant.core.security import (
+    canonicalize_nptu_url,
+    is_allowed_source_url,
+    nptu_content_identity,
+)
 from nptu_assistant.crawlers.config import CrawlerSourceConfig
 from nptu_assistant.crawlers.models import AnnouncementCandidate
 from nptu_assistant.crawlers.parsing import parse_published_at
@@ -48,9 +52,10 @@ class NptuHtmlListAdapter:
                     },
                 )
                 continue
-            if candidate.canonical_url in seen_urls:
+            identity = nptu_content_identity(candidate.canonical_url)
+            if identity in seen_urls:
                 continue
-            seen_urls.add(candidate.canonical_url)
+            seen_urls.add(identity)
             candidates.append(candidate)
 
         if not candidates:
