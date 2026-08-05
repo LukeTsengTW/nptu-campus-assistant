@@ -77,42 +77,64 @@ def _resolver() -> UnitSourceResolver:
     )
 
 
-def _service(refresher: _RecordingRefresher) -> ChatService:
+def _service(
+    refresher: _RecordingRefresher,
+    *,
+    enforce: bool = False,
+) -> ChatService:
+    policy = (
+        DbFirstCompletenessPolicy(
+            CompletenessConfig(rollout_mode=CompletenessMode.ENFORCE)
+        )
+        if enforce
+        else None
+    )
     return ChatService(
         cast(Any, object()),
         cast(Any, object()),
         cast(Any, object()),
         announcement_refresher=refresher,
         unit_source_resolver=_resolver(),
+        completeness_policy=policy,
     )
 
 
 @pytest.mark.parametrize(
-    ("question", "expected_calls", "snapshot_ready"),
+    ("question", "enforce", "expected_calls", "snapshot_ready"),
     [
-        ("查詢近期最新公告 ", ["nptu-overview"], True),
+        ("查詢近期最新公告 ", False, ["nptu-overview"], True),
         (
             "查詢近期最新獎學金公告",
+            True,
             ["student-scholarship-external-html"],
             True,
         ),
         (
             "查詢校內獎學金公告",
+            True,
             ["student-scholarship-internal-html"],
             True,
         ),
-        ("資訊學院近期最新公告", [], False),
-        ("獎學金申請資格", [], False),
+        (
+            "資訊學院近期最新公告",
+            True,
+            ["information-college-html"],
+            True,
+        ),
+        ("查詢獎學金公告", False, [], False),
+        ("資訊學院近期最新公告", False, [], False),
+        ("獎學金申請資格", True, [], False),
     ],
 )
 def test_latest_announcement_preflight_refreshes_authoritative_listing_sources(
     question: str,
+    enforce: bool,
     expected_calls: list[str],
     snapshot_ready: bool,
 ) -> None:
     refresher = _RecordingRefresher()
 
-    result = _service(refresher)._refresh_latest_announcements(question)
+    result = _service(refresher, enforce=enforce)._refresh_latest_announcements(question)
 
     assert result.snapshot_ready is snapshot_ready
     assert result.warning is None
