@@ -60,9 +60,7 @@ def test_canonicalizer_treats_encoded_comma_as_nptu_path_alias() -> None:
     assert canonicalize_nptu_url(LITERAL_URL) == LITERAL_URL
 
 
-def test_content_identity_collapses_404_and_406_routes_without_rewriting_urls() -> (
-    None
-):
+def test_content_identity_collapses_404_and_406_routes_without_rewriting_urls() -> None:
     assert canonicalize_nptu_url(PAGE_406_URL) == PAGE_406_URL
     assert canonicalize_nptu_url(PAGE_404_URL) == PAGE_404_URL
     assert nptu_content_identity(PAGE_406_URL) == nptu_content_identity(PAGE_404_URL)
