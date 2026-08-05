@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Protocol
 
 from nptu_assistant.api.schemas import CrawlSummary
+from nptu_assistant.core.security import canonicalize_nptu_url
 from nptu_assistant.crawlers.config import CrawlerSourceConfig, load_source_configs
 from nptu_assistant.crawlers.service import CrawlRunResult
 
@@ -58,6 +59,25 @@ class RefreshResult:
     canonical_urls: tuple[str, ...] | None = None
 
 
+def _deduplicate_canonical_url_aliases(
+    canonical_urls: tuple[str, ...] | None,
+) -> tuple[str, ...] | None:
+    if canonical_urls is None:
+        return None
+    deduplicated: list[str] = []
+    seen: set[str] = set()
+    for url in canonical_urls:
+        try:
+            identity = canonicalize_nptu_url(url)
+        except ValueError:
+            identity = url
+        if identity in seen:
+            continue
+        seen.add(identity)
+        deduplicated.append(url)
+    return tuple(deduplicated)
+
+
 class AnnouncementRefreshCoordinator:
     def __init__(
         self,
@@ -83,8 +103,8 @@ class AnnouncementRefreshCoordinator:
                     source_name,
                     attempted=False,
                     succeeded=True,
-                    canonical_urls=self._repository.canonical_urls_for_source(
-                        source_name
+                    canonical_urls=_deduplicate_canonical_url_aliases(
+                        self._repository.canonical_urls_for_source(source_name)
                     ),
                 )
 
@@ -96,13 +116,15 @@ class AnnouncementRefreshCoordinator:
                         source_name,
                         attempted=False,
                         succeeded=True,
-                        canonical_urls=self._repository.canonical_urls_for_source(
-                            source_name
+                        canonical_urls=_deduplicate_canonical_url_aliases(
+                            self._repository.canonical_urls_for_source(source_name)
                         ),
                     )
                 run_result = self._crawler.run_with_urls([source_name])
                 summary = run_result.summary
-                canonical_urls = run_result.canonical_urls.get(source_name)
+                canonical_urls = _deduplicate_canonical_url_aliases(
+                    run_result.canonical_urls.get(source_name)
+                )
                 if (
                     summary.failed
                     or canonical_urls is None
@@ -114,8 +136,8 @@ class AnnouncementRefreshCoordinator:
                         succeeded=False,
                         warning=REFRESH_FAILURE_WARNING,
                         summary=summary,
-                        canonical_urls=self._repository.canonical_urls_for_source(
-                            source_name
+                        canonical_urls=_deduplicate_canonical_url_aliases(
+                            self._repository.canonical_urls_for_source(source_name)
                         ),
                     )
                 if source_name not in run_result.persisted_source_snapshots:
