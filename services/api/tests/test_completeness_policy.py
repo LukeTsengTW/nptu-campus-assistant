@@ -51,7 +51,7 @@ def _facts(**changes: object) -> CompletenessFacts:
             _facts(strong_evidence_count=1, exact_scope_match_count=1),
             QueryIntent.ANNOUNCEMENT,
             CompletenessAction.USE_DB,
-            "exact_scoped_match",
+            "fresh_announcement_snapshot",
         ),
         (
             _facts(exact_scope_match_count=0),
@@ -141,6 +141,64 @@ def test_policy_is_table_driven_and_conservative(
 
     assert decision.action is expected
     assert reason in decision.reason_codes
+
+
+@pytest.mark.parametrize("intent", [QueryIntent.LATEST, QueryIntent.ANNOUNCEMENT])
+def test_fresh_announcement_snapshot_does_not_require_semantic_score(
+    intent: QueryIntent,
+) -> None:
+    decision = DbFirstCompletenessPolicy(CompletenessConfig()).decide(
+        facts=_facts(
+            strong_evidence_count=0,
+            top_score=0.0,
+            score_margin=0.0,
+        ),
+        intent=intent,
+        remaining_deadline_seconds=10.0,
+    )
+
+    assert decision.action is CompletenessAction.USE_DB
+    assert decision.reason_codes == ("fresh_announcement_snapshot",)
+
+
+def test_weak_but_fresh_keyword_announcements_schedule_instead_of_live_fallback() -> (
+    None
+):
+    decision = DbFirstCompletenessPolicy(CompletenessConfig()).decide(
+        facts=_facts(
+            strong_evidence_count=0,
+            top_score=0.2,
+            score_margin=0.01,
+        ),
+        intent=QueryIntent.KEYWORD_ANNOUNCEMENT,
+        remaining_deadline_seconds=10.0,
+    )
+
+    assert decision.action is CompletenessAction.USE_DB_AND_SCHEDULE_REFRESH
+    assert decision.reason_codes == ("weak_but_usable_announcement_evidence",)
+
+
+def test_keyword_announcement_without_database_evidence_keeps_bounded_live_fallback() -> (
+    None
+):
+    decision = DbFirstCompletenessPolicy(CompletenessConfig()).decide(
+        facts=_facts(
+            evidence_count=0,
+            unique_url_count=0,
+            strong_evidence_count=0,
+            top_score=0.0,
+            score_margin=0.0,
+            current_document_count=0,
+            fresh_count=0,
+            content_hash_in_sync_count=0,
+            source_coverage_ratio=0.0,
+        ),
+        intent=QueryIntent.KEYWORD_ANNOUNCEMENT,
+        remaining_deadline_seconds=10.0,
+    )
+
+    assert decision.action is CompletenessAction.USE_BOUNDED_LIVE_FALLBACK
+    assert "missing_listing_coverage" in decision.reason_codes
 
 
 def test_deadline_prevents_live_and_keeps_best_database_evidence() -> None:
