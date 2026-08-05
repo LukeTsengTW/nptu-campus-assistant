@@ -195,9 +195,7 @@ class _ScriptedProvider:
             }
             return ModelTurn(
                 output_items=[item],
-                tool_calls=[
-                    ToolCall("call-latest", "search_announcements", arguments)
-                ],
+                tool_calls=[ToolCall("call-latest", "search_announcements", arguments)],
             )
         return ModelTurn(
             output_items=[{"type": "message", "role": "assistant"}],
@@ -247,7 +245,9 @@ class _RecordingKeywordIngestor:
     def ingest(self, query: str, **kwargs: object) -> Any:
         del kwargs
         self.calls.append(query)
-        raise AssertionError("successful overview preflight must skip keyword live fallback")
+        raise AssertionError(
+            "successful overview preflight must skip keyword live fallback"
+        )
 
 
 class _DeadlineSiteIngestor:
@@ -255,7 +255,9 @@ class _DeadlineSiteIngestor:
         return SearchDeadline.after(8.0)
 
 
-def test_successful_overview_preflight_skips_redundant_live_fallback_and_warning() -> None:
+def test_successful_overview_preflight_skips_redundant_live_fallback_and_warning() -> (
+    None
+):
     item = Evidence(
         id="latest-announcement",
         kind=AnswerType.ANNOUNCEMENT,
