@@ -228,7 +228,9 @@ class _NoLiveKeywordIngestor:
     def ingest(self, query: str, **kwargs: object) -> Any:
         del kwargs
         self.calls.append(query)
-        raise AssertionError("fresh database evidence must not use synchronous live search")
+        raise AssertionError(
+            "fresh database evidence must not use synchronous live search"
+        )
 
 
 class _DeadlineSiteIngestor:
