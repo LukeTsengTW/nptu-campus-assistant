@@ -7,6 +7,11 @@ from urllib.parse import urlsplit, urlunsplit
 
 
 _NPTU_PATH_COMMA_ALIAS = re.compile(r"%2c", re.IGNORECASE)
+_NPTU_PAGE_CONTENT_PATH = re.compile(
+    r"^/p/(?:404|406)-(?P<unit_id>\d+)-(?P<content_id>\d+)"
+    r"(?:,[^/]+)?\.php$",
+    re.IGNORECASE,
+)
 
 
 def is_allowed_nptu_url(url: str) -> bool:
@@ -43,6 +48,19 @@ def canonicalize_nptu_url(url: str) -> str:
     host = (parsed.hostname or "").lower().rstrip(".")
     path = _NPTU_PATH_COMMA_ALIAS.sub(",", parsed.path or "/")
     return urlunsplit(("https", host, path, parsed.query, ""))
+
+
+def nptu_content_identity(url: str) -> str:
+    """Return a stable identity for equivalent NPTU Page content routes."""
+    canonical_url = canonicalize_nptu_url(url)
+    parsed = urlsplit(canonical_url)
+    match = _NPTU_PAGE_CONTENT_PATH.fullmatch(parsed.path)
+    if match is None:
+        return canonical_url
+    identity_path = (
+        f"/p/content-{match.group('unit_id')}-{match.group('content_id')}.php"
+    )
+    return urlunsplit(("https", parsed.netloc, identity_path, parsed.query, ""))
 
 
 def secrets_match(provided: str | None, expected: str) -> bool:
