@@ -31,7 +31,10 @@ from nptu_assistant.crawlers.unit_intents import (
     classify_unit_query,
     extract_announcement_topic,
 )
-from nptu_assistant.rag.completeness import DbFirstCompletenessPolicy
+from nptu_assistant.rag.completeness import (
+    CompletenessMode,
+    DbFirstCompletenessPolicy,
+)
 from nptu_assistant.rag.completeness_refresh import CompletenessRefreshScheduler
 from nptu_assistant.rag.models import (
     ConversationContext,
@@ -148,6 +151,10 @@ class ChatService:
         self._conversation_store = conversation_store
         self._announcement_refresher = announcement_refresher
         self._unit_source_resolver = unit_source_resolver
+        self._enforcing_completeness = (
+            completeness_policy is not None
+            and completeness_policy.config.rollout_mode is CompletenessMode.ENFORCE
+        )
         self._tool_executor = ToolExecutor(
             retriever,
             announcement_refresher,
@@ -169,11 +176,12 @@ class ChatService:
     ) -> _LatestAnnouncementPreflight:
         """Refresh the authoritative listing for a supported latest query.
 
-        This covers both the global overview and configured listing sources,
-        such as the internal and external scholarship pages. A successful
-        due-aware refresh, including a TTL cache hit, means completeness may
-        reuse the refreshed database snapshot instead of launching a second
-        bounded live search for the same listing.
+        Global overview queries retain their existing preflight. Configured
+        listing sources only preflight while completeness enforcement is active;
+        otherwise ToolExecutor owns the normal single refresh. A successful
+        due-aware refresh, including a TTL cache hit, lets completeness reuse
+        the refreshed database snapshot instead of launching a second bounded
+        live search for the same listing.
         """
 
         if self._announcement_refresher is None or self._unit_source_resolver is None:
@@ -190,6 +198,8 @@ class ChatService:
             }
             and resolution.source is not None
         ):
+            if not self._enforcing_completeness:
+                return _LatestAnnouncementPreflight(False)
             source_name = resolution.source.name
         elif resolution.status is UnitResolutionStatus.NONE:
             directory = self._unit_source_resolver.official_units
