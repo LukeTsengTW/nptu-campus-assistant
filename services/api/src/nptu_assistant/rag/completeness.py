@@ -251,6 +251,19 @@ class DbFirstCompletenessPolicy:
                 "stale_but_usable",
             )
 
+        partial_multi_source_coverage = bool(
+            announcement_intent
+            and len(facts.source_names) > 1
+            and facts.source_coverage_ratio
+            < self._config.minimum_source_coverage_ratio
+        )
+        if partial_multi_source_coverage:
+            return self._decision(
+                CompletenessAction.USE_DB_AND_SCHEDULE_REFRESH,
+                facts,
+                "insufficient_source_coverage",
+            )
+
         if (
             intent in {QueryIntent.LATEST, QueryIntent.ANNOUNCEMENT}
             and usable_announcement_evidence
