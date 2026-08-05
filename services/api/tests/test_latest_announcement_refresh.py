@@ -32,9 +32,7 @@ class _RecordingRefresher:
             source_name=source_name,
             attempted=True,
             succeeded=True,
-            canonical_urls=(
-                "https://www.nptu.edu.tw/p/406-1000-200001.php",
-            ),
+            canonical_urls=("https://www.nptu.edu.tw/p/406-1000-200001.php",),
         )
 
 
