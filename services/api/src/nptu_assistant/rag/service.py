@@ -46,8 +46,10 @@ from nptu_assistant.rag.models import (
 from nptu_assistant.rag.prompts import SYSTEM_INSTRUCTIONS
 from nptu_assistant.rag.tools import (
     AnnouncementRefresher,
+    AnnouncementSort,
     CompletenessFactsProvider,
     KeywordAnnouncementIngestor,
+    SearchAnnouncementsArguments,
     SitePageIngestor,
     StructuredRetriever,
     ToolExecutor,
@@ -174,14 +176,11 @@ class ChatService:
     def _refresh_latest_announcements(
         self, question: str
     ) -> _LatestAnnouncementPreflight:
-        """Refresh the authoritative listing for a supported latest query.
+        """Backward-compatible raw-question preflight helper.
 
-        Global overview queries retain their existing preflight. Configured
-        listing sources only preflight while completeness enforcement is active;
-        otherwise ToolExecutor owns the normal single refresh. A successful
-        due-aware refresh, including a TTL cache hit, lets completeness reuse
-        the refreshed database snapshot instead of launching a second bounded
-        live search for the same listing.
+        Request handling no longer calls this method. Actual tool arguments are
+        now the freshness boundary, so prompt wording cannot create one-off
+        optimization paths.
         """
 
         if self._announcement_refresher is None or self._unit_source_resolver is None:
@@ -217,6 +216,62 @@ class ChatService:
             return _LatestAnnouncementPreflight(False, REFRESH_FAILURE_WARNING)
         return _LatestAnnouncementPreflight(result.succeeded, result.warning)
 
+    def _refresh_announcement_call(
+        self,
+        arguments: str,
+    ) -> _LatestAnnouncementPreflight:
+        """Refresh an authoritative listing from validated tool arguments.
+
+        This applies uniformly to every prompt that produces the same
+        ``search_announcements`` call. Configured listings are refreshed during
+        completeness enforcement, while a global newest query refreshes the
+        overview source as before. Keyword-only and scoped-site queries stay
+        DB-first and are governed by the completeness policy.
+        """
+
+        if self._announcement_refresher is None or self._unit_source_resolver is None:
+            return _LatestAnnouncementPreflight(False)
+        try:
+            parsed = SearchAnnouncementsArguments.model_validate_json(arguments)
+        except Exception:
+            return _LatestAnnouncementPreflight(False)
+
+        resolution = self._unit_source_resolver.resolve(parsed.unit, parsed.query)
+        source_name: str | None = None
+        if (
+            resolution.status
+            in {
+                UnitResolutionStatus.RESOLVED,
+                UnitResolutionStatus.KNOWN_WITH_LISTING,
+            }
+            and resolution.source is not None
+        ):
+            if self._enforcing_completeness:
+                source_name = resolution.source.name
+        elif (
+            resolution.status is UnitResolutionStatus.NONE
+            and parsed.sort is AnnouncementSort.NEWEST
+        ):
+            if parsed.query is None:
+                source_name = "nptu-overview"
+            else:
+                directory = self._unit_source_resolver.official_units
+                if (
+                    directory is not None
+                    and classify_unit_query(parsed.query)
+                    is UnitQueryIntent.ANNOUNCEMENT
+                    and extract_announcement_topic(parsed.query, directory) is None
+                ):
+                    source_name = "nptu-overview"
+
+        if source_name is None:
+            return _LatestAnnouncementPreflight(False)
+        try:
+            result = self._announcement_refresher.ensure_fresh(source_name)
+        except Exception:
+            return _LatestAnnouncementPreflight(False, REFRESH_FAILURE_WARNING)
+        return _LatestAnnouncementPreflight(result.succeeded, result.warning)
+
     @staticmethod
     def _without_redundant_latest_warning(
         output: str,
@@ -244,16 +299,8 @@ class ChatService:
         evidence_by_id = {item.id: item for item in context.evidence}
         tool_events: list[dict[str, object]] = []
         tool_warnings: list[str] = []
-        latest_preflight = self._refresh_latest_announcements(question)
-        if latest_preflight.warning:
-            tool_warnings.append(latest_preflight.warning)
         tool_rounds = 0
         request_deadline = self._tool_executor.new_deadline()
-        if latest_preflight.snapshot_ready and request_deadline is not None:
-            # The authoritative listing snapshot is already refreshed. Pass an
-            # exhausted live-search budget so completeness evaluation may reuse
-            # the DB result without launching the redundant bounded fallback.
-            request_deadline = SearchDeadline(expires_at=0.0)
 
         while True:
             turn = self._llm.create_turn(
@@ -272,19 +319,32 @@ class ChatService:
                     )
                 tool_rounds += 1
                 for call in calls:
+                    call_preflight = (
+                        self._refresh_announcement_call(call.arguments)
+                        if call.name == "search_announcements"
+                        else _LatestAnnouncementPreflight(False)
+                    )
+                    if (
+                        call_preflight.warning
+                        and call_preflight.warning not in tool_warnings
+                    ):
+                        tool_warnings.append(call_preflight.warning)
+                    call_deadline = request_deadline
+                    if call_preflight.snapshot_ready and call_deadline is not None:
+                        # Only this announcement call reuses the authoritative
+                        # listing snapshot. Other tools retain the shared request
+                        # budget instead of inheriting an exhausted deadline.
+                        call_deadline = SearchDeadline(expires_at=0.0)
                     result = self._tool_executor.execute(
                         call.name,
                         call.arguments,
-                        deadline=request_deadline,
+                        deadline=call_deadline,
                     )
                     result_output, result_warning = (
                         self._without_redundant_latest_warning(
                             result.output,
                             result.warning,
-                            snapshot_ready=(
-                                latest_preflight.snapshot_ready
-                                and call.name == "search_announcements"
-                            ),
+                            snapshot_ready=call_preflight.snapshot_ready,
                         )
                     )
                     for item in result.evidence:

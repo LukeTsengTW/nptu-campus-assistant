@@ -128,6 +128,17 @@ class DbFirstCompletenessPolicy:
         intent: QueryIntent,
         remaining_deadline_seconds: float,
     ) -> CompletenessDecision:
+        announcement_intent = intent in {
+            QueryIntent.ANNOUNCEMENT,
+            QueryIntent.KEYWORD_ANNOUNCEMENT,
+            QueryIntent.LATEST,
+        }
+        usable_announcement_evidence = bool(
+            announcement_intent
+            and facts.evidence_count
+            and facts.current_document_count
+        )
+
         if not facts.facts_query_succeeded:
             return self._insufficient(
                 facts,
@@ -182,11 +193,7 @@ class DbFirstCompletenessPolicy:
                 "terminal_incomplete",
             )
 
-        if facts.current_document_count == 0 and intent in {
-            QueryIntent.ANNOUNCEMENT,
-            QueryIntent.KEYWORD_ANNOUNCEMENT,
-            QueryIntent.LATEST,
-        }:
+        if facts.current_document_count == 0 and announcement_intent:
             return self._insufficient(
                 facts,
                 "missing_listing_coverage",
@@ -200,13 +207,10 @@ class DbFirstCompletenessPolicy:
                 remaining_deadline_seconds,
             )
 
-        if facts.strong_evidence_count == 0:
-            return self._insufficient(
-                facts,
-                "weak_retrieval_score",
-                remaining_deadline_seconds,
-            )
-
+        # Freshness and ingestion state are stronger signals than semantic
+        # scores for announcement lists. Newest and configured listing queries
+        # are ordered/filter operations, so a score of zero is not evidence that
+        # the snapshot is unusable.
         if facts.hard_stale_count:
             if intent is QueryIntent.LATEST:
                 return self._insufficient(
@@ -247,19 +251,54 @@ class DbFirstCompletenessPolicy:
                 "stale_but_usable",
             )
 
+        partial_multi_source_coverage = bool(
+            announcement_intent
+            and len(facts.source_names) > 1
+            and facts.source_coverage_ratio < self._config.minimum_source_coverage_ratio
+        )
+        if partial_multi_source_coverage:
+            return self._decision(
+                CompletenessAction.USE_DB_AND_SCHEDULE_REFRESH,
+                facts,
+                "insufficient_source_coverage",
+            )
+
         if (
-            intent
-            in {
-                QueryIntent.ANNOUNCEMENT,
-                QueryIntent.KEYWORD_ANNOUNCEMENT,
-                QueryIntent.LATEST,
-            }
+            intent in {QueryIntent.LATEST, QueryIntent.ANNOUNCEMENT}
+            and usable_announcement_evidence
+            and facts.fresh_count
+        ):
+            return self._decision(
+                CompletenessAction.USE_DB,
+                facts,
+                "fresh_announcement_snapshot",
+            )
+
+        if (
+            announcement_intent
             and facts.source_coverage_ratio < self._config.minimum_source_coverage_ratio
         ):
             return self._decision(
                 CompletenessAction.USE_DB_AND_SCHEDULE_REFRESH,
                 facts,
                 "insufficient_source_coverage",
+            )
+
+        if facts.strong_evidence_count == 0:
+            if (
+                intent is QueryIntent.KEYWORD_ANNOUNCEMENT
+                and usable_announcement_evidence
+                and facts.fresh_count
+            ):
+                return self._decision(
+                    CompletenessAction.USE_DB_AND_SCHEDULE_REFRESH,
+                    facts,
+                    "weak_but_usable_announcement_evidence",
+                )
+            return self._insufficient(
+                facts,
+                "weak_retrieval_score",
+                remaining_deadline_seconds,
             )
 
         exact_scoped = (
@@ -296,10 +335,30 @@ class DbFirstCompletenessPolicy:
                 "fresh_strong_evidence",
             )
         if facts.score_margin < self._config.minimum_score_margin:
+            if (
+                intent is QueryIntent.KEYWORD_ANNOUNCEMENT
+                and usable_announcement_evidence
+                and facts.fresh_count
+            ):
+                return self._decision(
+                    CompletenessAction.USE_DB_AND_SCHEDULE_REFRESH,
+                    facts,
+                    "ambiguous_but_usable_announcement_evidence",
+                )
             return self._insufficient(
                 facts,
                 "insufficient_score_margin",
                 remaining_deadline_seconds,
+            )
+        if (
+            intent is QueryIntent.KEYWORD_ANNOUNCEMENT
+            and usable_announcement_evidence
+            and facts.fresh_count
+        ):
+            return self._decision(
+                CompletenessAction.USE_DB_AND_SCHEDULE_REFRESH,
+                facts,
+                "sparse_but_usable_announcement_evidence",
             )
         return self._insufficient(
             facts,
