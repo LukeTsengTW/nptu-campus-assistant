@@ -10,6 +10,7 @@ from nptu_assistant.core.security import (
     is_allowed_source_url,
     nptu_content_identity,
 )
+from nptu_assistant.crawlers.announcement_identity import announcement_title_identity
 from nptu_assistant.crawlers.config import CrawlerSourceConfig
 from nptu_assistant.crawlers.models import AnnouncementCandidate
 from nptu_assistant.crawlers.parsing import parse_published_at
@@ -38,7 +39,8 @@ class NptuHtmlListAdapter:
             raise ValueError("公告列表中找不到公告項目")
 
         candidates: list[AnnouncementCandidate] = []
-        seen_urls: set[str] = set()
+        seen_content_identities: set[str] = set()
+        seen_title_identities: set[tuple[object, ...]] = set()
         for index, row in enumerate(rows):
             try:
                 candidate = self._parse_item(row, index=index)
@@ -52,10 +54,19 @@ class NptuHtmlListAdapter:
                     },
                 )
                 continue
-            identity = nptu_content_identity(candidate.canonical_url)
-            if identity in seen_urls:
+            content_identity = nptu_content_identity(candidate.canonical_url)
+            title_identity = announcement_title_identity(
+                title=candidate.title,
+                published_at=candidate.published_at,
+                unit=candidate.unit,
+            )
+            if (
+                content_identity in seen_content_identities
+                or title_identity in seen_title_identities
+            ):
                 continue
-            seen_urls.add(identity)
+            seen_content_identities.add(content_identity)
+            seen_title_identities.add(title_identity)
             candidates.append(candidate)
 
         if not candidates:
