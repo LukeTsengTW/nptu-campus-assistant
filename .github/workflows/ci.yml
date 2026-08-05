@@ -84,6 +84,7 @@ jobs:
         run: >-
           uv run --project services/api pytest
           tests/integration/test_p4_completeness.py
+          tests/integration/test_p4_benchmark_acceptance.py
           --import-mode=importlib -q -rP
 
       - name: Verify generated API contracts
