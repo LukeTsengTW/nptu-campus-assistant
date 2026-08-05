@@ -11,12 +11,8 @@ from nptu_assistant.crawlers.refresh import AnnouncementRefreshCoordinator
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
 CONFIG_PATH = WORKSPACE_ROOT / "data/sources/announcements.yaml"
-ENCODED_URL = (
-    "https://staf-life.nptu.edu.tw/p/406-1074-200001%2Cr3893.php?Lang=zh-tw"
-)
-LITERAL_URL = (
-    "https://staf-life.nptu.edu.tw/p/406-1074-200001,r3893.php?Lang=zh-tw"
-)
+ENCODED_URL = "https://staf-life.nptu.edu.tw/p/406-1074-200001%2Cr3893.php?Lang=zh-tw"
+LITERAL_URL = "https://staf-life.nptu.edu.tw/p/406-1074-200001,r3893.php?Lang=zh-tw"
 OTHER_URL = "https://www.nptu.edu.tw/p/406-1000-200002.php?Lang=zh-tw"
 NOW = datetime(2026, 8, 5, 9, 30, tzinfo=timezone.utc)
 
